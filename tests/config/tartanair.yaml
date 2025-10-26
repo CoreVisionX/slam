@@ -1,0 +1,5 @@
+env: ["ArchVizTinyHouseDay"]
+difficulty: ["easy"]
+modality: ["image", "depth"]
+camera_name: ["lcam_front", "rcam_front"]
+unzip: True

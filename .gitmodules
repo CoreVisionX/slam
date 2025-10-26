@@ -1,0 +1,3 @@
+[submodule "submodules/tartanairpy"]
+	path = submodules/tartanairpy
+	url = https://github.com/castacks/tartanairpy.git

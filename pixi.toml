@@ -1,0 +1,26 @@
+[workspace]
+authors = ["Jacob Van Meter <jacobvm04@gmail.com>"]
+channels = ["conda-forge"]
+name = "slam"
+platforms = ["osx-arm64"]
+version = "0.1.0"
+
+[tasks]
+
+[dependencies]
+python = ">=3.13.0,<3.14"
+
+[pypi-dependencies]
+gtsam-develop = ">=4.3a0.dev202510200041, <5"
+torch = ">=2.9.0, <3"
+kornia = ">=0.8.1, <0.9"
+opencv-python = ">=4.12.0.88, <5"
+torchvision = ">=0.24.0, <0.25"
+
+[feature.dev.pypi-dependencies]
+ipykernel = "*"
+inline-snapshot = ">=0.30.1, <0.31"
+tartanair = { editable = true, path = "submodules/tartanairpy" }
+
+[environments]
+dev = ["dev"]
