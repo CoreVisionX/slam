@@ -13,7 +13,7 @@ from registration.utils import fundamental_fitler, rectify_stereo_frame_pair, so
 import tests.test_utils
 
 
-pair, first_depth, second_depth = tests.test_utils.load_tartanair_pair(seed=10, max_degs=30.0, max_dist=2.0, traj='P003')
+pair = tests.test_utils.load_tartanair_pair(seed=1, max_degs=35.0, max_dist=2.0, traj='P003')
 
 plt.imshow(stack_pair_images(pair, 'left'))
 
@@ -38,7 +38,19 @@ filtered_mkpts1, filtered_mkpts2, inlier_mask = fundamental_fitler(mkpts1, mkpts
 plt.imshow(draw_matches(rectified_pair, filtered_mkpts1[::32], filtered_mkpts2[::32], inlier_mask[::32]))
 
 # %%
-max_depth = 10.0
+from depth.sgbm import SGBM
+
+sgbm = SGBM(num_disparities=16 * 6, block_size=5)
+first_disparity = sgbm(rectified_pair.first.left_rect, rectified_pair.first.right_rect)
+second_disparity = sgbm(rectified_pair.second.left_rect, rectified_pair.second.right_rect)
+
+first_depth_xyz = cv2.reprojectImageTo3D(first_disparity, rectified_pair.first.calibration.Q)
+second_depth_xyz = cv2.reprojectImageTo3D(second_disparity, rectified_pair.second.calibration.Q)
+
+first_depth = first_depth_xyz[:, :, 2]
+second_depth = second_depth_xyz[:, :, 2]
+
+max_depth = 3.0
 first_depth[first_depth > max_depth] = np.nan
 second_depth[second_depth > max_depth] = np.nan
 
@@ -49,37 +61,6 @@ plt.show()
 print('Mean depth:', np.nanmean(first_depth))
 
 # %%
-
-def depth_to_3d(depth_image, intrinsic_matrix):
-    """
-    Converts a depth image to a 3D point cloud using camera intrinsics.
-
-    Args:
-        depth_image: A NumPy array of shape (H, W) representing the depth map.
-        intrinsic_matrix: The camera's intrinsic matrix (K).
-
-    Returns:
-        A NumPy array of shape (H, W, 3) representing 3D points in camera coordinates.
-    """
-    height, width = depth_image.shape
-    fx = intrinsic_matrix[0, 0]
-    fy = intrinsic_matrix[1, 1]
-    cx = intrinsic_matrix[0, 2]
-    cy = intrinsic_matrix[1, 2]
-
-    # Create pixel coordinate grid
-    u, v = np.meshgrid(np.arange(width), np.arange(height))
-
-    # Compute normalized image coordinates
-    X = (u - cx) / fx * depth_image
-    Y = (v - cy) / fy * depth_image
-    Z = depth_image
-
-    # Stack into (H, W, 3)
-    points_3d = np.stack((X, Y, Z), axis=-1)
-
-    return points_3d
-
 depth_pair = FramePairWithGroundTruth(
     first=StereoDepthFrame(
         left=rectified_pair.first.left,
@@ -88,7 +69,7 @@ depth_pair = FramePairWithGroundTruth(
         left_rect=rectified_pair.first.left_rect,
         right_rect=rectified_pair.first.right_rect,
         left_depth=first_depth,
-        left_depth_xyz=depth_to_3d(first_depth, rectified_pair.first.calibration.K_left_rect)
+        left_depth_xyz=first_depth_xyz
     ),
     second=StereoDepthFrame(
         left=rectified_pair.second.left,
@@ -97,7 +78,7 @@ depth_pair = FramePairWithGroundTruth(
         left_rect=rectified_pair.second.left_rect,
         right_rect=rectified_pair.second.right_rect,
         left_depth=second_depth,
-        left_depth_xyz=depth_to_3d(second_depth, rectified_pair.second.calibration.K_left_rect)
+        left_depth_xyz=second_depth_xyz
     ),
     first_T_second=pair.first_T_second
 )

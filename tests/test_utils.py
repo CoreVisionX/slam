@@ -102,4 +102,4 @@ def load_tartanair_pair(env="ArchVizTinyHouseDay", difficulty="easy", traj="P000
             calibration=tartanair_calib
         ),
         first_T_second=first_pose.inverse() * second_pose
-    ), first['lcam_front']['depth'], second['lcam_front']['depth']
+    )
