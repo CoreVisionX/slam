@@ -1,4 +1,5 @@
-env: ["ArchVizTinyHouseDay"]
+env: ["AbandonedFactory"]
+traj: ["P000"]
 difficulty: ["easy"]
 modality: ["image", "depth"]
 camera_name: ["lcam_front", "rcam_front"]

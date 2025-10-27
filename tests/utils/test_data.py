@@ -13,13 +13,12 @@ from registration.utils import fundamental_fitler, rectify_stereo_frame_pair, so
 import tests.test_utils
 
 
-pair, first_depth, second_depth = tests.test_utils.load_tartanair_pair(seed=37, max_dist=0.5)
+pair, first_depth, second_depth = tests.test_utils.load_tartanair_pair(seed=10, max_degs=30.0, max_dist=2.0, traj='P003')
 
 plt.imshow(stack_pair_images(pair, 'left'))
 
-print('Translation:', pair.first_T_second.translation())
-print('Rotation:', np.rad2deg(pair.first_T_second.rotation().ypr()))
-print(np.rad2deg(pair.first_T_second.rotation().ypr()))
+print(f'Translation: ({np.linalg.norm(pair.first_T_second.translation()):.2f} m) [{pair.first_T_second.translation()[0]:.2f}, {pair.first_T_second.translation()[1]:.2f}, {pair.first_T_second.translation()[2]:.2f}]')
+print(f'Rotation: ({np.linalg.norm(np.rad2deg(pair.first_T_second.rotation().ypr())):.2f} deg) [{np.rad2deg(pair.first_T_second.rotation().ypr()[0]):.2f}, {np.rad2deg(pair.first_T_second.rotation().ypr()[1]):.2f}, {np.rad2deg(pair.first_T_second.rotation().ypr()[2]):.2f}]')
 
 # %%
 rectified_pair = rectify_stereo_frame_pair(pair)
@@ -109,15 +108,17 @@ pose_error = first_T_second * pair.first_T_second.inverse()
 
 plt.imshow(draw_matches(depth_pair, pnp_filtered_mkpts1[::4], pnp_filtered_mkpts2[::4]))
 
+# TODO: factor out printing utilities
+# remember, composition over inheritance. Don't write the exact same code a bunch of times.
 print('--------------------------------')
 print(f'Estimated translation: ({np.linalg.norm(first_T_second.translation()):.2f} m) [{first_T_second.translation()[0]:.2f}, {first_T_second.translation()[1]:.2f}, {first_T_second.translation()[2]:.2f}]')
-print(f'Estimated rotation: ({np.rad2deg(first_T_second.rotation().ypr())[1]:.2f} deg) [{np.rad2deg(first_T_second.rotation().ypr()[0]):.2f}, {np.rad2deg(first_T_second.rotation().ypr()[1]):.2f}, {np.rad2deg(first_T_second.rotation().ypr()[2]):.2f}]')
+print(f'Estimated rotation: ({np.linalg.norm(np.rad2deg(first_T_second.rotation().ypr())):.2f} deg) [{np.rad2deg(first_T_second.rotation().ypr()[0]):.2f}, {np.rad2deg(first_T_second.rotation().ypr()[1]):.2f}, {np.rad2deg(first_T_second.rotation().ypr()[2]):.2f}]')
 print('--------------------------------')
 print(f'Ground truth translation: ({np.linalg.norm(pair.first_T_second.translation()):.2f} m) [{pair.first_T_second.translation()[0]:.2f}, {pair.first_T_second.translation()[1]:.2f}, {pair.first_T_second.translation()[2]:.2f}]')
-print(f'Ground truth rotation: ({np.rad2deg(pair.first_T_second.rotation().ypr())[1]:.2f} deg) [{np.rad2deg(pair.first_T_second.rotation().ypr()[0]):.2f}, {np.rad2deg(pair.first_T_second.rotation().ypr()[1]):.2f}, {np.rad2deg(pair.first_T_second.rotation().ypr()[2]):.2f}]')
+print(f'Ground truth rotation: ({np.linalg.norm(np.rad2deg(pair.first_T_second.rotation().ypr())):.2f} deg) [{np.rad2deg(pair.first_T_second.rotation().ypr()[0]):.2f}, {np.rad2deg(pair.first_T_second.rotation().ypr()[1]):.2f}, {np.rad2deg(pair.first_T_second.rotation().ypr()[2]):.2f}]')
 print('--------------------------------')
 print(f'Pose error translation: ({np.linalg.norm(pose_error.translation()):.2f} m) [{pose_error.translation()[0]:.2f}, {pose_error.translation()[1]:.2f}, {pose_error.translation()[2]:.2f}]')
-print(f'Pose error rotation: ({np.rad2deg(pose_error.rotation().ypr())[1]:.2f} deg) [{np.rad2deg(pose_error.rotation().ypr()[0]):.2f}, {np.rad2deg(pose_error.rotation().ypr()[1]):.2f}, {np.rad2deg(pose_error.rotation().ypr()[2]):.2f}]')
+print(f'Pose error rotation: ({np.linalg.norm(np.rad2deg(pose_error.rotation().ypr())):.2f} deg) [{np.rad2deg(pose_error.rotation().ypr()[0]):.2f}, {np.rad2deg(pose_error.rotation().ypr()[1]):.2f}, {np.rad2deg(pose_error.rotation().ypr()[2]):.2f}]')
 print('--------------------------------')
 
 

@@ -78,7 +78,8 @@ def load_tartanair_pair(env="ArchVizTinyHouseDay", difficulty="easy", traj="P000
         sample_pose = gtsam.Pose3(gtsam.Rot3(sample_pose_R), gtsam.Point3(sample_pose_t))
 
         sample_dist = np.linalg.norm(sample_pose.translation() - first_pose.translation())
-        sample_angle = (sample_pose.rotation() * first_pose.rotation().inverse()).axisAngle()[1]
+        sample_angle = np.linalg.norm((first_pose.inverse() * sample_pose).rotation().ypr())
+        print('sample_angle', np.rad2deg(sample_angle), 'sample_dist', sample_dist)
 
         if sample_dist < max_dist and sample_angle < np.deg2rad(max_degs):
             end_idx = idx

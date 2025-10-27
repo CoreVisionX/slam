@@ -51,7 +51,7 @@ def get_matching_keypoints(kp1, kp2, idxs):
 
 def fundamental_fitler(mkpts1: np.ndarray, mkpts2: np.ndarray) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     Fm, inliers = cv2.findFundamentalMat(
-        mkpts1, mkpts2, cv2.USAC_MAGSAC, 1.0, 0.999, 100000
+        mkpts1, mkpts2, cv2.USAC_MAGSAC, 2.0, 0.999, 100000
     )
     mask = inliers.ravel() > 0
 
