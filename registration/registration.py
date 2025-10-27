@@ -137,5 +137,5 @@ class FramePair[S]:
     second: S
 
 @dataclass
-class StereoPairWithGroundTruth[S](FramePair[S]):
+class FramePairWithGroundTruth[S](FramePair[S]):
     first_T_second: gtsam.Pose3

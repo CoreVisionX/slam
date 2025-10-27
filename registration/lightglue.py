@@ -36,6 +36,10 @@ class LightglueMatcher:
             lafs2 = KF.laf_from_center_scale_ori(kps2[None], torch.ones(1, len(kps2), 1, 1, device=self.device))
             _dists, idxs = self.matcher(descs1, descs2, lafs1, lafs2, hw1=hw1, hw2=hw2)
 
+            print('kps1', kps1.shape)
+            print('kps2', kps2.shape)
+            print('idxs', idxs.shape)
+
         mkpts1, mkpts2 = get_matching_keypoints(kps1, kps2, idxs)
         
         return np.array(mkpts1), np.array(mkpts2)

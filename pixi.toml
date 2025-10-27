@@ -16,6 +16,8 @@ torch = ">=2.9.0, <3"
 kornia = ">=0.8.1, <0.9"
 opencv-python = ">=4.12.0.88, <5"
 torchvision = ">=0.24.0, <0.25"
+onnxruntime = ">=1.23.2, <2"
+opencv-contrib-python = ">=4.12.0.88, <5"
 
 [feature.dev.pypi-dependencies]
 ipykernel = "*"
