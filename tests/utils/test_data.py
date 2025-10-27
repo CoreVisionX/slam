@@ -40,7 +40,7 @@ plt.imshow(draw_matches(rectified_pair, filtered_mkpts1[::32], filtered_mkpts2[:
 # %%
 from depth.sgbm import SGBM
 
-sgbm = SGBM(num_disparities=16 * 6, block_size=5)
+sgbm = SGBM(num_disparities=16 * 6, block_size=5, image_color='RGB')
 first_disparity = sgbm(rectified_pair.first.left_rect, rectified_pair.first.right_rect)
 second_disparity = sgbm(rectified_pair.second.left_rect, rectified_pair.second.right_rect)
 
