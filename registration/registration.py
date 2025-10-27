@@ -129,6 +129,7 @@ class RectifiedStereoFrame(StereoFrame):
 @dataclass
 class StereoDepthFrame(RectifiedStereoFrame):
     left_depth: np.ndarray
+    left_depth_xyz: np.ndarray
 
 @dataclass
 class FramePair[S]:
