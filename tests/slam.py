@@ -22,9 +22,11 @@ odometry_iterator = get_tartanair_iterator_with_odometry(
     difficulty='easy', 
     traj='P001', 
     include_ground_truth=True,
-    rotation_noise_sigmas=np.array([np.deg2rad(0.3), np.deg2rad(0.3), np.deg2rad(0.3)]),
-    translation_noise_sigmas=np.array([0.01, 0.01, 0.01])
+    rotation_noise_sigmas=np.array([np.deg2rad(0.5), np.deg2rad(0.5), np.deg2rad(0.5)]),
+    translation_noise_sigmas=np.array([0.008, 0.008, 0.008])
 )
+
+# TODO: the noise should probably be much higher than the real noise since we're integrating the odometry poses between keyframes
 odometry_noise = gtsam.noiseModel.Diagonal.Sigmas(np.array([np.deg2rad(0.2), np.deg2rad(0.2), np.deg2rad(0.2), 0.005, 0.005, 0.005]))
 
 rr.init("slam", spawn=True)
@@ -33,7 +35,7 @@ sgbm = SGBM(num_disparities=16 * 6, block_size=5, image_color='RGB')
 
 # setup backend
 pose_graph = GtsamPoseGraph(K=tartanair_calib.K_left_rect)
-loop_detector = ProximityLoopDetector(max_translation=7.0, max_rotation=np.deg2rad(35), max_candidates=5, min_seperation=1)
+loop_detector = ProximityLoopDetector(max_translation=5.0, max_rotation=np.deg2rad(35), max_candidates=5, min_seperation=1)
 
 # loop_noise = gtsam.noiseModel.Diagonal.Sigmas(np.array([np.deg2rad(0.5), np.deg2rad(0.5), np.deg2rad(0.5), 0.01, 0.01, 0.01]))
 loop_noise = odometry_noise # set it to the odometry noise so they're weighted equally which will make debugging the influence of the loop closures easier
@@ -42,12 +44,12 @@ loop_noise = odometry_noise # set it to the odometry noise so they're weighted e
 # TODO: log match images somehow?
 # TODO: log numbers and changes in inlier counts somehow?
 # setup two-view pose estimation
-matcher = LightglueMatcher(num_features=4096)
-min_inlier_count = 100
+matcher = LightglueMatcher(num_features=2048)
+min_inlier_count = 200
 
 # TODO: refactor keyframing logic into it's own class
-keyframe_translation_threshold = 2.5
-keyframe_rotation_threshold = np.deg2rad(25)
+keyframe_translation_threshold = 1.0
+keyframe_rotation_threshold = np.deg2rad(20)
 cur_keyframe_pose = None
 
 raw_trajectory: list[gtsam.Pose3] = []
@@ -146,13 +148,13 @@ for i, (frame, noisy_prev_robot_to_robot, first_robot_to_robot) in enumerate(odo
     rr.set_time("frame", sequence=i)
 
     rr_log_trajectory("gt_trajectory", gt_trajectory, color=(0, 255, 0))
-    rr_log_pose("gt", first_robot_to_robot, rectified_frame)
+    rr_log_pose("gt", first_robot_to_robot, depth_frame)
 
     rr_log_trajectory("raw_trajectory", raw_trajectory, color=(0, 0, 255))
-    rr_log_pose("raw", raw_trajectory[-1], rectified_frame)
+    rr_log_pose("raw", raw_trajectory[-1], depth_frame)
 
     rr_log_graph_edges(path="graph", nodes=pose_graph.values, graph=pose_graph.graph)
-    rr_log_pose(path="optimized", pose=pose_graph.get_latest_pose(), frame=rectified_frame)
+    rr_log_pose(path="optimized", pose=pose_graph.get_latest_pose(), frame=depth_frame)
 
     trans_ate = np.linalg.norm(gt_keyframe_trajectory[-1].translation() - pose_graph.get_latest_pose().translation())
     rot_ate = np.rad2deg(np.linalg.norm(gt_keyframe_trajectory[-1].rotation().ypr() - pose_graph.get_latest_pose().rotation().ypr()))
