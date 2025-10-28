@@ -12,6 +12,14 @@ import numpy as np
 tartanair_data_root = str(Path(__file__).parent / 'data')
 ta.init(tartanair_data_root)
 
+# converts the TartanAir coordinate frame to the CV coordinate frame
+TA_TO_CV = np.array([
+    [0.0, 1.0, 0.0],
+    [0.0, 0.0, 1.0],
+    [1.0, 0.0, 0.0],
+])
+
+
 # https://tartanair.org/modalities.html
 tartanair_calib = StereoCalibration.create(
     K=np.array([
@@ -23,6 +31,54 @@ tartanair_calib = StereoCalibration.create(
     R=np.eye(3)
 )
 
+def get_tartanair_iterator_with_odometry(env="ArchVizTinyHouseDay", difficulty="easy", traj="P000", rotation_noise_sigmas=np.array([np.deg2rad(0.2), np.deg2rad(0.2), np.deg2rad(0.2)]), translation_noise_sigmas=np.array([0.005, 0.005, 0.005]), include_ground_truth=False):
+    ta_iterator = ta.iterator(
+        env=[env],
+        difficulty=difficulty,
+        trajectory_id=traj,
+        modality=["image"],
+        camera_name=["lcam_front", "rcam_front"],
+    )
+
+    world_to_prev_robot = None
+    world_to_first_robot = None
+
+    for sample in ta_iterator:
+        world_to_robot = se3_flattened_to_pose3(sample['lcam_front']['pose'])
+        world_to_robot = convert_coordinate_frame(world_to_robot, TA_TO_CV)
+
+        if world_to_prev_robot is None or world_to_first_robot is None:
+            world_to_prev_robot = world_to_robot
+            world_to_first_robot = world_to_robot
+            continue # skip since we can't provide a relative pose having seen only a single pose
+
+        prev_robot_to_robot = world_to_prev_robot.inverse() * world_to_robot
+
+        # add noise to the relative odometry measurement
+        rotation_noise = gtsam.Rot3.Expmap(np.random.normal(0, rotation_noise_sigmas))
+        translation_noise = gtsam.Point3(np.random.normal(0, translation_noise_sigmas))
+        prev_robot_to_robot_noise = gtsam.Pose3(rotation_noise, translation_noise)
+        noisy_prev_robot_to_robot = prev_robot_to_robot.compose(prev_robot_to_robot_noise) # should be equivalent to prev_robot_to_robot_noise * prev_robot_to_robot?
+
+        # prepare ground truth pose
+        first_robot_to_robot = world_to_first_robot.inverse() * world_to_robot
+
+        # update previous world to robot pose
+        world_to_prev_robot = world_to_robot
+
+        # prepare frame
+        frame =StereoFrame(
+            left=sample['lcam_front']['image'],
+            right=sample['rcam_front']['image'],
+            calibration=tartanair_calib
+        )
+
+        if include_ground_truth:
+            yield frame, noisy_prev_robot_to_robot, first_robot_to_robot
+        else:
+            yield frame, noisy_prev_robot_to_robot
+
+
 def load_tartanair_pair(env="ArchVizTinyHouseDay", difficulty="easy", traj="P000", max_dist=1.0, max_degs=20.0, seed=0):
     """
     Load a pair of sensor data samples from the TartanAir dataset at two close steps along the trajectory.
@@ -32,7 +88,7 @@ def load_tartanair_pair(env="ArchVizTinyHouseDay", difficulty="easy", traj="P000
         env=[env],
         difficulty=difficulty,
         trajectory_id=traj,
-        modality=["image", "depth"],
+        modality=["image"],
         camera_name=["lcam_front", "rcam_front"],
     )
 
@@ -41,12 +97,6 @@ def load_tartanair_pair(env="ArchVizTinyHouseDay", difficulty="easy", traj="P000
     random.seed(seed)
     start_idx = random.randint(0, traj_len - 2)
     end_idx = start_idx + 1
-
-    TA_TO_CV = np.array([
-        [0.0, 1.0, 0.0],
-        [0.0, 0.0, 1.0],
-        [1.0, 0.0, 0.0],
-    ])
 
     for _ in range(start_idx + 1):
         first = next(ta_iterator)

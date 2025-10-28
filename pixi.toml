@@ -18,6 +18,7 @@ opencv-python = ">=4.12.0.88, <5"
 torchvision = ">=0.24.0, <0.25"
 onnxruntime = ">=1.23.2, <2"
 opencv-contrib-python = ">=4.12.0.88, <5"
+rerun-sdk = { version = ">=0.26.2, <0.27", extras = ["notebook"] }
 
 [feature.dev.pypi-dependencies]
 ipykernel = "*"
