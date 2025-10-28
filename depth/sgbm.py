@@ -1,9 +1,12 @@
 from __future__ import annotations
 
+from dataclasses import asdict
 from typing import Literal, Optional
 
 import cv2
 import numpy as np
+
+from registration.registration import FramePair, RectifiedStereoFrame, StereoDepthFrame
 
 
 class SGBM:
@@ -82,3 +85,27 @@ class SGBM:
             array = np.clip(array, 0, 255).astype(np.uint8)
 
         return np.ascontiguousarray(array)
+
+    def compute_depth(self, frame: RectifiedStereoFrame, max_depth: float = 20.0) -> StereoDepthFrame:
+        disparity = self(frame.left_rect, frame.right_rect)
+
+        depth_xyz = cv2.reprojectImageTo3D(disparity, frame.calibration.Q)
+
+        depth = depth_xyz[:, :, 2]
+        depth[depth > max_depth] = np.nan
+    
+        return StereoDepthFrame(
+            **{k: v for k, v in frame.__dict__.items() if not k.startswith('__')},
+            left_depth=depth,
+            left_depth_xyz=depth_xyz
+        )
+
+    def compute_depth_pair(self, pair: FramePair[RectifiedStereoFrame], max_depth: float = 20.0) -> FramePair[StereoDepthFrame]:
+        first_depth = self.compute_depth(pair.first, max_depth)
+        second_depth = self.compute_depth(pair.second, max_depth)
+
+        return pair.__class__[StereoDepthFrame](
+            **{k: v for k, v in pair.__dict__.items() if not k.startswith('__') and k not in ['first', 'second']},
+            first=first_depth,
+            second=second_depth
+        )

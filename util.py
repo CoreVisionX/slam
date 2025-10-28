@@ -14,3 +14,8 @@ def se3_flattened_to_pose3(se3_flattened: np.ndarray) -> gtsam.Pose3:
 
     return se3_to_pose3(T)
 
+def convert_coordinate_frame(pose: gtsam.Pose3, old_to_new_frame: np.ndarray) -> gtsam.Pose3:
+    new_R = old_to_new_frame @ pose.rotation().matrix() @ old_to_new_frame.T
+    new_t = old_to_new_frame @ pose.translation()
+
+    return gtsam.Pose3(gtsam.Rot3(new_R), gtsam.Point3(new_t))

@@ -5,7 +5,7 @@ import random
 import gtsam
 from registration.registration import StereoCalibration, StereoFrame, FramePairWithGroundTruth
 import tartanair as ta
-from util import se3_flattened_to_pose3, se3_to_pose3
+from util import convert_coordinate_frame, se3_flattened_to_pose3, se3_to_pose3
 import numpy as np
 
 # setup tartanair
@@ -51,17 +51,11 @@ def load_tartanair_pair(env="ArchVizTinyHouseDay", difficulty="easy", traj="P000
     for _ in range(start_idx + 1):
         first = next(ta_iterator)
     first_pose = se3_flattened_to_pose3(first['lcam_front']['pose'])
-
-    first_pose_R = TA_TO_CV @ first_pose.rotation().matrix() @ TA_TO_CV.T
-    first_pose_t = TA_TO_CV @ first_pose.translation()
-    first_pose = gtsam.Pose3(gtsam.Rot3(first_pose_R), gtsam.Point3(first_pose_t))
+    first_pose = convert_coordinate_frame(first_pose, TA_TO_CV)
 
     second = next(ta_iterator)
     second_pose = se3_flattened_to_pose3(second['lcam_front']['pose'])
-
-    second_pose_R = TA_TO_CV @ second_pose.rotation().matrix() @ TA_TO_CV.T
-    second_pose_t = TA_TO_CV @ second_pose.translation()
-    second_pose = gtsam.Pose3(gtsam.Rot3(second_pose_R), gtsam.Point3(second_pose_t))
+    second_pose = convert_coordinate_frame(second_pose, TA_TO_CV)
 
     while True:
         idx = end_idx + 1
@@ -72,14 +66,10 @@ def load_tartanair_pair(env="ArchVizTinyHouseDay", difficulty="easy", traj="P000
             break
 
         sample_pose = se3_flattened_to_pose3(sample['lcam_front']['pose'])
-
-        sample_pose_R = TA_TO_CV @ sample_pose.rotation().matrix() @ TA_TO_CV.T
-        sample_pose_t = TA_TO_CV @ sample_pose.translation()
-        sample_pose = gtsam.Pose3(gtsam.Rot3(sample_pose_R), gtsam.Point3(sample_pose_t))
+        sample_pose = convert_coordinate_frame(sample_pose, TA_TO_CV)
 
         sample_dist = np.linalg.norm(sample_pose.translation() - first_pose.translation())
         sample_angle = np.linalg.norm((first_pose.inverse() * sample_pose).rotation().ypr())
-        print('sample_angle', np.rad2deg(sample_angle), 'sample_dist', sample_dist)
 
         if sample_dist < max_dist and sample_angle < np.deg2rad(max_degs):
             end_idx = idx
@@ -87,8 +77,6 @@ def load_tartanair_pair(env="ArchVizTinyHouseDay", difficulty="easy", traj="P000
             second_pose = sample_pose
         else:
             break
-
-    # TODO: add calibration
 
     return FramePairWithGroundTruth[StereoFrame](
         first=StereoFrame(
@@ -103,3 +91,30 @@ def load_tartanair_pair(env="ArchVizTinyHouseDay", difficulty="easy", traj="P000
         ),
         first_T_second=first_pose.inverse() * second_pose
     )
+
+def print_pose_error(*, estimated_pose: gtsam.Pose3 | None = None, ground_truth_pose: gtsam.Pose3 | None = None):
+    if estimated_pose is not None and ground_truth_pose is not None:
+        pose_error = estimated_pose * ground_truth_pose.inverse()
+        
+        print('--------------------------------')
+        print(f'Estimated translation: ({np.linalg.norm(estimated_pose.translation()):.2f} m) [{estimated_pose.translation()[0]:.2f}, {estimated_pose.translation()[1]:.2f}, {estimated_pose.translation()[2]:.2f}]')
+        print(f'Estimated rotation: ({np.linalg.norm(np.rad2deg(estimated_pose.rotation().ypr())):.2f} deg) [{np.rad2deg(estimated_pose.rotation().ypr()[0]):.2f}, {np.rad2deg(estimated_pose.rotation().ypr()[1]):.2f}, {np.rad2deg(estimated_pose.rotation().ypr()[2]):.2f}]')
+        print('--------------------------------')
+        print(f'Ground truth translation: ({np.linalg.norm(ground_truth_pose.translation()):.2f} m) [{ground_truth_pose.translation()[0]:.2f}, {ground_truth_pose.translation()[1]:.2f}, {ground_truth_pose.translation()[2]:.2f}]')
+        print(f'Ground truth rotation: ({np.linalg.norm(np.rad2deg(ground_truth_pose.rotation().ypr())):.2f} deg) [{np.rad2deg(ground_truth_pose.rotation().ypr()[0]):.2f}, {np.rad2deg(ground_truth_pose.rotation().ypr()[1]):.2f}, {np.rad2deg(ground_truth_pose.rotation().ypr()[2]):.2f}]')
+        print('--------------------------------')
+        print(f'Pose error translation: ({np.linalg.norm(pose_error.translation()):.2f} m) [{pose_error.translation()[0]:.2f}, {pose_error.translation()[1]:.2f}, {pose_error.translation()[2]:.2f}]')
+        print(f'Pose error rotation: ({np.linalg.norm(np.rad2deg(pose_error.rotation().ypr())):.2f} deg) [{np.rad2deg(pose_error.rotation().ypr()[0]):.2f}, {np.rad2deg(pose_error.rotation().ypr()[1]):.2f}, {np.rad2deg(pose_error.rotation().ypr()[2]):.2f}]')
+        print('--------------------------------')
+    elif estimated_pose is not None:
+        print('--------------------------------')
+        print(f'Estimated translation: ({np.linalg.norm(estimated_pose.translation()):.2f} m) [{estimated_pose.translation()[0]:.2f}, {estimated_pose.translation()[1]:.2f}, {estimated_pose.translation()[2]:.2f}]')
+        print(f'Estimated rotation: ({np.linalg.norm(np.rad2deg(estimated_pose.rotation().ypr())):.2f} deg) [{np.rad2deg(estimated_pose.rotation().ypr()[0]):.2f}, {np.rad2deg(estimated_pose.rotation().ypr()[1]):.2f}, {np.rad2deg(estimated_pose.rotation().ypr()[2]):.2f}]')
+        print('--------------------------------')
+    elif ground_truth_pose is not None:
+        print('--------------------------------')
+        print(f'Ground truth translation: ({np.linalg.norm(ground_truth_pose.translation()):.2f} m) [{ground_truth_pose.translation()[0]:.2f}, {ground_truth_pose.translation()[1]:.2f}, {ground_truth_pose.translation()[2]:.2f}]')
+        print(f'Ground truth rotation: ({np.linalg.norm(np.rad2deg(ground_truth_pose.rotation().ypr())):.2f} deg) [{np.rad2deg(ground_truth_pose.rotation().ypr()[0]):.2f}, {np.rad2deg(ground_truth_pose.rotation().ypr()[1]):.2f}, {np.rad2deg(ground_truth_pose.rotation().ypr()[2]):.2f}]')
+        print('--------------------------------')
+    else:
+        raise ValueError('At least one of estimated_pose or ground_truth_pose must be provided')

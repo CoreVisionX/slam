@@ -63,15 +63,12 @@ def solve_pnp(pair: FramePair[StereoDepthFrame], mkpts1: np.ndarray, mkpts2: np.
     v = mkpts1[:, 0].astype(int)
 
     mkpts1_3d = pair.first.left_depth_xyz[u, v, :]
+    mkpts1_depth = pair.first.left_depth[u, v]
 
-    print('mkpts1_3d', mkpts1_3d.shape)
-
-    valid_mask = mkpts1_3d[:, 2] > 0
+    valid_mask = mkpts1_depth > 0
     mkpts1_3d = mkpts1_3d[valid_mask]
     mkpts1 = mkpts1[valid_mask]
     mkpts2 = mkpts2[valid_mask]
-
-    print('mkpts1_3d', mkpts1_3d.shape)
 
     ret, rvec, tvec, inliers = cv2.solvePnPRansac(
         mkpts1_3d, 
@@ -84,8 +81,6 @@ def solve_pnp(pair: FramePair[StereoDepthFrame], mkpts1: np.ndarray, mkpts2: np.
         flags=cv2.SOLVEPNP_ITERATIVE
     )
     inliers = inliers.ravel()
-
-    print('inliers', inliers.shape)
 
     R, _ = cv2.Rodrigues(rvec)
     t = tvec.reshape(3)
