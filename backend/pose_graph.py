@@ -5,6 +5,8 @@ from gtsam.symbol_shorthand import X, V, B
 
 import logging
 
+from registration.registration import StereoDepthFrame
+
 
 class GtsamPoseGraph:
     # think about how you can offload as much bookkeeping and timing and whatnot for odom/slam uses cases into this
@@ -31,6 +33,7 @@ class GtsamPoseGraph:
 
         self.values = gtsam.Values()
         self.graph = gtsam.NonlinearFactorGraph()
+        self.frames: dict[int, StereoDepthFrame] = {}
 
         self.kf_idx = 0
 
@@ -62,7 +65,8 @@ class GtsamPoseGraph:
         self.pim.integrateMeasurement(linear_acc, ang_vel, dt)
 
     # TODO: velocity constraints on the odometry
-    def process_odometry(self, prev_to_latest, prev_to_latest_noise):
+    # TODO: decouple the frame from the odometry processing so they can be processed at different rates
+    def process_odometry(self, prev_to_latest, prev_to_latest_noise, frame: StereoDepthFrame):
         prev_idx = self.kf_idx
         next_idx = self.kf_idx + 1
 
@@ -90,6 +94,8 @@ class GtsamPoseGraph:
         if self.pim is not None:
             self.append_imu_factor(self.pim)
             self.pim.resetIntegration()
+
+        self.frames[next_idx] = frame
 
     def append_imu_factor(self, pim):
         prev_idx = self.kf_idx

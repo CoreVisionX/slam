@@ -137,5 +137,12 @@ class FramePair[S]:
     second: S
 
 @dataclass
+class IndexedFramePair[S](FramePair[S]):
+    first: S
+    second: S
+    first_idx: int
+    second_idx: int
+
+@dataclass
 class FramePairWithGroundTruth[S](FramePair[S]):
     first_T_second: gtsam.Pose3
