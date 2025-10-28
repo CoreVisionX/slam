@@ -45,6 +45,10 @@ loop_noise = odometry_noise # set it to the odometry noise so they're weighted e
 # TODO: log numbers and changes in inlier counts somehow?
 # setup two-view pose estimation
 matcher = LightglueMatcher(num_features=2048)
+
+# TODO: might be too high and preventing wide baseline loop closures
+# try adding geometric and graph consistency checks to allow for more robust <100 inlier loop closures?
+# a basic robust loss might also help with outliers
 min_inlier_count = 200
 
 # TODO: refactor keyframing logic into it's own class
