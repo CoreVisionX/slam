@@ -53,7 +53,7 @@ matcher = LightglueMatcher(num_features=2048)
 min_inlier_count = 200
 
 # TODO: refactor keyframing logic into it's own class
-keyframe_translation_threshold = 2.0
+keyframe_translation_threshold = 1.0
 keyframe_rotation_threshold = np.deg2rad(20)
 cur_keyframe_pose = None
 
