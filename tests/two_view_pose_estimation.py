@@ -3,7 +3,7 @@ import sys
 import os
 import matplotlib.pyplot as plt
 
-sys.path.append(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
+sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from registration.lightglue import LightglueMatcher
 from registration.utils import fundamental_fitler, rectify_stereo_frame_pair, solve_pnp, stack_pair_images, draw_matches
 import tests.test_utils
