@@ -35,7 +35,7 @@ sgbm = SGBM(num_disparities=16 * 6, block_size=5, image_color='RGB')
 
 # setup backend
 pose_graph = GtsamPoseGraph(K=tartanair_calib.K_left_rect)
-loop_detector = ProximityLoopDetector(max_translation=5.0, max_rotation=np.deg2rad(35), max_candidates=5, min_seperation=1)
+loop_detector = ProximityLoopDetector(max_translation=7.0, max_rotation=np.deg2rad(35), max_candidates=5, min_seperation=2)
 
 # loop_noise = gtsam.noiseModel.Diagonal.Sigmas(np.array([np.deg2rad(0.5), np.deg2rad(0.5), np.deg2rad(0.5), 0.01, 0.01, 0.01]))
 loop_noise = odometry_noise # set it to the odometry noise so they're weighted equally which will make debugging the influence of the loop closures easier
@@ -48,11 +48,12 @@ matcher = LightglueMatcher(num_features=2048)
 
 # TODO: might be too high and preventing wide baseline loop closures
 # try adding geometric and graph consistency checks to allow for more robust <100 inlier loop closures?
+# varying the noise based on the inlier count might also help?
 # a basic robust loss might also help with outliers
 min_inlier_count = 200
 
 # TODO: refactor keyframing logic into it's own class
-keyframe_translation_threshold = 1.0
+keyframe_translation_threshold = 2.0
 keyframe_rotation_threshold = np.deg2rad(20)
 cur_keyframe_pose = None
 
