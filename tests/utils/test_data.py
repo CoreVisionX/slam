@@ -13,7 +13,7 @@ from registration.utils import fundamental_fitler, rectify_stereo_frame_pair, so
 import tests.test_utils
 
 
-pair = tests.test_utils.load_tartanair_pair(seed=1, max_degs=35.0, max_dist=2.0, traj='P003')
+pair = tests.test_utils.load_tartanair_pair(seed=2, max_degs=40.0, max_dist=5.0, env='AbandonedFactory', traj='P001')
 
 plt.imshow(stack_pair_images(pair, 'left'))
 
@@ -50,7 +50,7 @@ second_depth_xyz = cv2.reprojectImageTo3D(second_disparity, rectified_pair.secon
 first_depth = first_depth_xyz[:, :, 2]
 second_depth = second_depth_xyz[:, :, 2]
 
-max_depth = 3.0
+max_depth = 30.0
 first_depth[first_depth > max_depth] = np.nan
 second_depth[second_depth > max_depth] = np.nan
 
