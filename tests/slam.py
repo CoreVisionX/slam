@@ -1,4 +1,6 @@
 # %%
+from dataclasses import dataclass
+from queue import Empty, Full
 import sys
 import os
 import time
@@ -6,164 +8,432 @@ import gtsam
 from gtsam.symbol_shorthand import X
 import numpy as np
 import rerun as rr
+import torch.multiprocessing
+from torch.multiprocessing import Process, Queue
+
+if __name__ == "__main__":
+    torch.multiprocessing.set_start_method('spawn')
+
+# os.environ["TORCHINDUCTOR_COMPILE_THREADS"] = "1" 
+# import torch, torch._inductor.config as ind
+# ind.compile_threads = 1
+
+# TODO: why is the main thread still running so slow even with loop closure running in a separate process?
+# there shouldn't be anything heavy blocking??
+
+# TODO: watch memory usage to make sure the jetson isn't running out of memory
+# TODO: use python logger and make sure rerun it picks it up for easier debugging
 
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-from registration.registration import FramePair, StereoDepthFrame
 from backend.pose_graph import GtsamPoseGraph
 from backend.proximity_loop_detector import ProximityLoopDetector
 from tests.test_utils import get_tartanair_iterator_with_odometry, tartanair_calib
 from depth.sgbm import SGBM
+from registration.registration import FramePair, IndexedFramePair, FeatureFrame
 from registration.lightglue import LightglueMatcher
+from registration.lighterglue import LighterglueMatcher
 from registration.utils import fundamental_fitler, solve_pnp
-from viz import rr_log_pose, rr_log_trajectory, rr_log_graph_edges
+from viz import rr_log_map_points, rr_log_pose, rr_log_trajectory, rr_log_graph_edges
 
-odometry_iterator = get_tartanair_iterator_with_odometry(
-    env='AbandonedFactory', 
-    difficulty='easy', 
-    traj='P001', 
-    include_ground_truth=True,
-    rotation_noise_sigmas=np.array([np.deg2rad(0.5), np.deg2rad(0.5), np.deg2rad(0.5)]),
-    translation_noise_sigmas=np.array([0.008, 0.008, 0.008])
-)
 
-# TODO: the noise should probably be much higher than the real noise since we're integrating the odometry poses between keyframes
-odometry_noise = gtsam.noiseModel.Diagonal.Sigmas(np.array([np.deg2rad(0.2), np.deg2rad(0.2), np.deg2rad(0.2), 0.005, 0.005, 0.005]))
+# TODO: definitely factor all this multiprocessing logic out, it needs to be robust and reusable
+# TODO: log loop closure candidate average age somehow to make sure they're not too stale or doing anything weird
+@dataclass
+class LoopClosureResult:
+    candidate: IndexedFramePair[FeatureFrame]
+    first_to_second: gtsam.Pose3
+    noise: gtsam.noiseModel.Diagonal
+    mkpts1: np.ndarray
+    mkpts1_3d: np.ndarray
+    mkpts1_color: np.ndarray
+    
+def loop_closure_worker(loop_closure_candidates_queue: Queue, loop_closures_queue: Queue, loop_noise: gtsam.noiseModel.Diagonal, min_inlier_count: int):
+    """
+    Worker process for loop closing
 
-rr.init("slam", spawn=True)
+    # Approach
 
-sgbm = SGBM(num_disparities=16 * 6, block_size=5, image_color='RGB')
+    Queue message passing:
+    - Every frame the main process the odometry, add it to the pose graph,
+    find loop closure candidates, and queue the candidate pairs from the loop closure worker
+    - The loop closure worker will get the latest candidate pairs (this will be implement by having a maximum queue size that's fairly low to prevent latency?),
+    attempt to estimate their relative pose, and send the results back to the main process via a loop closures queue
+    - The worker will be checking the loop closures queue and adding the loop closures to the pose graph as they come in
+    """
 
-# setup backend
-pose_graph = GtsamPoseGraph(K=tartanair_calib.K_left_rect)
-loop_detector = ProximityLoopDetector(max_translation=5.0, max_rotation=np.deg2rad(35), max_candidates=5, min_seperation=2)
+    # TODO: consider factoring this out into it's own class too
+    # TODO: log match images somehow?
+    # TODO: log numbers and changes in inlier counts somehow?
+    # setup two-view pose estimation
+    # matcher = LightglueMatcher(num_features=1536, compile=False, mp=True, device='cuda')
+    matcher = LighterglueMatcher(num_features=4096, compile=False, device='cuda', use_lighterglue_matching=True)
+    print("Loop closure worker started")
 
-# loop_noise = gtsam.noiseModel.Diagonal.Sigmas(np.array([np.deg2rad(0.5), np.deg2rad(0.5), np.deg2rad(0.5), 0.01, 0.01, 0.01]))
-loop_noise = odometry_noise # set it to the odometry noise so they're weighted equally which will make debugging the influence of the loop closures easier
+    times = []
+    i = 0
+    log_every = 20
+    max_queue_size = 5
 
-# TODO: consider factoring this out into it's own class too
-# TODO: log match images somehow?
-# TODO: log numbers and changes in inlier counts somehow?
-# setup two-view pose estimation
-matcher = LightglueMatcher(num_features=2048)
+    candidates = []
 
-# TODO: might be too high and preventing wide baseline loop closures
-# try adding geometric and graph consistency checks to allow for more robust <100 inlier loop closures?
-# varying the noise based on the inlier count might also help?
-# a basic robust loss might also help with outliers
-min_inlier_count = 200
+    while True:
+        if len(candidates) == 0 and loop_closure_candidates_queue.empty():
+            time.sleep(0.01)
+            continue
 
-# TODO: refactor keyframing logic into it's own class
-keyframe_translation_threshold = 1.0
-keyframe_rotation_threshold = np.deg2rad(20)
-cur_keyframe_pose = None
+        # maintain the queue size on the worker side to prevent race conditions since only one actor is reading from the queue
+        while not loop_closure_candidates_queue.empty():
+            candidates.append(loop_closure_candidates_queue.get_nowait())
 
-raw_trajectory: list[gtsam.Pose3] = []
-gt_trajectory: list[gtsam.Pose3] = []
+        candidates = candidates[-max_queue_size:]
 
-gt_keyframe_trajectory: list[gtsam.Pose3] = []
+        candidate = candidates.pop(0)
 
-prev_frame = None
-
-for i, (frame, noisy_prev_robot_to_robot, first_robot_to_robot) in enumerate(odometry_iterator):
-    # update raw/gt trajectories
-    gt_trajectory.append(first_robot_to_robot)
-
-    if len(raw_trajectory) == 0:
-        raw_trajectory.append(noisy_prev_robot_to_robot)
-    else:
-        raw_trajectory.append(raw_trajectory[-1].compose(noisy_prev_robot_to_robot))
-
-    # preprocess frame
-    rectified_frame = frame.rectify()
-    depth_frame = sgbm.compute_depth(rectified_frame)
-
-    # update slam if a new keyframe is detected
-    if cur_keyframe_pose is None:
-        cur_keyframe_pose = first_robot_to_robot
-        pose_graph.process_odometry(noisy_prev_robot_to_robot, odometry_noise, depth_frame)
-
-        # TODO: figure out why doing this causes the estimated trajectory to be offset? I think it's because even this is actually the second frame not the first one or something?
-        # # TODO: this is a hack to get the loop detector to work with the first keyframe, fix this later
-        # pose_graph.frames[0] = depth_frame
-
-    # TODO: setup a proper reusable VO pipeline if you're going to use this
-    # # use visual odometry instead of the given raw odometry
-    # if prev_frame is not None:
-    #     try:
-    #         pair = FramePair[StereoDepthFrame](first=prev_frame, second=depth_frame)
-    #         mkpts1, mkpts2 = matcher.match(pair)
-    #         filtered_mkpts1, filtered_mkpts2, inlier_mask = fundamental_fitler(mkpts1, mkpts2)
-    #         first_to_second, pnp_filtered_mkpts1, pnp_filtered_mkpts2, pnp_inliers = solve_pnp(pair, filtered_mkpts1, filtered_mkpts2)
-
-    #         if len(pnp_inliers) < min_inlier_count:
-    #             raise ValueError("Not enough final inliers to solve PnP")
-           
-    #         noisy_prev_robot_to_robot = first_to_second
-    #         print(f"Computed visual odometry between {len(pnp_inliers)} inliers")
-
-    #     except ValueError:
-    #         print(f"Failed to solve PnP for visual odometry between {prev_frame.idx} and {depth_frame.idx}")
-
-    prev_frame = depth_frame
-
-    # use raw odometry for keyframe calculations
-    cur_keyframe_to_robot = cur_keyframe_pose.inverse() * raw_trajectory[-1]
-    dist = np.linalg.norm(cur_keyframe_to_robot.translation())
-    rot = np.linalg.norm(cur_keyframe_to_robot.rotation().ypr()) # TODO: use axis-angle or quaternions to avoid potential singularity issues?
-
-    if dist > keyframe_translation_threshold or rot > keyframe_rotation_threshold:
         start_time = time.perf_counter()
 
-        gt_keyframe_trajectory.append(first_robot_to_robot)
+        # mkpts1, mkpts2 = matcher.match([candidate])[0]
+        matched_pair = matcher.match([candidate])[0]
 
-        # update keyframe pose
-        cur_keyframe_pose = raw_trajectory[-1]
+        try:
+            # TODO: refactor to support fundemental filtering with feature frames
+            # filtered_mkpts1, filtered_mkpts2, inlier_mask = fundamental_fitler(mkpts1, mkpts2)
+            
+            first_to_second, matched_pair = solve_pnp(matched_pair)
+        except Exception as e:
+            # print(f"Failed to solve PnP for loop closure between {candidate.first_idx} and {candidate.second_idx} with {len(matched_pair.matches)} inliers: {e}")
+            continue
 
-        # update slam with new keyframe
-        # cur_keyframe_to_robot accumulates all of the odometry since the last keyframe
-        pose_graph.process_odometry(cur_keyframe_to_robot, odometry_noise, depth_frame)
-
-        loop_candidates = loop_detector.candidates(pose_graph, pose_graph.kf_idx)
-        for candidate in loop_candidates:
-            mkpts1, mkpts2 = matcher.match(candidate)
-
-            try:
-                filtered_mkpts1, filtered_mkpts2, inlier_mask = fundamental_fitler(mkpts1, mkpts2)
-                first_to_second, pnp_filtered_mkpts1, pnp_filtered_mkpts2, pnp_inliers = solve_pnp(candidate, filtered_mkpts1, filtered_mkpts2)
-            except Exception as e:
-                print(f"Failed to solve PnP for loop closure between {candidate.first_idx} and {candidate.second_idx}: {e}")
-                continue
-
-            if len(pnp_inliers) > min_inlier_count:
-                pose_graph.add_between_pose_factor(candidate.first_idx, candidate.second_idx, first_to_second, loop_noise)
-                print(f"Added loop closure between {candidate.first_idx} and {candidate.second_idx} with {len(pnp_inliers)} inliers")
-            else:
-                print(f"Failed to add loop closure between {candidate.first_idx} and {candidate.second_idx} with {len(pnp_inliers)} inliers")
-
-            # TODO: log the error the relative to the ground truth relative pose?
-
-        pose_graph.optimize()
+        if len(matched_pair.matches) > min_inlier_count:
+            # TODO: would sending back a matched pair be better?
+            # idk think about composition over inheritance for this kind of thing
+            result = LoopClosureResult(
+                candidate=candidate,
+                first_to_second=first_to_second,
+                noise=loop_noise,
+                mkpts1=matched_pair.mkpts1,
+                mkpts1_3d=matched_pair.mkpts1_3d,
+                mkpts1_color=matched_pair.mkpts1_color,
+            )
+            loop_closures_queue.put(result)
+        else:
+            # print(f"Failed to solve PnP for loop closure between {candidate.first_idx} and {candidate.second_idx} with {len(matched_pair.matches)} inliers")
+            pass
 
         end_time = time.perf_counter()
-        print(f"Frame Processing Time: {end_time - start_time:.2f} seconds ({1 / (end_time - start_time):.2f} fps)")
-    else:
-        continue
+        times.append(end_time - start_time)
+        i += 1
+        
+        if i % log_every == 0:
+            print(f"Mean Loop Closure Processing Time: {np.mean(times):.2f} seconds ({1 / np.mean(times):.2f} fps)")
+            times = []
 
-    # logging
-    rr.set_time("frame", sequence=i)
 
-    rr_log_trajectory("gt_trajectory", gt_trajectory, color=(0, 255, 0))
-    rr_log_pose("gt", first_robot_to_robot, depth_frame)
+if __name__ == "__main__":
+    # timestamps = np.load(os.path.join(os.path.dirname(__file__), 'data', 'AbandonedFactory', 'Data_easy', 'P001', 'imu', 'cam_time.npy'))
 
-    rr_log_trajectory("raw_trajectory", raw_trajectory, color=(0, 0, 255))
-    rr_log_pose("raw", raw_trajectory[-1], depth_frame)
+    # TODO: the noise should probably be much higher than the real noise since we're integrating the odometry poses between keyframes
+    odometry_noise = gtsam.noiseModel.Diagonal.Sigmas(np.array([np.deg2rad(1.0), np.deg2rad(1.0), np.deg2rad(1.0), 0.02, 0.02, 0.02]))
 
-    rr_log_graph_edges(path="graph", nodes=pose_graph.values, graph=pose_graph.graph)
-    rr_log_pose(path="optimized", pose=pose_graph.get_latest_pose(), frame=depth_frame)
+    # TODO: actually robust rerun setup (factor this out somewhere reusable)
+    rr.init("slam")
+    # rr.connect_tcp("192.168.88.1:9876")
+    rr.connect_tcp("192.168.1.37:9876")
 
-    trans_ate = np.linalg.norm(gt_keyframe_trajectory[-1].translation() - pose_graph.get_latest_pose().translation())
-    rot_ate = np.rad2deg(np.linalg.norm(gt_keyframe_trajectory[-1].rotation().ypr() - pose_graph.get_latest_pose().rotation().ypr()))
-    rr.log("/translation/ate", rr.Scalars(trans_ate))
-    rr.log("/rotation/ate", rr.Scalars(rot_ate))
+    sgbm = SGBM(num_disparities=16 * 4, block_size=5, image_color='RGB')
+
+    # setup backend
+    pose_graph = GtsamPoseGraph(K=tartanair_calib.K_left_rect)
+
+    # TODO: figure out a proximity loop closer with a minimum seperation between candidates it finds, not just the current pose. maybe that's what keyframes should be doing and I need a better way of maintaining the local trajectory smoothness? idk.
+    # show encourage longer baseline loop closures
+    loop_detector = ProximityLoopDetector(max_translation=7.0, max_rotation=np.deg2rad(60), max_candidates=5, min_seperation=1)
+
+    # TODO: figure out the proper noise model for this
+    # an interactive UI with sliders and visualizaation of the resulting optimization might be really useful
+    # also adding an optoin for a basic huber loss might help with outliers
+    # in that vein proper geometric verification in terms of making sure a new loop doesn't cause a massive weird change in the map or anything would be really useful
+    # in allowing for wide baseline loop closures that help a lot with large areas and long sessions
+    # while still avoding any bad loop closures that cause catastrophic damage to the map
+    # loop_noise = gtsam.noiseModel.Diagonal.Sigmas(np.array([np.deg2rad(1.0), np.deg2rad(1.0), np.deg2rad(1.0), 0.04, 0.04, 0.04]))
+    loop_noise = gtsam.noiseModel.Gaussian.Covariance(np.array([
+        [ 0.000006,  0.000000, -0.000000,  0.000002,  0.000042,  0.000008],
+        [ 0.000000,  0.000006, -0.000000, -0.000053,  0.000005,  0.000019],
+        [-0.000000, -0.000000,  0.000003, -0.000001,  0.000001, -0.000006],
+        [ 0.000002, -0.000053, -0.000001,  0.000711,  0.000028, -0.000017],
+        [ 0.000042,  0.000005,  0.000001,  0.000028,  0.000541,  0.000226],
+        [ 0.000008,  0.000019, -0.000006, -0.000017,  0.000226,  0.000637],
+    ]))
+    # loop_noise = odometry_noise # set it to the odometry noise so they're weighted equally which will make debugging the influence of the loop closures easier
+
+    # TODO: might be too high and preventing wide baseline loop closures
+    # try adding geometric and graph consistency checks to allow for more robust <100 inlier loop closures?
+    # varying the noise based on the inlier count might also help?
+    # a basic robust loss might also help with outliers
+    min_inlier_count = 75
+
+    # TODO: refactor keyframing logic into it's own class
+    # goal: encourage high quality wide baseline loop closures
+    keyframe_translation_threshold = 0.5 # I notice that higher values let more wide baseline loop closures be detected
+    keyframe_rotation_threshold = np.deg2rad(8)
+    cur_keyframe_pose = None
+
+    raw_trajectory: list[gtsam.Pose3] = []
+    gt_trajectory: list[gtsam.Pose3] = []
+    optimized_trajectory: list[gtsam.Pose3] = []
+
+    raw_keyframe_trajectory: list[gtsam.Pose3] = []
+    gt_keyframe_trajectory: list[gtsam.Pose3] = []
+
+    map_points: list[tuple[int, np.ndarray, np.ndarray]] = []
+
+
+    # frames with features already added should be okay since
+    # xfeat runs at like 15 fps
+    # should be Queue[IndexedFramePair[StereoDepthFrameWithFeatures]] but python doesn't support it?
+    # TODO: low max size and overwrite old candidates to maintain low latency
+    loop_closure_candidates_queue = Queue(maxsize=5000)
+
+    # should be Queue[LoopClosureResult] but python doesn't support it?
+    loop_closures_queue = Queue(maxsize=5000)
+
+    # inefficient but we need an instance of the matcher here too for feature detection
+    # we could either split the matcher into a feature detection and matching part or just have the worker do both?
+    matcher = LighterglueMatcher(num_features=4096, compile=False, device='cuda', use_lighterglue_matching=True)
+
+    # start the loop closure worker
+    loop_closure_worker_process = Process(target=loop_closure_worker, args=(loop_closure_candidates_queue, loop_closures_queue, loop_noise, min_inlier_count))
+    loop_closure_worker_process.start()
+
+    print("Waiting for the worker to start...")
+    time.sleep(10) # wait for the worker to start
+
+    exc_ts_start = None
+
+    odometry_iterator = get_tartanair_iterator_with_odometry(
+        env='AbandonedFactory', 
+        difficulty='hard', 
+        traj='P001', 
+        include_ground_truth=True,
+        rotation_noise_sigmas=np.array([np.deg2rad(1.0), np.deg2rad(1.0), np.deg2rad(1.0)]),
+        translation_noise_sigmas=np.array([0.02, 0.02, 0.02])
+    )
+
+    print("Starting trajectory processing...")
+    for i, (frame, noisy_prev_robot_to_robot, first_robot_to_robot) in enumerate(odometry_iterator):
+        # ts = timestamps[i]
+        
+        if exc_ts_start is None:
+            exc_ts_start = time.perf_counter()
+
+        exc_ts = time.perf_counter() - exc_ts_start
+
+        # update raw/gt trajectories
+        gt_trajectory.append(first_robot_to_robot)
+
+        if len(raw_trajectory) == 0:
+            raw_trajectory.append(noisy_prev_robot_to_robot)
+        else:
+            raw_trajectory.append(raw_trajectory[-1].compose(noisy_prev_robot_to_robot))
+
+        # simulate realtime processing
+
+        # # warn if we're behind realtime by more than 0.5 seconds
+        # if exc_ts > (ts + 0.5):
+        #     print(f"Behind realtime by {exc_ts - ts:.2f} seconds, skipping frame")
+        #     continue
+
+        # # sleep until the true time if we're ahead of realtime
+        # if exc_ts < ts:
+        #     time.sleep(ts - exc_ts)
+
+        time.sleep(0.2) # wait to simulate realtime processing
+
+        start_time = time.perf_counter()
+
+        # update slam if a new keyframe is detected
+        if cur_keyframe_pose is None:
+            cur_keyframe_pose = first_robot_to_robot
+
+            # TODO: definitely need to clean this up and refactor it out somewhere reusable and debuggable and testable, it's a big perf sink
+            # preprocess frame
+            start_preprocess_time = time.perf_counter()
+            rectified_frame = frame.rectify()
+            depth_frame = sgbm.compute_depth(rectified_frame)
+            feature_frame = matcher.detect_features([depth_frame])[0]
+            end_preprocess_time = time.perf_counter()
+            # print(f"Preprocess Time: {end_preprocess_time - start_preprocess_time:.2f} seconds ({1 / (end_preprocess_time - start_preprocess_time):.2f} fps)")
+
+            pose_graph.process_odometry(noisy_prev_robot_to_robot, odometry_noise, feature_frame)
+
+            # TODO: figure out why doing this causes the estimated trajectory to be offset? I think it's because even this is actually the second frame not the first one or something?
+            # # TODO: this is a hack to get the loop detector to work with the first keyframe, fix this later
+            # pose_graph.frames[0] = depth_frame_with_features
+
+        # TODO: setup a proper reusable VO pipeline if you're going to use this
+        # # use visual odometry instead of the given raw odometry
+        # if prev_frame is not None:
+        #     try:
+        #         pair = FramePair[StereoDepthFrame](first=prev_frame, second=depth_frame_with_features)
+        #         mkpts1, mkpts2 = matcher.match(pair)
+        #         filtered_mkpts1, filtered_mkpts2, inlier_mask = fundamental_fitler(mkpts1, mkpts2)
+        #         first_to_second, pnp_filtered_mkpts1, pnp_filtered_mkpts2, pnp_inliers = solve_pnp(pair, filtered_mkpts1, filtered_mkpts2)
+
+        #         if len(pnp_inliers) < min_inlier_count:
+        #             raise ValueError("Not enough final inliers to solve PnP")
+            
+        #         noisy_prev_robot_to_robot = first_to_second
+        #         print(f"Computed visual odometry between {len(pnp_inliers)} inliers")
+
+        #     except ValueError:
+        #         print(f"Failed to solve PnP for visual odometry between {prev_frame.idx} and {depth_frame_with_features.idx}")
+
+        # use raw odometry for keyframe calculations
+        cur_keyframe_to_robot = cur_keyframe_pose.inverse() * raw_trajectory[-1]
+        dist = np.linalg.norm(cur_keyframe_to_robot.translation())
+        rot = np.linalg.norm(cur_keyframe_to_robot.rotation().ypr()) # TODO: use axis-angle or quaternions to avoid potential singularity issues?
+
+        if dist > keyframe_translation_threshold or rot > keyframe_rotation_threshold:
+            # preprocess frame
+            start_preprocess_time = time.perf_counter()
+            rectified_frame = frame.rectify()
+            depth_frame = sgbm.compute_depth(rectified_frame)
+            feature_frame = matcher.detect_features([depth_frame])[0]
+            end_preprocess_time = time.perf_counter()
+            # print(f"Preprocess Time: {end_preprocess_time - start_preprocess_time:.2f} seconds ({1 / (end_preprocess_time - start_preprocess_time):.2f} fps)")
+
+            gt_keyframe_trajectory.append(first_robot_to_robot)
+            raw_keyframe_trajectory.append(raw_trajectory[-1])
+
+
+            # update keyframe pose
+            cur_keyframe_pose = raw_trajectory[-1]
+
+            # update slam with new keyframe
+            # cur_keyframe_to_robot accumulates all of the odometry since the last keyframe
+            pose_graph.process_odometry(cur_keyframe_to_robot, odometry_noise, feature_frame)
+
+            start_match_time = time.perf_counter()
+
+            # queue new loop closure candidates
+            loop_candidates = loop_detector.candidates(pose_graph, pose_graph.kf_idx)
+
+            # TODO: figure out how to not overwrite the queue too much? or at least preserve the closest candidates?
+            start_loop_closure_candidates_time = time.perf_counter()
+            for candidate in loop_candidates:
+                # # TODO: this is a hack get rid of this later
+                # # detach all tensors from the GPU and move to the CPU before queuing to avoid cuda issues
+                # for key in candidate.first.features.__dict__:
+                #     if isinstance(candidate.first.features.__dict__[key], torch.Tensor):
+                #         print(f"Detaching {key} from GPU")
+                #         candidate.first.features.__dict__[key] = candidate.first.features.__dict__[key].detach().cpu()
+
+                # for key in candidate.second.features.__dict__:
+                #     if isinstance(candidate.second.features.__dict__[key], torch.Tensor):
+                #         print(f"Detaching {key} from GPU")
+                #         candidate.second.features.__dict__[key] = candidate.second.features.__dict__[key].detach().cpu()
+
+                # TODO: definitely refactor this out somewhere but also
+                # make sure the order we're removing candidates from the right side so that we're minimizing
+                # latency?
+                # try:
+                loop_closure_candidates_queue.put_nowait(candidate)
+                # except Full:
+                #     print(f"Loop closure candidate queue is full, dropping oldest candidate to maintain low latency")
+                #     loop_closure_candidates_queue.get_nowait()
+                #     loop_closure_candidates_queue.put_nowait(candidate)
+
+            end_loop_closure_candidates_time = time.perf_counter()
+            # print(f"Loop Closure Candidates Time: {end_loop_closure_candidates_time - start_loop_closure_candidates_time:.2f} seconds ({1 / (end_loop_closure_candidates_time - start_loop_closure_candidates_time):.2f} fps)")
+
+            # process any loop closure results from the worker
+            start_loop_closure_results_time = time.perf_counter()
+            while not loop_closures_queue.empty():
+                result = loop_closures_queue.get_nowait()
+                assert result is not None
+        
+                pose_graph.add_between_pose_factor(result.candidate.first_idx, result.candidate.second_idx, result.first_to_second, result.noise)
+                
+                rand_idxs = np.random.choice(len(result.mkpts1_3d), size=min(200, len(result.mkpts1_3d)), replace=False)
+                map_points.append((result.candidate.first_idx, result.mkpts1_3d[rand_idxs], result.mkpts1_color[rand_idxs]))
+                if len(map_points) > 1000: # cap the map points to prevent memory issues
+                    map_points.pop(0)
+            
+            end_loop_closure_results_time = time.perf_counter()
+            # print(f"Loop Closure Results Time: {end_loop_closure_results_time - start_loop_closure_results_time:.2f} seconds ({1 / (end_loop_closure_results_time - start_loop_closure_results_time):.2f} fps)")
+
+            # # single-process loop closure processing
+            # candidate_matches = matcher.match(loop_candidates)
+            # end_match_time = time.perf_counter()
+            # print(f"Match Time: {end_match_time - start_match_time:.2f} seconds ({1 / (end_match_time - start_match_time):.2f} fps)")
+
+            # for candidate, (mkpts1, mkpts2) in zip(loop_candidates, candidate_matches):
+            #     try:
+            #         start_filter_time = time.perf_counter()
+            #         filtered_mkpts1, filtered_mkpts2, inlier_mask = fundamental_fitler(mkpts1, mkpts2)
+            #         end_filter_time = time.perf_counter()
+            #         print(f"Filter Time: {end_filter_time - start_filter_time:.2f} seconds ({1 / (end_filter_time - start_filter_time):.2f} fps)")
+
+            #         start_pnp_time = time.perf_counter()
+            #         first_to_second, pnp_filtered_mkpts1, pnp_filtered_mkpts2, pnp_3d_points, pnp_color_mkpts1, pnp_inliers = solve_pnp(candidate, filtered_mkpts1, filtered_mkpts2)
+            #         end_pnp_time = time.perf_counter()
+            #         print(f"PnP Time: {end_pnp_time - start_pnp_time:.2f} seconds ({1 / (end_pnp_time - start_pnp_time):.2f} fps)")
+            #     except Exception as e:
+            #         print(f"Failed to solve PnP for loop closure between {candidate.first_idx} and {candidate.second_idx} with {len(mkpts1)} inliers: {e}")
+            #         continue
+
+            #     if len(pnp_inliers) > min_inlier_count:
+            #         pose_graph.add_between_pose_factor(candidate.first_idx, candidate.second_idx, first_to_second, loop_noise)
+            #         # print(f"Added loop closure between {candidate.first_idx} and {candidate.second_idx} with {len(pnp_inliers)} inliers")
+
+            #         map_points.append((candidate.first_idx, pnp_3d_points, pnp_color_mkpts1))
+            #     else:
+            #         # print(f"Failed to add loop closure between {candidate.first_idx} and {candidate.second_idx} with {len(pnp_inliers)} inliers")
+            #         pass
+
+            #     # TODO: log the error the relative to the ground truth relative pose? see if there's any correlations between various parts of bad loop closures?
+
+            start_optimize_time = time.perf_counter()
+            pose_graph.optimize()
+            end_optimize_time = time.perf_counter()
+            # print(f"Optimize Time: {end_optimize_time - start_optimize_time:.2f} seconds ({1 / (end_optimize_time - start_optimize_time):.2f} fps)")
+
+            # time.sleep(0.2) # sleep for a moment to simulate real-time odometry
+        else:
+            continue
+
+        # logging
+        start_logging_time = time.perf_counter()
+
+        rr.set_time_sequence("frame", sequence=i)
+
+        rr_log_trajectory("gt_keyframe_trajectory", gt_keyframe_trajectory, color=(0, 255, 0))
+        # rr_log_trajectory("gt_trajectory", gt_trajectory, color=(0, 255, 0))
+        # # rr_log_pose("gt", first_robot_to_robot, depth_frame_with_features)
+
+        rr_log_trajectory("raw_keyframe_trajectory", raw_keyframe_trajectory, color=(0, 0, 255))
+        # rr_log_trajectory("raw_trajectory", raw_trajectory, color=(0, 0, 255))
+        # # rr_log_pose("raw", raw_trajectory[-1], depth_frame_with_features)
+
+        # optimized_trajectory.append(pose_graph.get_latest_pose())
+        # rr_log_trajectory("optimized_trajectory", optimized_trajectory, color=(255, 0, 0))
+        rr_log_graph_edges(path="graph", nodes=pose_graph.values, graph=pose_graph.graph)
+        # rr_log_pose(path="optimized", pose=pose_graph.get_latest_pose(), frame=depth_frame)
+
+        # this might be causing perf issues? not sure
+        rr_log_map_points("map_points", pose_graph, map_points)
+
+        # trans_ate = np.linalg.norm(gt_keyframe_trajectory[-1].translation() - pose_graph.get_latest_pose().translation())
+        # rot_ate = np.rad2deg(np.linalg.norm(gt_keyframe_trajectory[-1].rotation().ypr() - pose_graph.get_latest_pose().rotation().ypr()))
+        trans_ate = np.mean([np.linalg.norm(gt_keyframe_trajectory[i].translation() - pose_graph.values.atPose3(X(i)).translation()) for i in range(len(gt_keyframe_trajectory))])
+        rot_ate = np.mean([np.linalg.norm(gt_keyframe_trajectory[i].rotation().ypr() - pose_graph.values.atPose3(X(i)).rotation().ypr()) for i in range(len(gt_keyframe_trajectory))])
+
+        rr.log("/translation/ate", rr.Scalar(trans_ate))
+        rr.log("/rotation/ate", rr.Scalar(rot_ate))
+
+        end_logging_time = time.perf_counter()
+        # print(f"Logging Time: {end_logging_time - start_logging_time:.2f} seconds ({1 / (end_logging_time - start_logging_time):.2f} fps)")
+
+        end_time = time.perf_counter()
+        print(f"Total Frame Processing Time: {end_time - start_time:.2f} seconds ({1 / (end_time - start_time):.2f} fps)")
 
 # %%

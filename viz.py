@@ -1,7 +1,9 @@
+from backend.pose_graph import GtsamPoseGraph
 from registration.registration import RectifiedStereoFrame, StereoDepthFrame
 import rerun as rr
 import gtsam
 import numpy as np
+import cv2
 
 def rr_log_pose(path: str, pose: gtsam.Pose3, frame: RectifiedStereoFrame | StereoDepthFrame, camera_xyz: rr.ViewCoordinates = rr.ViewCoordinates.RDF, image_plane_dist: float = 0.2):
     rr.log(path, rr.Transform3D(translation=pose.translation(), quaternion=pose.rotation().toQuaternion().coeffs()))
@@ -61,3 +63,33 @@ def rr_log_graph_edges(path: str, nodes, graph):
     rr.log(path + "/odom", rr.LineStrips3D(odom, colors=[[255, 0, 0]], radii=[0.004]))
     rr.log(path + "/closures", rr.LineStrips3D(loops, colors=[[128, 128, 0]], radii=[0.004]))
     rr.log(path + "/scale_free_closures", rr.LineStrips3D(scale_free_loops, colors=[[0, 128, 128]], radii=[0.004]))
+
+def rr_log_map_points(path: str, pose_graph: GtsamPoseGraph, points: list[tuple[int, np.ndarray, np.ndarray]], height_colormap: bool = True):
+    if len(points) == 0:
+        return
+        
+    world_points = []
+    world_points_colors = []
+
+    for kf_idx, pts_3d, pts_color in points:
+        assert pts_3d.shape == (len(pts_3d), 3)
+
+        pose = pose_graph.get_pose(kf_idx)
+        world_pts_3d = pose.transformFrom(pts_3d.T).T
+
+        world_points.append(world_pts_3d)
+        world_points_colors.append(pts_color)
+    
+    world_points = np.concatenate(world_points, axis=0)
+    world_points_colors = np.concatenate(world_points_colors, axis=0)
+    assert world_points.shape == (len(world_points), 3)
+    assert world_points_colors.shape == (len(world_points_colors), 3)
+
+    if height_colormap:
+        height_map = -world_points[:, 1]
+        height_normalized = (height_map - np.min(height_map)) / (np.max(height_map) - np.min(height_map))
+        height_colors = cv2.applyColorMap((height_normalized * 255).astype(np.uint8), cv2.COLORMAP_JET)
+
+        world_points_colors = height_colors
+
+    rr.log(path, rr.Points3D(world_points, colors=world_points_colors, radii=[0.01]))

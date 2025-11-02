@@ -5,7 +5,7 @@ from gtsam.symbol_shorthand import X, V, B
 
 import logging
 
-from registration.registration import StereoDepthFrame
+from registration.registration import FeatureFrame
 
 
 class GtsamPoseGraph:
@@ -33,7 +33,7 @@ class GtsamPoseGraph:
 
         self.values = gtsam.Values()
         self.graph = gtsam.NonlinearFactorGraph()
-        self.frames: dict[int, StereoDepthFrame] = {}
+        self.frames: dict[int, FeatureFrame] = {}
 
         self.kf_idx = 0
 
@@ -66,7 +66,7 @@ class GtsamPoseGraph:
 
     # TODO: velocity constraints on the odometry
     # TODO: decouple the frame from the odometry processing so they can be processed at different rates
-    def process_odometry(self, prev_to_latest, prev_to_latest_noise, frame: StereoDepthFrame):
+    def process_odometry(self, prev_to_latest, prev_to_latest_noise, frame: FeatureFrame):
         prev_idx = self.kf_idx
         next_idx = self.kf_idx + 1
 

@@ -2,28 +2,48 @@
 authors = ["Jacob Van Meter <jacobvm04@gmail.com>"]
 channels = ["conda-forge"]
 name = "slam"
-platforms = ["osx-arm64"]
+platforms = ["linux-aarch64"]            # Jetson-only to avoid cross-platform solve headaches
 version = "0.1.0"
+
+[system-requirements]
+cuda = "12"
 
 [tasks]
 
 [dependencies]
-python = ">=3.13.0,<3.14"
+python = ">=3.10,<3.11"                  # Jetson GPU wheels exist; 3.12 often doesn't
+pip = ">=25.2,<26"
 
+# Cross-platform-safe (for Jetson) PyPI deps
 [pypi-dependencies]
 gtsam-develop = ">=4.3a0.dev202510200041, <5"
-torch = ">=2.9.0, <3"
 kornia = ">=0.8.1, <0.9"
-opencv-python = ">=4.12.0.88, <5"
-torchvision = ">=0.24.0, <0.25"
-onnxruntime = ">=1.23.2, <2"
-opencv-contrib-python = ">=4.12.0.88, <5"
+opencv-python-headless = ">=4.12.0.88, <5"   # headless on Jetson
 rerun-sdk = { version = ">=0.26.2, <0.27", extras = ["notebook"] }
+triton = ">=3.5.0, <4"
 
+# ------------ Jetson CUDA 12.6 (JetPack 6.2.x) ------------
+[feature.jetson-cu126.pypi-options]
+index-url = "https://pypi.jetson-ai-lab.io/jp6/cu126"
+extra-index-urls = [
+  "https://pypi.nvidia.com/simple",
+  "https://pypi.org/simple"
+]
+# default index-strategy ("first-index") — SAFE
+
+[feature.jetson-cu126.pypi-dependencies]
+torch = { version = "==2.8.0", index = "https://pypi.jetson-ai-lab.io/jp6/cu126" }
+torchvision = { version = "*", index = "https://pypi.jetson-ai-lab.io/jp6/cu126" }
+onnxruntime-gpu = { version = "*", index = "https://pypi.jetson-ai-lab.io/jp6/cu126" }     # NVIDIA publishes GPU ORT wheels; falls back to PyPI if needed
+flash-attn = { version = "*", index = "https://pypi.jetson-ai-lab.io/jp6/cu126" }
+
+# ------------ Dev feature ------------
 [feature.dev.pypi-dependencies]
-ipykernel = "*"
-inline-snapshot = ">=0.30.1, <0.31"
 tartanair = { editable = true, path = "submodules/tartanairpy" }
+ipykernel = ">=7.1.0, <8"
+matplotlib = ">=3.10.7, <4"
 
-[environments]
-dev = ["dev"]
+# ------------ Environments ------------
+[environments.dev-jetson-cu126]
+features = ["dev", "jetson-cu126"]
+solve-group = "jetson-cu126"
