@@ -490,6 +490,7 @@ def run_bundle_adjustment(
     track_history: list[np.ndarray],
     attributes: dict[str, Any],
     sequence_results: list[dict[str, Any]],
+    depth_frames: list[StereoDepthFrame],
 ) -> dict[str, Any]:
     frames_for_ba = select_frames_for_ba(track_history)
     calibration = build_calibration(rectified_frames[0])
@@ -513,8 +514,6 @@ def run_bundle_adjustment(
     graph.add(gtsam.PriorFactorPose3(X(0), gtsam.Pose3.Identity(), prior_noise))
 
     landmark_positions = attributes["keypoints_3d"]
-    anchor_depths = attributes["keypoints_depth"]
-    anchor_measurements = attributes["keypoints"]
     landmark_keys: list[int] = []
     landmark_index_lookup: list[int] = []
     observations: list[tuple[int, int, np.ndarray]] = []
@@ -549,19 +548,27 @@ def run_bundle_adjustment(
 
         values.insert(L(landmark_key), point3_like_to_numpy(point))
 
+        fx = stereo_calibration.fx()
+        baseline = stereo_calibration.baseline()
+
         for frame_idx, measurement in observation_frames:
-            if frame_idx == 0:
-                depth_value = float(anchor_depths[landmark_idx])
-                if not np.isfinite(depth_value) or depth_value <= 0.0:
-                    continue
-                fx = stereo_calibration.fx()
-                baseline = stereo_calibration.baseline()
-                disparity = (fx * baseline) / depth_value
-                stereo_measurement = gtsam.StereoPoint2(
-                    float(anchor_measurements[landmark_idx][0]),
-                    float(anchor_measurements[landmark_idx][0] - disparity),
-                    float(anchor_measurements[landmark_idx][1]),
-                )
+            stereo_measurement = None
+            depth_map = getattr(depth_frames[frame_idx], "left_depth", None)
+            if depth_map is not None and np.isfinite(measurement[0]) and np.isfinite(measurement[1]):
+                col = int(np.round(measurement[0]))
+                row = int(np.round(measurement[1]))
+                h, w = depth_map.shape
+                if 0 <= row < h and 0 <= col < w:
+                    depth_value = float(depth_map[row, col])
+                    if np.isfinite(depth_value) and depth_value > 0.0 and baseline > 0.0:
+                        disparity = (fx * baseline) / depth_value
+                        stereo_measurement = gtsam.StereoPoint2(
+                            float(measurement[0]),
+                            float(measurement[0] - disparity),
+                            float(measurement[1]),
+                        )
+
+            if stereo_measurement is not None:
                 graph.add(
                     gtsam.GenericStereoFactor3D(
                         stereo_measurement,
@@ -804,8 +811,8 @@ def plot_pose_trajectories(
         )
     plt.xlabel("X (m)")
     plt.ylabel("Y (m)")
-    plt.xlim(-3, 3)
-    plt.ylim(-3, 3)
+    plt.xlim(-1.5, 1.5)
+    plt.ylim(-1.5, 1.5)
     plt.grid(True, linestyle="--", alpha=0.4)
     plt.legend()
     plt.show()
@@ -929,6 +936,7 @@ for sample_idx in range(NUM_SEQUENCE_SAMPLES):
         track_history=track_history,
         attributes=attributes,
         sequence_results=sequence_results,
+        depth_frames=depth_frames,
     )
 
     save_results(tracking_summary, ba_result, sequence)
@@ -953,6 +961,19 @@ for sample_idx in range(NUM_SEQUENCE_SAMPLES):
     print(
         "  Rotation error norms (deg):",
         np.array2string(np.asarray(optimized_rotation_norms_deg), precision=2),
+    )
+    stereo_counts = ba_result["stereo_counts"]
+    mono_counts = ba_result["mono_counts"]
+    frame_order = ba_result["frames_for_ba"]
+    stereo_per_frame = [stereo_counts[idx] for idx in frame_order]
+    mono_per_frame = [mono_counts[idx] for idx in frame_order]
+    print(
+        "  Stereo factors:",
+        f"{sum(stereo_per_frame)} total -> {np.array2string(np.asarray(stereo_per_frame), separator=', ')}",
+    )
+    print(
+        "  Mono factors:",
+        f"{sum(mono_per_frame)} total -> {np.array2string(np.asarray(mono_per_frame), separator=', ')}",
     )
 
     plot_feature_tracks(rectified_frames, track_history)
