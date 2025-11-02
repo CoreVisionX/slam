@@ -23,6 +23,8 @@ from registration.registration import (  # noqa: E402
 from registration.utils import draw_matches, solve_pnp  # noqa: E402
 import tests.test_utils as test_utils  # noqa: E402
 
+# TODO: velocity factors using the timestamps
+
 # %%
 # ----------------------------------------------------------------------
 # Configuration
@@ -49,7 +51,7 @@ LK_CRITERIA = (cv2.TERM_CRITERIA_EPS | cv2.TERM_CRITERIA_COUNT, 40, 0.01)
 LK_MIN_EIG_THRESHOLD = 1e-4
 
 MIN_MATCHES_FOR_PNP = 30
-MAX_DEPTH = 20.0
+MAX_DEPTH = 30.0
 
 RESULTS_DIR = Path(__file__).parent / "results"
 RESULTS_PATH = RESULTS_DIR / "klt_local_vo_tracking.npz"
