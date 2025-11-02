@@ -759,6 +759,9 @@ def plot_pose_trajectories(
     initial_pose_dict: dict[int, gtsam.Pose3],
     optimized_pose_dict: dict[int, gtsam.Pose3],
     sequence_sample: test_utils.FrameSequenceWithGroundTruth,  # type: ignore[type-arg]
+    initial_landmarks: list[np.ndarray] | None = None,
+    optimized_landmarks: list[np.ndarray] | None = None,
+    landmark_stride: int = 1,
 ) -> None:
     frames = sorted(optimized_pose_dict.keys())
 
@@ -774,9 +777,35 @@ def plot_pose_trajectories(
     plt.plot(initial_xyz[:, 0], initial_xyz[:, 1], "o--", label="Initial PnP")
     plt.plot(optimized_xyz[:, 0], optimized_xyz[:, 1], "o-", label="Optimized BA")
     plt.plot(ground_truth_xyz[:, 0], ground_truth_xyz[:, 1], "x-", label="Ground truth")
+    
+    if initial_landmarks:
+        init_landmarks_arr = np.asarray(initial_landmarks, dtype=np.float64)
+        if landmark_stride > 1:
+            init_landmarks_arr = init_landmarks_arr[::landmark_stride]
+        plt.scatter(
+            init_landmarks_arr[:, 0],
+            init_landmarks_arr[:, 1],
+            s=6,
+            c="#66c2a5",
+            alpha=0.35,
+            label="Landmarks before BA",
+        )
+    if optimized_landmarks:
+        opt_landmarks_arr = np.asarray(optimized_landmarks, dtype=np.float64)
+        if landmark_stride > 1:
+            opt_landmarks_arr = opt_landmarks_arr[::landmark_stride]
+        plt.scatter(
+            opt_landmarks_arr[:, 0],
+            opt_landmarks_arr[:, 1],
+            s=6,
+            c="#fc8d62",
+            alpha=0.35,
+            label="Landmarks after BA",
+        )
     plt.xlabel("X (m)")
     plt.ylabel("Y (m)")
-    plt.axis("equal")
+    plt.xlim(-3, 3)
+    plt.ylim(-3, 3)
     plt.grid(True, linestyle="--", alpha=0.4)
     plt.legend()
     plt.show()
@@ -928,7 +957,14 @@ for sample_idx in range(NUM_SEQUENCE_SAMPLES):
 
     plot_feature_tracks(rectified_frames, track_history)
     plot_match_debug(rectified_frames, sequence_results)
-    plot_pose_trajectories(ba_result["initial_pose_dict"], ba_result["optimized_pose_dict"], sequence)
+    plot_pose_trajectories(
+        ba_result["initial_pose_dict"],
+        ba_result["optimized_pose_dict"],
+        sequence,
+        ba_result["initial_landmarks"],
+        ba_result["optimized_landmarks"],
+        landmark_stride=5,
+    )
     plot_pose_error_norms_per_frame(
         ba_result["initial_pose_dict"],
         ba_result["optimized_pose_dict"],
