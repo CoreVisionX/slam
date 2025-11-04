@@ -61,7 +61,11 @@ def fundamental_fitler(mkpts1: np.ndarray, mkpts2: np.ndarray) -> tuple[np.ndarr
 def solve_pnp(pair: MatchedFramePair[FeatureFrame]) -> tuple[gtsam.Pose3, MatchedFramePair[FeatureFrame]]:
     # mkpts1 = pair.first.features['keypoints'].cpu().numpy()[pair.matches[:, 0]]
     # mkpts2 = pair.second.features['keypoints'].cpu().numpy()[pair.matches[:, 1]]
-    mkpts1, mkpts2 = get_matching_keypoints(pair.first.features['keypoints'].cpu().numpy(), pair.second.features['keypoints'].cpu().numpy(), pair.matches)
+    mkpts1, mkpts2 = get_matching_keypoints(
+        kp1=pair.first.features['keypoints'].cpu().numpy() if isinstance(pair.first.features['keypoints'], torch.Tensor) else pair.first.features['keypoints'],
+        kp2=pair.second.features['keypoints'].cpu().numpy() if isinstance(pair.second.features['keypoints'], torch.Tensor) else pair.second.features['keypoints'],
+        idxs=pair.matches
+    )
 
     # u = mkpts1[:, 1].astype(int)
     # v = mkpts1[:, 0].astype(int)

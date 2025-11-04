@@ -1,6 +1,7 @@
 # %%
 from dataclasses import dataclass
 from queue import Empty, Full
+import argparse
 import sys
 import os
 import time
@@ -8,11 +9,10 @@ import gtsam
 from gtsam.symbol_shorthand import X
 import numpy as np
 import rerun as rr
-import torch.multiprocessing
-from torch.multiprocessing import Process, Queue
-
-if __name__ == "__main__":
-    torch.multiprocessing.set_start_method('spawn')
+# import torch.multiprocessing as mp
+# from torch.multiprocessing import Process, Queue
+from multiprocessing import Process, Queue
+import multiprocessing as mp
 
 # os.environ["TORCHINDUCTOR_COMPILE_THREADS"] = "1" 
 # import torch, torch._inductor.config as ind
@@ -30,10 +30,15 @@ from backend.proximity_loop_detector import ProximityLoopDetector
 from tests.test_utils import get_tartanair_iterator_with_odometry, tartanair_calib
 from depth.sgbm import SGBM
 from registration.registration import FramePair, IndexedFramePair, FeatureFrame
-from registration.lightglue import LightglueMatcher
-from registration.lighterglue import LighterglueMatcher
+# from registration.lightglue import LightglueMatcher
+# from registration.lighterglue import LighterglueMatcher
+from registration.orb import OrbMatcher
 from registration.utils import fundamental_fitler, solve_pnp
 from viz import rr_log_map_points, rr_log_pose, rr_log_trajectory, rr_log_graph_edges
+
+
+ALIGN_GT_KEYFRAMES = True
+USE_HUBER_LOSS = True # definitely turn it off when you're debugging things related to the factor graph since it can cover up outliers that may be causing issues
 
 
 # TODO: definitely factor all this multiprocessing logic out, it needs to be robust and reusable
@@ -41,11 +46,83 @@ from viz import rr_log_map_points, rr_log_pose, rr_log_trajectory, rr_log_graph_
 @dataclass
 class LoopClosureResult:
     candidate: IndexedFramePair[FeatureFrame]
-    first_to_second: gtsam.Pose3
-    noise: gtsam.noiseModel.Diagonal
+    # first_to_second: gtsam.Pose3
+    R_first_to_second: np.ndarray
+    t_first_to_second: np.ndarray
+    # noise: gtsam.noiseModel.Diagonal
+    noise_diagonal: np.ndarray
     mkpts1: np.ndarray
     mkpts1_3d: np.ndarray
     mkpts1_color: np.ndarray
+
+
+def _pose_translation_to_array(pose: gtsam.Pose3) -> np.ndarray:
+    """Extract the translation component of a pose as an ndarray."""
+    return pose.translation()
+
+
+def _umeyama_alignment(
+    source_points: np.ndarray, target_points: np.ndarray
+) -> tuple[np.ndarray, np.ndarray]:
+    """
+    Compute the rigid Umeyama alignment (no scaling) that maps source -> target.
+
+    Returns:
+        A tuple (R, t) where R is a 3x3 rotation matrix and t is a 3-vector.
+    """
+    assert source_points.shape == target_points.shape, "Point sets must have the same shape"
+    n_points = source_points.shape[0]
+    if n_points == 0:
+        raise ValueError("At least one point is required for Umeyama alignment")
+
+    source_mean = source_points.mean(axis=0)
+    target_mean = target_points.mean(axis=0)
+
+    source_centered = source_points - source_mean
+    target_centered = target_points - target_mean
+
+    covariance = source_centered.T @ target_centered / n_points
+    U, _, Vt = np.linalg.svd(covariance)
+    R = Vt.T @ U.T
+
+    if np.linalg.det(R) < 0:
+        Vt[-1, :] *= -1
+        R = Vt.T @ U.T
+
+    t = target_mean - R @ source_mean
+    return R, t
+
+
+def compute_umeyama_alignment_pose(
+    source_poses: list[gtsam.Pose3], target_poses: list[gtsam.Pose3]
+) -> gtsam.Pose3 | None:
+    """
+    Estimate the pose that best aligns source_poses to target_poses using Umeyama.
+
+    Args:
+        source_poses: Poses to align (e.g. ground truth).
+        target_poses: Reference poses (e.g. estimates). Must match in length.
+
+    Returns:
+        A gtsam.Pose3 representing the alignment transform, or None if alignment
+        cannot be computed.
+    """
+    if len(source_poses) == 0 or len(source_poses) != len(target_poses):
+        return None
+
+    if len(source_poses) == 1:
+        delta = _pose_translation_to_array(target_poses[0]) - _pose_translation_to_array(source_poses[0])
+        return gtsam.Pose3(gtsam.Rot3.Identity(), gtsam.Point3(*delta))
+
+    source_points = np.stack([_pose_translation_to_array(pose) for pose in source_poses])
+    target_points = np.stack([_pose_translation_to_array(pose) for pose in target_poses])
+
+    try:
+        R, t = _umeyama_alignment(source_points, target_points)
+    except np.linalg.LinAlgError:
+        return None
+
+    return gtsam.Pose3(gtsam.Rot3(R), gtsam.Point3(*t))
     
 def loop_closure_worker(loop_closure_candidates_queue: Queue, loop_closures_queue: Queue, loop_noise: gtsam.noiseModel.Diagonal, min_inlier_count: int):
     """
@@ -66,13 +143,14 @@ def loop_closure_worker(loop_closure_candidates_queue: Queue, loop_closures_queu
     # TODO: log numbers and changes in inlier counts somehow?
     # setup two-view pose estimation
     # matcher = LightglueMatcher(num_features=1536, compile=False, mp=True, device='cuda')
-    matcher = LighterglueMatcher(num_features=4096, compile=False, device='cuda', use_lighterglue_matching=True)
+    # matcher = LighterglueMatcher(num_features=4096, compile=False, device='cuda', use_lighterglue_matching=True)
+    matcher = OrbMatcher(num_features=1000)
     print("Loop closure worker started")
 
     times = []
     i = 0
     log_every = 20
-    max_queue_size = 5
+    max_queue_size = 10
 
     candidates = []
 
@@ -84,10 +162,13 @@ def loop_closure_worker(loop_closure_candidates_queue: Queue, loop_closures_queu
         # maintain the queue size on the worker side to prevent race conditions since only one actor is reading from the queue
         while not loop_closure_candidates_queue.empty():
             candidates.append(loop_closure_candidates_queue.get_nowait())
+            # print(f"Added candidate {candidates[-1].first_idx} and {candidates[-1].second_idx} to candidates")
 
         candidates = candidates[-max_queue_size:]
 
         candidate = candidates.pop(0)
+
+        # print(f"Processing candidate {candidate.first_idx} and {candidate.second_idx}")
 
         start_time = time.perf_counter()
 
@@ -100,7 +181,7 @@ def loop_closure_worker(loop_closure_candidates_queue: Queue, loop_closures_queu
             
             first_to_second, matched_pair = solve_pnp(matched_pair)
         except Exception as e:
-            # print(f"Failed to solve PnP for loop closure between {candidate.first_idx} and {candidate.second_idx} with {len(matched_pair.matches)} inliers: {e}")
+            print(f"Failed to solve PnP for loop closure between {candidate.first_idx} and {candidate.second_idx} with {len(matched_pair.matches)} inliers: {e}")
             continue
 
         if len(matched_pair.matches) > min_inlier_count:
@@ -108,13 +189,18 @@ def loop_closure_worker(loop_closure_candidates_queue: Queue, loop_closures_queu
             # idk think about composition over inheritance for this kind of thing
             result = LoopClosureResult(
                 candidate=candidate,
-                first_to_second=first_to_second,
-                noise=loop_noise,
+                # first_to_second=first_to_second,
+                R_first_to_second=first_to_second.rotation().matrix(),
+                t_first_to_second=first_to_second.translation(),
+                # noise=loop_noise,
+                # noise_diagonal=loop_noise.sigmas(),
+                noise_diagonal=None,
                 mkpts1=matched_pair.mkpts1,
                 mkpts1_3d=matched_pair.mkpts1_3d,
                 mkpts1_color=matched_pair.mkpts1_color,
             )
             loop_closures_queue.put(result)
+            print(f"Added result for candidate {candidate.first_idx} and {candidate.second_idx}")
         else:
             # print(f"Failed to solve PnP for loop closure between {candidate.first_idx} and {candidate.second_idx} with {len(matched_pair.matches)} inliers")
             pass
@@ -129,15 +215,18 @@ def loop_closure_worker(loop_closure_candidates_queue: Queue, loop_closures_queu
 
 
 if __name__ == "__main__":
+    mp.set_start_method('fork')
+
     # timestamps = np.load(os.path.join(os.path.dirname(__file__), 'data', 'AbandonedFactory', 'Data_easy', 'P001', 'imu', 'cam_time.npy'))
 
     # TODO: the noise should probably be much higher than the real noise since we're integrating the odometry poses between keyframes
-    odometry_noise = gtsam.noiseModel.Diagonal.Sigmas(np.array([np.deg2rad(1.0), np.deg2rad(1.0), np.deg2rad(1.0), 0.02, 0.02, 0.02]))
+    # odometry_noise = gtsam.noiseModel.Diagonal.Sigmas(np.array([np.deg2rad(1.0), np.deg2rad(1.0), np.deg2rad(1.0), 0.02, 0.02, 0.02]) * 100_000) # make it exteremly high so it doesn't influence anything
+    odometry_noise = gtsam.noiseModel.Diagonal.Sigmas(np.array([np.deg2rad(1.0), np.deg2rad(1.0), np.deg2rad(1.0), 0.02, 0.02, 0.02]) * 100)
 
     # TODO: actually robust rerun setup (factor this out somewhere reusable)
     rr.init("slam")
     # rr.connect_tcp("192.168.88.1:9876")
-    rr.connect_tcp("192.168.1.37:9876")
+    rr.connect_tcp("192.168.1.20:9876")
 
     sgbm = SGBM(num_disparities=16 * 4, block_size=5, image_color='RGB')
 
@@ -146,7 +235,7 @@ if __name__ == "__main__":
 
     # TODO: figure out a proximity loop closer with a minimum seperation between candidates it finds, not just the current pose. maybe that's what keyframes should be doing and I need a better way of maintaining the local trajectory smoothness? idk.
     # show encourage longer baseline loop closures
-    loop_detector = ProximityLoopDetector(max_translation=7.0, max_rotation=np.deg2rad(60), max_candidates=5, min_seperation=1)
+    loop_detector = ProximityLoopDetector(max_translation=12.0, max_rotation=np.deg2rad(60), max_candidates=10, min_seperation=1)
 
     # TODO: figure out the proper noise model for this
     # an interactive UI with sliders and visualizaation of the resulting optimization might be really useful
@@ -154,26 +243,35 @@ if __name__ == "__main__":
     # in that vein proper geometric verification in terms of making sure a new loop doesn't cause a massive weird change in the map or anything would be really useful
     # in allowing for wide baseline loop closures that help a lot with large areas and long sessions
     # while still avoding any bad loop closures that cause catastrophic damage to the map
-    # loop_noise = gtsam.noiseModel.Diagonal.Sigmas(np.array([np.deg2rad(1.0), np.deg2rad(1.0), np.deg2rad(1.0), 0.04, 0.04, 0.04]))
-    loop_noise = gtsam.noiseModel.Gaussian.Covariance(np.array([
-        [ 0.000006,  0.000000, -0.000000,  0.000002,  0.000042,  0.000008],
-        [ 0.000000,  0.000006, -0.000000, -0.000053,  0.000005,  0.000019],
-        [-0.000000, -0.000000,  0.000003, -0.000001,  0.000001, -0.000006],
-        [ 0.000002, -0.000053, -0.000001,  0.000711,  0.000028, -0.000017],
-        [ 0.000042,  0.000005,  0.000001,  0.000028,  0.000541,  0.000226],
-        [ 0.000008,  0.000019, -0.000006, -0.000017,  0.000226,  0.000637],
-    ]))
+    if USE_HUBER_LOSS:
+        print("Using Huber loss for loop closures")
+        loop_noise = gtsam.noiseModel.Robust.Create(
+            gtsam.noiseModel.mEstimator.Huber(1.0),
+            gtsam.noiseModel.Diagonal.Sigmas(np.array([np.deg2rad(1.0), np.deg2rad(1.0), np.deg2rad(1.0), 0.04, 0.04, 0.04]) * 0.01)
+        )
+    else:
+        print("Not using Huber loss for loop closures")
+        loop_noise = gtsam.noiseModel.Diagonal.Sigmas(np.array([np.deg2rad(1.0), np.deg2rad(1.0), np.deg2rad(1.0), 0.04, 0.04, 0.04]) * 0.01)
+    # loop_noise = gtsam.noiseModel.Gaussian.Covariance(np.array([
+    #     [ 0.000006,  0.000000, -0.000000,  0.000002,  0.000042,  0.000008],
+    #     [ 0.000000,  0.000006, -0.000000, -0.000053,  0.000005,  0.000019],
+    #     [-0.000000, -0.000000,  0.000003, -0.000001,  0.000001, -0.000006],
+    #     [ 0.000002, -0.000053, -0.000001,  0.000711,  0.000028, -0.000017],
+    #     [ 0.000042,  0.000005,  0.000001,  0.000028,  0.000541,  0.000226],
+    #     [ 0.000008,  0.000019, -0.000006, -0.000017,  0.000226,  0.000637],
+    # ]))
     # loop_noise = odometry_noise # set it to the odometry noise so they're weighted equally which will make debugging the influence of the loop closures easier
 
     # TODO: might be too high and preventing wide baseline loop closures
     # try adding geometric and graph consistency checks to allow for more robust <100 inlier loop closures?
     # varying the noise based on the inlier count might also help?
     # a basic robust loss might also help with outliers
-    min_inlier_count = 75
+    # velocity factors might help as well
+    min_inlier_count = 30
 
     # TODO: refactor keyframing logic into it's own class
     # goal: encourage high quality wide baseline loop closures
-    keyframe_translation_threshold = 0.5 # I notice that higher values let more wide baseline loop closures be detected
+    keyframe_translation_threshold = 0.2 # I notice that higher values let more wide baseline loop closures be detected
     keyframe_rotation_threshold = np.deg2rad(8)
     cur_keyframe_pose = None
 
@@ -198,20 +296,21 @@ if __name__ == "__main__":
 
     # inefficient but we need an instance of the matcher here too for feature detection
     # we could either split the matcher into a feature detection and matching part or just have the worker do both?
-    matcher = LighterglueMatcher(num_features=4096, compile=False, device='cuda', use_lighterglue_matching=True)
+    # matcher = LighterglueMatcher(num_features=4096, compile=False, device='cuda', use_lighterglue_matching=True)
+    matcher = OrbMatcher(num_features=1000)
 
     # start the loop closure worker
     loop_closure_worker_process = Process(target=loop_closure_worker, args=(loop_closure_candidates_queue, loop_closures_queue, loop_noise, min_inlier_count))
     loop_closure_worker_process.start()
 
     print("Waiting for the worker to start...")
-    time.sleep(10) # wait for the worker to start
+    time.sleep(6) # wait for the worker to start
 
     exc_ts_start = None
 
     odometry_iterator = get_tartanair_iterator_with_odometry(
         env='AbandonedFactory', 
-        difficulty='hard', 
+        difficulty='easy', 
         traj='P001', 
         include_ground_truth=True,
         rotation_noise_sigmas=np.array([np.deg2rad(1.0), np.deg2rad(1.0), np.deg2rad(1.0)]),
@@ -246,7 +345,8 @@ if __name__ == "__main__":
         # if exc_ts < ts:
         #     time.sleep(ts - exc_ts)
 
-        time.sleep(0.2) # wait to simulate realtime processing
+        # TODO: get rid of this lmao we aren't using the hard sequence rn
+        # time.sleep(0.2) # wait to simulate realtime processing
 
         start_time = time.perf_counter()
 
@@ -264,6 +364,7 @@ if __name__ == "__main__":
             # print(f"Preprocess Time: {end_preprocess_time - start_preprocess_time:.2f} seconds ({1 / (end_preprocess_time - start_preprocess_time):.2f} fps)")
 
             pose_graph.process_odometry(noisy_prev_robot_to_robot, odometry_noise, feature_frame)
+            gt_keyframe_trajectory.append(first_robot_to_robot)
 
             # TODO: figure out why doing this causes the estimated trajectory to be offset? I think it's because even this is actually the second frame not the first one or something?
             # # TODO: this is a hack to get the loop detector to work with the first keyframe, fix this later
@@ -295,9 +396,21 @@ if __name__ == "__main__":
         if dist > keyframe_translation_threshold or rot > keyframe_rotation_threshold:
             # preprocess frame
             start_preprocess_time = time.perf_counter()
+
+            start_rectify_time = time.perf_counter()
             rectified_frame = frame.rectify()
+            end_rectify_time = time.perf_counter()
+            # print(f"Rectify Time: {end_rectify_time - start_rectify_time:.2f} seconds ({1 / (end_rectify_time - start_rectify_time):.2f} fps)")
+
+            start_compute_depth_time = time.perf_counter()
             depth_frame = sgbm.compute_depth(rectified_frame)
+            end_compute_depth_time = time.perf_counter()
+            # print(f"Compute Depth Time: {end_compute_depth_time - start_compute_depth_time:.2f} seconds ({1 / (end_compute_depth_time - start_compute_depth_time):.2f} fps)")
+
+            start_detect_features_time = time.perf_counter()
             feature_frame = matcher.detect_features([depth_frame])[0]
+            end_detect_features_time = time.perf_counter()
+
             end_preprocess_time = time.perf_counter()
             # print(f"Preprocess Time: {end_preprocess_time - start_preprocess_time:.2f} seconds ({1 / (end_preprocess_time - start_preprocess_time):.2f} fps)")
 
@@ -319,6 +432,8 @@ if __name__ == "__main__":
 
             # TODO: figure out how to not overwrite the queue too much? or at least preserve the closest candidates?
             start_loop_closure_candidates_time = time.perf_counter()
+
+            # should the order here be reversed?
             for candidate in loop_candidates:
                 # # TODO: this is a hack get rid of this later
                 # # detach all tensors from the GPU and move to the CPU before queuing to avoid cuda issues
@@ -345,13 +460,25 @@ if __name__ == "__main__":
             end_loop_closure_candidates_time = time.perf_counter()
             # print(f"Loop Closure Candidates Time: {end_loop_closure_candidates_time - start_loop_closure_candidates_time:.2f} seconds ({1 / (end_loop_closure_candidates_time - start_loop_closure_candidates_time):.2f} fps)")
 
+            # TODO: consider doing this in the outer loop so we don't have to wait for a keyframe to process loop closures?
             # process any loop closure results from the worker
             start_loop_closure_results_time = time.perf_counter()
-            while not loop_closures_queue.empty():
-                result = loop_closures_queue.get_nowait()
-                assert result is not None
-        
-                pose_graph.add_between_pose_factor(result.candidate.first_idx, result.candidate.second_idx, result.first_to_second, result.noise)
+            while True:
+                # drain by checking for exceptions instead of using empty() because apparently empty() isn't reliable?
+                try:
+                    # result = loop_closures_queue.get_nowait()
+                    result = loop_closures_queue.get(timeout=0.5)
+                    assert result is not None
+                except Empty:
+                    break
+
+                print(f"Processing result for candidate {result.candidate.first_idx} and {result.candidate.second_idx}")
+
+                first_to_second = gtsam.Pose3(gtsam.Rot3(result.R_first_to_second), gtsam.Point3(result.t_first_to_second))
+                # noise = gtsam.noiseModel.Diagonal.Sigmas(result.noise_diagonal)
+                noise = loop_noise
+
+                pose_graph.add_between_pose_factor(result.candidate.first_idx, result.candidate.second_idx, first_to_second, noise)
                 
                 rand_idxs = np.random.choice(len(result.mkpts1_3d), size=min(200, len(result.mkpts1_3d)), replace=False)
                 map_points.append((result.candidate.first_idx, result.mkpts1_3d[rand_idxs], result.mkpts1_color[rand_idxs]))
@@ -404,9 +531,29 @@ if __name__ == "__main__":
         # logging
         start_logging_time = time.perf_counter()
 
+        if len(gt_keyframe_trajectory) < 2:
+            continue
+
         rr.set_time_sequence("frame", sequence=i)
 
-        rr_log_trajectory("gt_keyframe_trajectory", gt_keyframe_trajectory, color=(0, 255, 0))
+        estimated_keyframe_trajectory: list[gtsam.Pose3] = []
+        for idx in range(1, pose_graph.kf_idx + 1):
+            key = X(idx)
+            if pose_graph.values.exists(key):
+                estimated_keyframe_trajectory.append(pose_graph.values.atPose3(key))
+            else:
+                estimated_keyframe_trajectory = []
+                break
+
+        assert len(estimated_keyframe_trajectory) == len(gt_keyframe_trajectory), f"Estimated keyframe trajectory length {len(estimated_keyframe_trajectory)} does not match ground truth keyframe trajectory length {len(gt_keyframe_trajectory)}"
+
+        gt_keyframes_for_logging = gt_keyframe_trajectory
+        if ALIGN_GT_KEYFRAMES and len(estimated_keyframe_trajectory) == len(gt_keyframe_trajectory):
+            alignment_pose = compute_umeyama_alignment_pose(gt_keyframe_trajectory, estimated_keyframe_trajectory)
+            if alignment_pose is not None:
+                gt_keyframes_for_logging = [alignment_pose.compose(pose) for pose in gt_keyframe_trajectory]
+
+        rr_log_trajectory("gt_keyframe_trajectory", gt_keyframes_for_logging, color=(0, 255, 0))
         # rr_log_trajectory("gt_trajectory", gt_trajectory, color=(0, 255, 0))
         # # rr_log_pose("gt", first_robot_to_robot, depth_frame_with_features)
 
@@ -417,18 +564,29 @@ if __name__ == "__main__":
         # optimized_trajectory.append(pose_graph.get_latest_pose())
         # rr_log_trajectory("optimized_trajectory", optimized_trajectory, color=(255, 0, 0))
         rr_log_graph_edges(path="graph", nodes=pose_graph.values, graph=pose_graph.graph)
-        # rr_log_pose(path="optimized", pose=pose_graph.get_latest_pose(), frame=depth_frame)
+        rr_log_pose(path="optimized", pose=pose_graph.get_latest_pose(), frame=depth_frame)
 
         # this might be causing perf issues? not sure
         rr_log_map_points("map_points", pose_graph, map_points)
 
         # trans_ate = np.linalg.norm(gt_keyframe_trajectory[-1].translation() - pose_graph.get_latest_pose().translation())
         # rot_ate = np.rad2deg(np.linalg.norm(gt_keyframe_trajectory[-1].rotation().ypr() - pose_graph.get_latest_pose().rotation().ypr()))
-        trans_ate = np.mean([np.linalg.norm(gt_keyframe_trajectory[i].translation() - pose_graph.values.atPose3(X(i)).translation()) for i in range(len(gt_keyframe_trajectory))])
-        rot_ate = np.mean([np.linalg.norm(gt_keyframe_trajectory[i].rotation().ypr() - pose_graph.values.atPose3(X(i)).rotation().ypr()) for i in range(len(gt_keyframe_trajectory))])
+        if len(gt_keyframes_for_logging) > 0 and len(gt_keyframes_for_logging) == len(estimated_keyframe_trajectory):
+            trans_errors = [
+                np.linalg.norm(
+                    _pose_translation_to_array(gt_pose) - _pose_translation_to_array(est_pose)
+                )
+                for gt_pose, est_pose in zip(gt_keyframes_for_logging, estimated_keyframe_trajectory)
+            ]
+            trans_ate = float(np.mean(trans_errors))
+            rot_errors = [
+                np.linalg.norm(gt_pose.rotation().ypr() - est_pose.rotation().ypr())
+                for gt_pose, est_pose in zip(gt_keyframes_for_logging, estimated_keyframe_trajectory)
+            ]
+            rot_ate = float(np.mean(rot_errors))
 
-        rr.log("/translation/ate", rr.Scalar(trans_ate))
-        rr.log("/rotation/ate", rr.Scalar(rot_ate))
+            rr.log("/translation/ate", rr.Scalar(trans_ate))
+            rr.log("/rotation/ate", rr.Scalar(rot_ate))
 
         end_logging_time = time.perf_counter()
         # print(f"Logging Time: {end_logging_time - start_logging_time:.2f} seconds ({1 / (end_logging_time - start_logging_time):.2f} fps)")
