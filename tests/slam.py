@@ -11,7 +11,7 @@ import numpy as np
 import rerun as rr
 # import torch.multiprocessing as mp
 # from torch.multiprocessing import Process, Queue
-from multiprocessing import Process, Queue
+from multiprocessing import Process, Queue, SimpleQueue
 import multiprocessing as mp
 
 # os.environ["TORCHINDUCTOR_COMPILE_THREADS"] = "1" 
@@ -45,15 +45,17 @@ USE_HUBER_LOSS = True # definitely turn it off when you're debugging things rela
 # TODO: log loop closure candidate average age somehow to make sure they're not too stale or doing anything weird
 @dataclass
 class LoopClosureResult:
-    candidate: IndexedFramePair[FeatureFrame]
+    # candidate: IndexedFramePair[FeatureFrame]
+    first_idx: int
+    second_idx: int
     # first_to_second: gtsam.Pose3
     R_first_to_second: np.ndarray
     t_first_to_second: np.ndarray
     # noise: gtsam.noiseModel.Diagonal
-    noise_diagonal: np.ndarray
-    mkpts1: np.ndarray
-    mkpts1_3d: np.ndarray
-    mkpts1_color: np.ndarray
+    # noise_diagonal: np.ndarray
+    # mkpts1: np.ndarray
+    # mkpts1_3d: np.ndarray
+    # mkpts1_color: np.ndarray
 
 
 def _pose_translation_to_array(pose: gtsam.Pose3) -> np.ndarray:
@@ -124,6 +126,7 @@ def compute_umeyama_alignment_pose(
 
     return gtsam.Pose3(gtsam.Rot3(R), gtsam.Point3(*t))
     
+# TODO: launch more than one worker to speed up loop closing
 def loop_closure_worker(loop_closure_candidates_queue: Queue, loop_closures_queue: Queue, loop_noise: gtsam.noiseModel.Diagonal, min_inlier_count: int):
     """
     Worker process for loop closing
@@ -150,7 +153,7 @@ def loop_closure_worker(loop_closure_candidates_queue: Queue, loop_closures_queu
     times = []
     i = 0
     log_every = 20
-    max_queue_size = 10
+    max_queue_size = 20
 
     candidates = []
 
@@ -161,12 +164,18 @@ def loop_closure_worker(loop_closure_candidates_queue: Queue, loop_closures_queu
 
         # maintain the queue size on the worker side to prevent race conditions since only one actor is reading from the queue
         while not loop_closure_candidates_queue.empty():
-            candidates.append(loop_closure_candidates_queue.get_nowait())
+            # candidates.append(loop_closure_candidates_queue.get(block=True, timeout=0.1))
+            candidates.append(loop_closure_candidates_queue.get())
             # print(f"Added candidate {candidates[-1].first_idx} and {candidates[-1].second_idx} to candidates")
 
-        candidates = candidates[-max_queue_size:]
+        if len(candidates) > max_queue_size:
+            candidate_idxs = [candidate.first_idx for candidate in candidates]
+            print(f"Candidates overflowing idxs: {candidate_idxs}")
 
-        candidate = candidates.pop(0)
+        # candidates = candidates[-max_queue_size:]
+
+        candidate = candidates.pop(-1) # process the latest candidates first
+        # candidate = candidates.pop(0)
 
         # print(f"Processing candidate {candidate.first_idx} and {candidate.second_idx}")
 
@@ -188,19 +197,22 @@ def loop_closure_worker(loop_closure_candidates_queue: Queue, loop_closures_queu
             # TODO: would sending back a matched pair be better?
             # idk think about composition over inheritance for this kind of thing
             result = LoopClosureResult(
-                candidate=candidate,
+                # candidate=candidate,
+                first_idx=candidate.first_idx,
+                second_idx=candidate.second_idx,
                 # first_to_second=first_to_second,
                 R_first_to_second=first_to_second.rotation().matrix(),
                 t_first_to_second=first_to_second.translation(),
                 # noise=loop_noise,
                 # noise_diagonal=loop_noise.sigmas(),
-                noise_diagonal=None,
-                mkpts1=matched_pair.mkpts1,
-                mkpts1_3d=matched_pair.mkpts1_3d,
-                mkpts1_color=matched_pair.mkpts1_color,
+                # noise_diagonal=None,
+                # mkpts1=matched_pair.mkpts1,
+                # mkpts1_3d=matched_pair.mkpts1_3d,
+                # mkpts1_color=matched_pair.mkpts1_color,
             )
             loop_closures_queue.put(result)
-            print(f"Added result for candidate {candidate.first_idx} and {candidate.second_idx}")
+            # print(f"(Current keyframe index: {result.candidate.first_idx}) Added result for candidate {candidate.first_idx} and {candidate.second_idx}")
+            print(f"(Current keyframe index: {result.first_idx}) Added result for candidate {result.first_idx} and {result.second_idx}")
         else:
             # print(f"Failed to solve PnP for loop closure between {candidate.first_idx} and {candidate.second_idx} with {len(matched_pair.matches)} inliers")
             pass
@@ -215,7 +227,7 @@ def loop_closure_worker(loop_closure_candidates_queue: Queue, loop_closures_queu
 
 
 if __name__ == "__main__":
-    mp.set_start_method('fork')
+    mp.set_start_method('spawn')
 
     # timestamps = np.load(os.path.join(os.path.dirname(__file__), 'data', 'AbandonedFactory', 'Data_easy', 'P001', 'imu', 'cam_time.npy'))
 
@@ -271,8 +283,8 @@ if __name__ == "__main__":
 
     # TODO: refactor keyframing logic into it's own class
     # goal: encourage high quality wide baseline loop closures
-    keyframe_translation_threshold = 0.2 # I notice that higher values let more wide baseline loop closures be detected
-    keyframe_rotation_threshold = np.deg2rad(8)
+    keyframe_translation_threshold = 0.8 # I notice that higher values let more wide baseline loop closures be detected
+    keyframe_rotation_threshold = np.deg2rad(16)
     cur_keyframe_pose = None
 
     raw_trajectory: list[gtsam.Pose3] = []
@@ -289,10 +301,12 @@ if __name__ == "__main__":
     # xfeat runs at like 15 fps
     # should be Queue[IndexedFramePair[StereoDepthFrameWithFeatures]] but python doesn't support it?
     # TODO: low max size and overwrite old candidates to maintain low latency
-    loop_closure_candidates_queue = Queue(maxsize=5000)
+    # loop_closure_candidates_queue = Queue(maxsize=5000)
+    loop_closure_candidates_queue = SimpleQueue()
 
     # should be Queue[LoopClosureResult] but python doesn't support it?
     loop_closures_queue = Queue(maxsize=5000)
+    # loop_closures_queue = SimpleQueue()
 
     # inefficient but we need an instance of the matcher here too for feature detection
     # we could either split the matcher into a feature detection and matching part or just have the worker do both?
@@ -363,7 +377,11 @@ if __name__ == "__main__":
             end_preprocess_time = time.perf_counter()
             # print(f"Preprocess Time: {end_preprocess_time - start_preprocess_time:.2f} seconds ({1 / (end_preprocess_time - start_preprocess_time):.2f} fps)")
 
+            start_process_odometry_time = time.perf_counter()
             pose_graph.process_odometry(noisy_prev_robot_to_robot, odometry_noise, feature_frame)
+            end_process_odometry_time = time.perf_counter()
+            print(f"Process Odometry Time: {end_process_odometry_time - start_process_odometry_time:.2f} seconds ({1 / (end_process_odometry_time - start_process_odometry_time):.2f} fps)")
+
             gt_keyframe_trajectory.append(first_robot_to_robot)
 
             # TODO: figure out why doing this causes the estimated trajectory to be offset? I think it's because even this is actually the second frame not the first one or something?
@@ -412,7 +430,7 @@ if __name__ == "__main__":
             end_detect_features_time = time.perf_counter()
 
             end_preprocess_time = time.perf_counter()
-            # print(f"Preprocess Time: {end_preprocess_time - start_preprocess_time:.2f} seconds ({1 / (end_preprocess_time - start_preprocess_time):.2f} fps)")
+            print(f"Preprocess Time: {end_preprocess_time - start_preprocess_time:.2f} seconds ({1 / (end_preprocess_time - start_preprocess_time):.2f} fps)")
 
             gt_keyframe_trajectory.append(first_robot_to_robot)
             raw_keyframe_trajectory.append(raw_trajectory[-1])
@@ -451,42 +469,51 @@ if __name__ == "__main__":
                 # make sure the order we're removing candidates from the right side so that we're minimizing
                 # latency?
                 # try:
-                loop_closure_candidates_queue.put_nowait(candidate)
+
+                # TODO: this is a big bottleneck, we need to use shared memory or something
+                # it takes like 0.4 seconds to copy the candidate to the worker
+                loop_closure_candidates_queue.put(candidate)
+
                 # except Full:
                 #     print(f"Loop closure candidate queue is full, dropping oldest candidate to maintain low latency")
                 #     loop_closure_candidates_queue.get_nowait()
                 #     loop_closure_candidates_queue.put_nowait(candidate)
 
             end_loop_closure_candidates_time = time.perf_counter()
-            # print(f"Loop Closure Candidates Time: {end_loop_closure_candidates_time - start_loop_closure_candidates_time:.2f} seconds ({1 / (end_loop_closure_candidates_time - start_loop_closure_candidates_time):.2f} fps)")
+            print(f"Loop Closure Candidates Time: {end_loop_closure_candidates_time - start_loop_closure_candidates_time:.2f} seconds ({1 / (end_loop_closure_candidates_time - start_loop_closure_candidates_time):.2f} fps)")
 
             # TODO: consider doing this in the outer loop so we don't have to wait for a keyframe to process loop closures?
             # process any loop closure results from the worker
             start_loop_closure_results_time = time.perf_counter()
-            while True:
+            # while True:
+            while not loop_closures_queue.empty():
                 # drain by checking for exceptions instead of using empty() because apparently empty() isn't reliable?
                 try:
-                    # result = loop_closures_queue.get_nowait()
-                    result = loop_closures_queue.get(timeout=0.5)
+                    result = loop_closures_queue.get_nowait()
+                    # result = loop_closures_queue.get(timeout=0.5)
+                    # result = loop_closures_queue.get()
                     assert result is not None
                 except Empty:
                     break
 
-                print(f"Processing result for candidate {result.candidate.first_idx} and {result.candidate.second_idx}")
+                # print(f"(Current keyframe index: {pose_graph.kf_idx}, Delayed {pose_graph.kf_idx - result.candidate.first_idx} frames) Processing result for candidate {result.candidate.first_idx} and {result.candidate.second_idx}")
+                print(f"(Current keyframe index: {pose_graph.kf_idx}, Delayed {pose_graph.kf_idx - result.first_idx} frames) Processing result for candidate {result.first_idx} and {result.second_idx}")
 
                 first_to_second = gtsam.Pose3(gtsam.Rot3(result.R_first_to_second), gtsam.Point3(result.t_first_to_second))
                 # noise = gtsam.noiseModel.Diagonal.Sigmas(result.noise_diagonal)
                 noise = loop_noise
 
-                pose_graph.add_between_pose_factor(result.candidate.first_idx, result.candidate.second_idx, first_to_second, noise)
+                first_idx = result.first_idx
+                second_idx = result.second_idx
+                pose_graph.add_between_pose_factor(first_idx, second_idx, first_to_second, noise)
                 
-                rand_idxs = np.random.choice(len(result.mkpts1_3d), size=min(200, len(result.mkpts1_3d)), replace=False)
-                map_points.append((result.candidate.first_idx, result.mkpts1_3d[rand_idxs], result.mkpts1_color[rand_idxs]))
-                if len(map_points) > 1000: # cap the map points to prevent memory issues
-                    map_points.pop(0)
+                # rand_idxs = np.random.choice(len(result.mkpts1_3d), size=min(200, len(result.mkpts1_3d)), replace=False)
+                # map_points.append((result.candidate.first_idx, result.mkpts1_3d[rand_idxs], result.mkpts1_color[rand_idxs]))
+                # if len(map_points) > 1000: # cap the map points to prevent memory issues
+                #     map_points.pop(0)
             
             end_loop_closure_results_time = time.perf_counter()
-            # print(f"Loop Closure Results Time: {end_loop_closure_results_time - start_loop_closure_results_time:.2f} seconds ({1 / (end_loop_closure_results_time - start_loop_closure_results_time):.2f} fps)")
+            print(f"Loop Closure Results Time: {end_loop_closure_results_time - start_loop_closure_results_time:.2f} seconds ({1 / (end_loop_closure_results_time - start_loop_closure_results_time):.2f} fps)")
 
             # # single-process loop closure processing
             # candidate_matches = matcher.match(loop_candidates)
@@ -522,7 +549,7 @@ if __name__ == "__main__":
             start_optimize_time = time.perf_counter()
             pose_graph.optimize()
             end_optimize_time = time.perf_counter()
-            # print(f"Optimize Time: {end_optimize_time - start_optimize_time:.2f} seconds ({1 / (end_optimize_time - start_optimize_time):.2f} fps)")
+            print(f"Optimize Time: {end_optimize_time - start_optimize_time:.2f} seconds ({1 / (end_optimize_time - start_optimize_time):.2f} fps)")
 
             # time.sleep(0.2) # sleep for a moment to simulate real-time odometry
         else:
@@ -564,10 +591,10 @@ if __name__ == "__main__":
         # optimized_trajectory.append(pose_graph.get_latest_pose())
         # rr_log_trajectory("optimized_trajectory", optimized_trajectory, color=(255, 0, 0))
         rr_log_graph_edges(path="graph", nodes=pose_graph.values, graph=pose_graph.graph)
-        rr_log_pose(path="optimized", pose=pose_graph.get_latest_pose(), frame=depth_frame)
+        # rr_log_pose(path="optimized", pose=pose_graph.get_latest_pose(), frame=depth_frame)
 
         # this might be causing perf issues? not sure
-        rr_log_map_points("map_points", pose_graph, map_points)
+        # rr_log_map_points("map_points", pose_graph, map_points)
 
         # trans_ate = np.linalg.norm(gt_keyframe_trajectory[-1].translation() - pose_graph.get_latest_pose().translation())
         # rot_ate = np.rad2deg(np.linalg.norm(gt_keyframe_trajectory[-1].rotation().ypr() - pose_graph.get_latest_pose().rotation().ypr()))
@@ -589,7 +616,7 @@ if __name__ == "__main__":
             rr.log("/rotation/ate", rr.Scalar(rot_ate))
 
         end_logging_time = time.perf_counter()
-        # print(f"Logging Time: {end_logging_time - start_logging_time:.2f} seconds ({1 / (end_logging_time - start_logging_time):.2f} fps)")
+        print(f"Logging Time: {end_logging_time - start_logging_time:.2f} seconds ({1 / (end_logging_time - start_logging_time):.2f} fps)")
 
         end_time = time.perf_counter()
         print(f"Total Frame Processing Time: {end_time - start_time:.2f} seconds ({1 / (end_time - start_time):.2f} fps)")
