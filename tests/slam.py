@@ -36,8 +36,8 @@ from tests.test_utils import get_tartanair_iterator_with_odometry, tartanair_cal
 from depth.sgbm import SGBM
 from registration.registration import FramePair, IndexedFramePair, FeatureFrame
 # from registration.lightglue import LightglueMatcher
-# from registration.lighterglue import LighterglueMatcher
-from registration.orb import OrbMatcher
+from registration.lighterglue import LighterglueMatcher
+# from registration.orb import OrbMatcher
 from registration.utils import fundamental_fitler, solve_pnp
 from viz import rr_log_map_points, rr_log_pose, rr_log_trajectory, rr_log_graph_edges
 from util import share_feature_frame
@@ -151,8 +151,8 @@ def loop_closure_worker(loop_closure_candidates_queue: Queue, loop_closures_queu
     # TODO: log numbers and changes in inlier counts somehow?
     # setup two-view pose estimation
     # matcher = LightglueMatcher(num_features=1536, compile=False, mp=True, device='cuda')
-    # matcher = LighterglueMatcher(num_features=4096, compile=False, device='cuda', use_lighterglue_matching=True)
-    matcher = OrbMatcher(num_features=2000)
+    matcher = LighterglueMatcher(num_features=4096, compile=False, device='cuda', use_lighterglue_matching=True)
+    # matcher = OrbMatcher(num_features=2000)
     print(f"Loop closure worker {worker_id} started")
 
     times = []
@@ -284,7 +284,7 @@ if __name__ == "__main__":
     # varying the noise based on the inlier count might also help?
     # a basic robust loss might also help with outliers
     # velocity factors might help as well
-    min_inlier_count = 30
+    min_inlier_count = 100
 
     # TODO: refactor keyframing logic into it's own class
     # goal: encourage high quality wide baseline loop closures
@@ -315,8 +315,8 @@ if __name__ == "__main__":
 
     # inefficient but we need an instance of the matcher here too for feature detection
     # we could either split the matcher into a feature detection and matching part or just have the worker do both?
-    # matcher = LighterglueMatcher(num_features=4096, compile=False, device='cuda', use_lighterglue_matching=True)
-    matcher = OrbMatcher(num_features=2000)
+    matcher = LighterglueMatcher(num_features=4096, compile=False, device='cuda', use_lighterglue_matching=True)
+    # matcher = OrbMatcher(num_features=2000)
 
     try:
         available_cpus = mp.cpu_count()
@@ -324,7 +324,8 @@ if __name__ == "__main__":
         available_cpus = 1
 
     if available_cpus and available_cpus > 1:
-        num_loop_closure_workers = min(4, max(2, available_cpus // 2))
+        # num_loop_closure_workers = min(4, max(2, available_cpus // 2))
+        num_loop_closure_workers = 1
     else:
         num_loop_closure_workers = 1
 
@@ -381,17 +382,17 @@ if __name__ == "__main__":
 
         # simulate realtime processing
 
-        # # warn if we're behind realtime by more than 0.5 seconds
-        # if exc_ts > (ts + 0.5):
-        #     print(f"Behind realtime by {exc_ts - ts:.2f} seconds, skipping frame")
-        #     continue
+        # warn if we're behind realtime by more than 0.5 seconds
+        if exc_ts > (ts + 0.5):
+            print(f"Behind realtime by {exc_ts - ts:.2f} seconds, skipping frame")
+            continue
 
-        # # sleep until the true time if we're ahead of realtime
-        # if exc_ts < ts:
-        #     time.sleep(ts - exc_ts)
+        # sleep until the true time if we're ahead of realtime
+        if exc_ts < ts:
+            time.sleep(ts - exc_ts)
 
         # # TODO: get rid of this lmao we aren't using the hard sequence rn
-        time.sleep(0.2) # wait to simulate realtime processing
+        # time.sleep(0.2) # wait to simulate realtime processing
 
         start_time = time.perf_counter()
 

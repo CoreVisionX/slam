@@ -31,11 +31,11 @@ class LighterglueMatcher:
             # move all features to the CPU to avoid multiprocessing issues
             for key in output.keys():
                 if isinstance(output[key], torch.Tensor):
-                    output[key] = output[key].detach().cpu()
+                    output[key] = output[key].detach().cpu().numpy()
 
             # calculate the 3d positions of the features
-            u = output['keypoints'][:, 1].cpu().numpy().astype(int)
-            v = output['keypoints'][:, 0].cpu().numpy().astype(int)
+            u = output['keypoints'][:, 1].astype(int)
+            v = output['keypoints'][:, 0].astype(int)
             output['keypoints_3d'] = frame.left_depth_xyz[u, v, :]
             output['keypoints_depth'] = frame.left_depth[u, v]
             output['keypoints_color'] = frame.left[u, v]
@@ -69,9 +69,15 @@ class LighterglueMatcher:
         results = []
 
         for pair in pairs:
-            # move all features back to the GPU
-            first_features = {key: value.to(self.device) if isinstance(value, torch.Tensor) else value for key, value in pair.first.features.items()}
-            second_features = {key: value.to(self.device) if isinstance(value, torch.Tensor) else value for key, value in pair.second.features.items()}
+            # move all features back to the GPU for matching
+            pair.first.features['keypoints'] = torch.tensor(pair.first.features['keypoints']).to(self.device)
+            pair.second.features['keypoints'] = torch.tensor(pair.second.features['keypoints']).to(self.device)
+
+            pair.first.features['descriptors'] = torch.tensor(pair.first.features['descriptors']).to(self.device)
+            pair.second.features['descriptors'] = torch.tensor(pair.second.features['descriptors']).to(self.device)
+            
+            first_features = pair.first.features
+            second_features = pair.second.features
 
             if self.use_lighterglue_matching:
                 _mkpts1, _mkpts2, idxs = self.matcher.match_lighterglue(first_features, second_features)
