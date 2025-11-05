@@ -184,6 +184,13 @@ def main() -> None:
             f"Finished with {keyframe_count} keyframes and {loop_closure_count} loop closures."
         )
         if last_snapshot is not None and last_snapshot.rolling_stats:
+            total_runtime = last_snapshot.cumulative_time
+            avg_frame_time = last_snapshot.mean_frame_time
+            fps = last_snapshot.mean_fps
+            print(
+                f"Processed {last_snapshot.frame_count} frames | total {total_runtime:.2f}s | "
+                f"avg {avg_frame_time:.3f}s ({fps:.2f} fps)"
+            )
             print("Rolling performance stats:")
             for line in last_snapshot.summary_lines():
                 print(f"    {line}")

@@ -27,6 +27,8 @@ class PerformanceSnapshot:
     total_duration: float
     sections: dict[str, float]
     rolling_stats: dict[str, SectionStats]
+    frame_count: int
+    cumulative_time: float
 
     def summary_lines(self) -> list[str]:
         lines = []
@@ -37,6 +39,19 @@ class PerformanceSnapshot:
             )
         return lines
 
+    @property
+    def mean_frame_time(self) -> float:
+        if self.frame_count == 0:
+            return 0.0
+        return self.cumulative_time / self.frame_count
+
+    @property
+    def mean_fps(self) -> float:
+        mean_time = self.mean_frame_time
+        if mean_time <= 0.0:
+            return 0.0
+        return 1.0 / mean_time
+
 
 class PerformanceTracker:
     """Track per-section timings with rolling statistics."""
@@ -46,6 +61,8 @@ class PerformanceTracker:
         self._records: dict[str, Deque[float]] = {}
         self._step_sections: dict[str, float] = {}
         self._current_frame: int = -1
+        self._frame_count = 0
+        self._cumulative_time = 0.0
 
     def start_step(self, frame_index: int) -> None:
         self._step_sections = {}
@@ -57,11 +74,15 @@ class PerformanceTracker:
             for name, deque_values in self._records.items()
             if deque_values
         }
+        self._frame_count += 1
+        self._cumulative_time += total_duration
         return PerformanceSnapshot(
             frame_index=self._current_frame,
             total_duration=total_duration,
             sections=dict(self._step_sections),
             rolling_stats=stats,
+            frame_count=self._frame_count,
+            cumulative_time=self._cumulative_time,
         )
 
     def record(self, section: str, duration: float) -> None:
