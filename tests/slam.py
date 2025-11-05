@@ -35,6 +35,7 @@ from registration.registration import FramePair, IndexedFramePair, FeatureFrame
 from registration.orb import OrbMatcher
 from registration.utils import fundamental_fitler, solve_pnp
 from viz import rr_log_map_points, rr_log_pose, rr_log_trajectory, rr_log_graph_edges
+from util import share_feature_frame
 
 
 ALIGN_GT_KEYFRAMES = True
@@ -147,7 +148,7 @@ def loop_closure_worker(loop_closure_candidates_queue: Queue, loop_closures_queu
     # setup two-view pose estimation
     # matcher = LightglueMatcher(num_features=1536, compile=False, mp=True, device='cuda')
     # matcher = LighterglueMatcher(num_features=4096, compile=False, device='cuda', use_lighterglue_matching=True)
-    matcher = OrbMatcher(num_features=1000)
+    matcher = OrbMatcher(num_features=2000)
     print("Loop closure worker started")
 
     times = []
@@ -170,7 +171,7 @@ def loop_closure_worker(loop_closure_candidates_queue: Queue, loop_closures_queu
 
         if len(candidates) > max_queue_size:
             candidate_idxs = [candidate.first_idx for candidate in candidates]
-            print(f"Candidates overflowing idxs: {candidate_idxs}")
+            print(f"Candidates overflowing idxs: ({len(candidate_idxs)} total) ...{candidate_idxs[-5:]}")
 
         # candidates = candidates[-max_queue_size:]
 
@@ -229,11 +230,11 @@ def loop_closure_worker(loop_closure_candidates_queue: Queue, loop_closures_queu
 if __name__ == "__main__":
     mp.set_start_method('spawn')
 
-    # timestamps = np.load(os.path.join(os.path.dirname(__file__), 'data', 'AbandonedFactory', 'Data_easy', 'P001', 'imu', 'cam_time.npy'))
+    timestamps = np.load(os.path.join(os.path.dirname(__file__), 'data', 'AbandonedFactory', 'Data_easy', 'P001', 'imu', 'cam_time.npy'))
 
     # TODO: the noise should probably be much higher than the real noise since we're integrating the odometry poses between keyframes
     # odometry_noise = gtsam.noiseModel.Diagonal.Sigmas(np.array([np.deg2rad(1.0), np.deg2rad(1.0), np.deg2rad(1.0), 0.02, 0.02, 0.02]) * 100_000) # make it exteremly high so it doesn't influence anything
-    odometry_noise = gtsam.noiseModel.Diagonal.Sigmas(np.array([np.deg2rad(1.0), np.deg2rad(1.0), np.deg2rad(1.0), 0.02, 0.02, 0.02]) * 100)
+    odometry_noise = gtsam.noiseModel.Diagonal.Sigmas(np.array([np.deg2rad(0.3), np.deg2rad(0.3), np.deg2rad(0.3), 0.007, 0.007, 0.007]))
 
     # TODO: actually robust rerun setup (factor this out somewhere reusable)
     rr.init("slam")
@@ -247,7 +248,7 @@ if __name__ == "__main__":
 
     # TODO: figure out a proximity loop closer with a minimum seperation between candidates it finds, not just the current pose. maybe that's what keyframes should be doing and I need a better way of maintaining the local trajectory smoothness? idk.
     # show encourage longer baseline loop closures
-    loop_detector = ProximityLoopDetector(max_translation=12.0, max_rotation=np.deg2rad(60), max_candidates=10, min_seperation=1)
+    loop_detector = ProximityLoopDetector(max_translation=12.0, max_rotation=np.deg2rad(60), max_candidates=20, min_seperation=1)
 
     # TODO: figure out the proper noise model for this
     # an interactive UI with sliders and visualizaation of the resulting optimization might be really useful
@@ -259,11 +260,11 @@ if __name__ == "__main__":
         print("Using Huber loss for loop closures")
         loop_noise = gtsam.noiseModel.Robust.Create(
             gtsam.noiseModel.mEstimator.Huber(1.0),
-            gtsam.noiseModel.Diagonal.Sigmas(np.array([np.deg2rad(1.0), np.deg2rad(1.0), np.deg2rad(1.0), 0.04, 0.04, 0.04]) * 0.01)
+            gtsam.noiseModel.Diagonal.Sigmas(np.array([np.deg2rad(0.3), np.deg2rad(0.3), np.deg2rad(0.3), 0.014, 0.014, 0.014]))
         )
     else:
         print("Not using Huber loss for loop closures")
-        loop_noise = gtsam.noiseModel.Diagonal.Sigmas(np.array([np.deg2rad(1.0), np.deg2rad(1.0), np.deg2rad(1.0), 0.04, 0.04, 0.04]) * 0.01)
+        loop_noise = gtsam.noiseModel.Diagonal.Sigmas(np.array([np.deg2rad(0.3), np.deg2rad(0.3), np.deg2rad(0.3), 0.014, 0.014, 0.014]))
     # loop_noise = gtsam.noiseModel.Gaussian.Covariance(np.array([
     #     [ 0.000006,  0.000000, -0.000000,  0.000002,  0.000042,  0.000008],
     #     [ 0.000000,  0.000006, -0.000000, -0.000053,  0.000005,  0.000019],
@@ -279,12 +280,12 @@ if __name__ == "__main__":
     # varying the noise based on the inlier count might also help?
     # a basic robust loss might also help with outliers
     # velocity factors might help as well
-    min_inlier_count = 30
+    min_inlier_count = 60
 
     # TODO: refactor keyframing logic into it's own class
     # goal: encourage high quality wide baseline loop closures
-    keyframe_translation_threshold = 0.8 # I notice that higher values let more wide baseline loop closures be detected
-    keyframe_rotation_threshold = np.deg2rad(16)
+    keyframe_translation_threshold = 0.2 # I notice that higher values let more wide baseline loop closures be detected
+    keyframe_rotation_threshold = np.deg2rad(8)
     cur_keyframe_pose = None
 
     raw_trajectory: list[gtsam.Pose3] = []
@@ -311,7 +312,7 @@ if __name__ == "__main__":
     # inefficient but we need an instance of the matcher here too for feature detection
     # we could either split the matcher into a feature detection and matching part or just have the worker do both?
     # matcher = LighterglueMatcher(num_features=4096, compile=False, device='cuda', use_lighterglue_matching=True)
-    matcher = OrbMatcher(num_features=1000)
+    matcher = OrbMatcher(num_features=2000)
 
     # start the loop closure worker
     loop_closure_worker_process = Process(target=loop_closure_worker, args=(loop_closure_candidates_queue, loop_closures_queue, loop_noise, min_inlier_count))
@@ -327,13 +328,13 @@ if __name__ == "__main__":
         difficulty='easy', 
         traj='P001', 
         include_ground_truth=True,
-        rotation_noise_sigmas=np.array([np.deg2rad(1.0), np.deg2rad(1.0), np.deg2rad(1.0)]),
-        translation_noise_sigmas=np.array([0.02, 0.02, 0.02])
+        rotation_noise_sigmas=np.array([np.deg2rad(0.3), np.deg2rad(0.3), np.deg2rad(0.3)]),
+        translation_noise_sigmas=np.array([0.007, 0.007, 0.007])
     )
 
     print("Starting trajectory processing...")
     for i, (frame, noisy_prev_robot_to_robot, first_robot_to_robot) in enumerate(odometry_iterator):
-        # ts = timestamps[i]
+        ts = timestamps[i]
         
         if exc_ts_start is None:
             exc_ts_start = time.perf_counter()
@@ -359,8 +360,8 @@ if __name__ == "__main__":
         # if exc_ts < ts:
         #     time.sleep(ts - exc_ts)
 
-        # TODO: get rid of this lmao we aren't using the hard sequence rn
-        # time.sleep(0.2) # wait to simulate realtime processing
+        # # TODO: get rid of this lmao we aren't using the hard sequence rn
+        time.sleep(0.2) # wait to simulate realtime processing
 
         start_time = time.perf_counter()
 
@@ -374,6 +375,7 @@ if __name__ == "__main__":
             rectified_frame = frame.rectify()
             depth_frame = sgbm.compute_depth(rectified_frame)
             feature_frame = matcher.detect_features([depth_frame])[0]
+            feature_frame = share_feature_frame(feature_frame)
             end_preprocess_time = time.perf_counter()
             # print(f"Preprocess Time: {end_preprocess_time - start_preprocess_time:.2f} seconds ({1 / (end_preprocess_time - start_preprocess_time):.2f} fps)")
 
@@ -427,6 +429,7 @@ if __name__ == "__main__":
 
             start_detect_features_time = time.perf_counter()
             feature_frame = matcher.detect_features([depth_frame])[0]
+            feature_frame = share_feature_frame(feature_frame)
             end_detect_features_time = time.perf_counter()
 
             end_preprocess_time = time.perf_counter()
@@ -452,7 +455,7 @@ if __name__ == "__main__":
             start_loop_closure_candidates_time = time.perf_counter()
 
             # should the order here be reversed?
-            for candidate in loop_candidates:
+            for candidate in reversed(loop_candidates):
                 # # TODO: this is a hack get rid of this later
                 # # detach all tensors from the GPU and move to the CPU before queuing to avoid cuda issues
                 # for key in candidate.first.features.__dict__:
