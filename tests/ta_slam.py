@@ -3,16 +3,17 @@
 from __future__ import annotations
 
 import argparse
-import time
-import multiprocessing    
-from pathlib import Path
+import multiprocessing
 import sys
+import time
+from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
 import numpy as np
+import rerun as rr
 
 from slam import SlamConfig, create_default_slam_system
 from tests.test_utils import get_tartanair_iterator_with_odometry, tartanair_calib
@@ -71,8 +72,20 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--sleep",
         type=float,
-        default=0.2,
+        default=0.0,
         help="Sleep time between frames (seconds).",
+    )
+    parser.add_argument(
+        "--perf-log-threshold",
+        type=float,
+        default=None,
+        help="If set, log performance sections for non-keyframe frames whose total processing time "
+        "exceeds this threshold (seconds).",
+    )
+    parser.add_argument(
+        "--log-loop-closures",
+        action="store_true",
+        help="Log loop closures to console.",
     )
     return parser.parse_args()
 
@@ -108,35 +121,61 @@ def main() -> None:
 
     keyframe_count = 0
     loop_closure_count = 0
-
-    # TODO: collect (or build in tools for this?) metrics for timing performance, kinda important
-    # figure out what's causing the stuttering here
+    last_snapshot = None
 
     try:
         for frame, odometry, gt_pose in iterator:
-            start_time = time.perf_counter()
             result = slam.process_step(frame, odometry, ground_truth_pose=gt_pose)
-            elapsed = time.perf_counter() - start_time
+            last_snapshot = result.performance
+
+            total_duration = result.performance.total_duration
+            log_sections = result.is_keyframe or (
+                args.perf_log_threshold is not None and total_duration >= args.perf_log_threshold
+            )
 
             if result.is_keyframe:
                 keyframe_count += 1
-                preprocess = result.frontend_timings.total if result.frontend_timings else 0.0
-                print(
-                    f"[Frame {result.frame_index:04d}] keyframe {keyframe_count:04d} "
-                    f"(preprocess {preprocess:.2f}s, total {elapsed:.2f}s)"
+
+            if log_sections:
+                section_breakdown = ", ".join(
+                    f"{name}:{duration:.3f}s"
+                    for name, duration in sorted(result.performance.sections.items())
+                    if duration > 0.0
                 )
-                if result.metrics:
-                    print(
-                        f"    ATE transl {result.metrics.translation_ate:.3f} m, "
-                        f"rot {result.metrics.rotation_ate_deg:.3f} deg"
+                if result.is_keyframe:
+                    preprocess = result.frontend_timings.total if result.frontend_timings else 0.0
+                    msg = f"[Frame {result.frame_index:04d}] keyframe {keyframe_count:04d} "
+                    msg += f"(preprocess {preprocess:.2f}s, total {total_duration:.2f}s)\n"
+                    msg += f"    sections: {section_breakdown}\n"
+                    if result.metrics:
+                        msg += f"    ATE transl {result.metrics.translation_ate:.3f} m, "
+                        msg += f"rot {result.metrics.rotation_ate_deg:.3f} deg\n"
+                    print(msg)
+
+                    if not args.disable_rerun:
+                        rr.set_time_sequence("frame", sequence=result.frame_index)
+                        rr.log("logs", rr.TextLog(msg))
+                else:
+                    header = (
+                        f"[Frame {result.frame_index:04d}] non-keyframe total {total_duration:.2f}s"
                     )
+                    if args.perf_log_threshold is not None:
+                        header += f" (threshold {args.perf_log_threshold:.2f}s)"
+                    msg = f"{header}\n    sections: {section_breakdown}"
+                    print(msg)
+
+                    if not args.disable_rerun:
+                        rr.set_time_sequence("frame", sequence=result.frame_index)
+                        rr.log("logs", rr.TextLog(msg))
 
             if result.loop_closures_added:
                 loop_closure_count += result.loop_closures_added
-                print(
-                    f"    Integrated {result.loop_closures_added} loop closures "
-                    f"(total {loop_closure_count})"
-                )
+
+                if args.log_loop_closures:
+                    print(
+                        f"    Integrated {result.loop_closures_added} loop closures "
+                        f"(total {loop_closure_count})"
+                    )
 
             time.sleep(args.sleep)
     finally:
@@ -144,6 +183,10 @@ def main() -> None:
         print(
             f"Finished with {keyframe_count} keyframes and {loop_closure_count} loop closures."
         )
+        if last_snapshot is not None and last_snapshot.rolling_stats:
+            print("Rolling performance stats:")
+            for line in last_snapshot.summary_lines():
+                print(f"    {line}")
 
 
 if __name__ == "__main__":

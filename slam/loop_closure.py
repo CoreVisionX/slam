@@ -34,6 +34,7 @@ def _loop_closure_worker(
     loop_closures_queue: Queue,
     min_inlier_count: int,
     worker_id: int,
+    verbose: bool = False,
 ) -> None:
     """Background worker that estimates relative poses for candidate keyframe pairs."""
 
@@ -64,7 +65,8 @@ def _loop_closure_worker(
             matched_pair = matcher.match([candidate])[0]
             first_to_second, matched_pair = solve_pnp(matched_pair)
         except Exception as exc:  # broad catch for robustness
-            print(
+            if verbose:
+                print(
                 f"[LoopClosureWorker {worker_id}] failed to solve PnP for "
                 f"({candidate.first_idx}, {candidate.second_idx}): {exc}"
             )
@@ -82,7 +84,8 @@ def _loop_closure_worker(
                     inlier_count=inlier_count,
                 )
             )
-            print(
+            if verbose:
+                print(
                 f"[LoopClosureWorker {worker_id}] queued closure "
                 f"{candidate.first_idx}->{candidate.second_idx} with {inlier_count} inliers"
             )

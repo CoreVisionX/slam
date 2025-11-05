@@ -16,6 +16,7 @@ from registration.registration import StereoFrame
 from slam.frontend import FrontendOutput, FrontendTimings, StereoFrontend
 from slam.logger import RerunLogger, TrajectoryMetrics
 from slam.loop_closure import LoopClosureManager, LoopClosureResult
+from slam.metrics import PerformanceSnapshot, PerformanceTracker
 
 
 @dataclass(slots=True)
@@ -57,6 +58,7 @@ class SlamStepResult:
     frontend_timings: FrontendTimings | None
     total_time: float
     metrics: TrajectoryMetrics | None
+    performance: PerformanceSnapshot
 
 
 class StereoSlamSystem:
@@ -78,6 +80,7 @@ class StereoSlamSystem:
         self.loop_detector = loop_detector
         self.loop_manager = loop_manager
         self.logger = logger
+        self.performance = PerformanceTracker(history=300)
 
         self.loop_manager.start()
 
@@ -124,8 +127,10 @@ class StereoSlamSystem:
 
         self._frame_index += 1
         step_start = time.perf_counter()
+        self.performance.start_step(self._frame_index)
 
-        latest_pose = self._integrate_odometry(odometry)
+        with self.performance.time_section("odometry.integrate"):
+            latest_pose = self._integrate_odometry(odometry)
         frontend_output: FrontendOutput | None = None
         is_keyframe = False
 
@@ -133,8 +138,11 @@ class StereoSlamSystem:
             self._gt_trajectory.append(ground_truth_pose)
 
         if self._current_keyframe_pose is None:
-            frontend_output = self.frontend.process(frame)
-            self.pose_graph.process_odometry(odometry, self._odometry_noise, frontend_output.feature_frame)
+            with self.performance.time_section("frontend.total"):
+                frontend_output = self.frontend.process(frame)
+            self._record_frontend_timings(frontend_output.timings)
+            with self.performance.time_section("pose_graph.process_odometry"):
+                self.pose_graph.process_odometry(odometry, self._odometry_noise, frontend_output.feature_frame)
 
             self._current_keyframe_pose = ground_truth_pose or latest_pose
             self._raw_keyframe_trajectory.append(latest_pose)
@@ -151,8 +159,13 @@ class StereoSlamSystem:
                 distance > self.config.keyframe_translation_threshold
                 or rotation > self.config.keyframe_rotation_threshold
             ):
-                frontend_output = self.frontend.process(frame)
-                self.pose_graph.process_odometry(relative_to_keyframe, self._odometry_noise, frontend_output.feature_frame)
+                with self.performance.time_section("frontend.total"):
+                    frontend_output = self.frontend.process(frame)
+                self._record_frontend_timings(frontend_output.timings)
+                with self.performance.time_section("pose_graph.process_odometry"):
+                    self.pose_graph.process_odometry(
+                        relative_to_keyframe, self._odometry_noise, frontend_output.feature_frame
+                    )
 
                 self._current_keyframe_pose = latest_pose
                 self._raw_keyframe_trajectory.append(latest_pose)
@@ -170,16 +183,20 @@ class StereoSlamSystem:
 
         metrics: TrajectoryMetrics | None = None
         if is_keyframe or loop_closures_added > 0:
-            self.pose_graph.optimize()
+            with self.performance.time_section("optimization"):
+                self.pose_graph.optimize()
             if self.logger is not None and self._gt_keyframe_trajectory:
-                metrics = self.logger.log_step(
-                    self._frame_index,
-                    self.pose_graph,
-                    self._gt_keyframe_trajectory,
-                    self._raw_keyframe_trajectory,
-                )
+                with self.performance.time_section("logging.rerun"):
+                    metrics = self.logger.log_step(
+                        self._frame_index,
+                        self.pose_graph,
+                        self._gt_keyframe_trajectory,
+                        self._raw_keyframe_trajectory,
+                    )
 
         total_time = time.perf_counter() - step_start
+        self.performance.record("total_step", total_time)
+        snapshot = self.performance.end_step(total_time)
 
         return SlamStepResult(
             frame_index=self._frame_index,
@@ -189,6 +206,7 @@ class StereoSlamSystem:
             frontend_timings=frontend_output.timings if frontend_output else None,
             total_time=total_time,
             metrics=metrics,
+            performance=snapshot,
         )
 
     def _integrate_odometry(self, odometry: gtsam.Pose3 | None) -> gtsam.Pose3:
@@ -198,26 +216,48 @@ class StereoSlamSystem:
         self._raw_trajectory.append(self._raw_pose)
         return self._raw_pose
 
+    def _record_frontend_timings(self, timings: FrontendTimings) -> None:
+        self.performance.record("frontend.rectify", timings.rectify)
+        self.performance.record("frontend.depth", timings.depth)
+        self.performance.record("frontend.features", timings.feature_detection)
+
     def _queue_loop_closure_candidates(self) -> None:
+        total_start = time.perf_counter()
+        detect_start = total_start
         loop_candidates = self.loop_detector.candidates(self.pose_graph, self.pose_graph.kf_idx)
-        if loop_candidates:
-            self.loop_manager.submit_candidates(reversed(loop_candidates))
+        self.performance.record("loop_candidates.detect", time.perf_counter() - detect_start)
+
+        if not loop_candidates:
+            self.performance.record("loop_candidates.total", time.perf_counter() - total_start)
+            return
+
+        enqueue_start = time.perf_counter()
+        candidates = list(reversed(loop_candidates))
+        self.loop_manager.submit_candidates(candidates)
+        self.performance.record("loop_candidates.enqueue", time.perf_counter() - enqueue_start)
+        self.performance.record("loop_candidates.total", time.perf_counter() - total_start)
 
     def _ingest_loop_closure_results(self) -> int:
-        results = self.loop_manager.poll_results()
-        added = 0
-        for result in results:
-            self._add_loop_closure(result)
-            added += 1
-        return added
+        with self.performance.time_section("loop_results.total"):
+            poll_start = time.perf_counter()
+            results = self.loop_manager.poll_results()
+            self.performance.record("loop_results.poll", time.perf_counter() - poll_start)
+
+            added = 0
+            for result in results:
+                with self.performance.time_section("loop_results.apply"):
+                    self._add_loop_closure(result)
+                added += 1
+            return added
 
     def _add_loop_closure(self, result: LoopClosureResult) -> None:
         first_to_second = gtsam.Pose3(
             gtsam.Rot3(result.rotation_matrix), gtsam.Point3(result.translation)
         )
-        self.pose_graph.add_between_pose_factor(
-            result.first_idx, result.second_idx, first_to_second, self._loop_noise
-        )
+        with self.performance.time_section("pose_graph.add_loop_closure"):
+            self.pose_graph.add_between_pose_factor(
+                result.first_idx, result.second_idx, first_to_second, self._loop_noise
+            )
 
 
 def create_default_slam_system(
