@@ -1,4 +1,5 @@
 # %%
+import atexit
 from dataclasses import dataclass
 from queue import Empty, Full
 import argparse
@@ -17,6 +18,10 @@ import multiprocessing as mp
 # os.environ["TORCHINDUCTOR_COMPILE_THREADS"] = "1" 
 # import torch, torch._inductor.config as ind
 # ind.compile_threads = 1
+
+# TODO: pose interoplation between keyframes for realtime odometry output
+# TODO: velocity factors for smoother trajectories (have process_odometry accept dt and use it to compute the velocity)
+# TODO: encourage wider baseline loop closures, like maybe fan out? adding a vpr model like dino salad v2 would definitely help a ton as well
 
 # TODO: why is the main thread still running so slow even with loop closure running in a separate process?
 # there shouldn't be anything heavy blocking??
@@ -127,8 +132,7 @@ def compute_umeyama_alignment_pose(
 
     return gtsam.Pose3(gtsam.Rot3(R), gtsam.Point3(*t))
     
-# TODO: launch more than one worker to speed up loop closing
-def loop_closure_worker(loop_closure_candidates_queue: Queue, loop_closures_queue: Queue, loop_noise: gtsam.noiseModel.Diagonal, min_inlier_count: int):
+def loop_closure_worker(loop_closure_candidates_queue: Queue, loop_closures_queue: Queue, loop_noise: gtsam.noiseModel.Diagonal, min_inlier_count: int, worker_id: int = 0):
     """
     Worker process for loop closing
 
@@ -149,7 +153,7 @@ def loop_closure_worker(loop_closure_candidates_queue: Queue, loop_closures_queu
     # matcher = LightglueMatcher(num_features=1536, compile=False, mp=True, device='cuda')
     # matcher = LighterglueMatcher(num_features=4096, compile=False, device='cuda', use_lighterglue_matching=True)
     matcher = OrbMatcher(num_features=2000)
-    print("Loop closure worker started")
+    print(f"Loop closure worker {worker_id} started")
 
     times = []
     i = 0
@@ -171,7 +175,7 @@ def loop_closure_worker(loop_closure_candidates_queue: Queue, loop_closures_queu
 
         if len(candidates) > max_queue_size:
             candidate_idxs = [candidate.first_idx for candidate in candidates]
-            print(f"Candidates overflowing idxs: ({len(candidate_idxs)} total) ...{candidate_idxs[-5:]}")
+            print(f"[Worker {worker_id}] Candidates overflowing idxs: ({len(candidate_idxs)} total) ...{candidate_idxs[-5:]}")
 
         # candidates = candidates[-max_queue_size:]
 
@@ -191,7 +195,7 @@ def loop_closure_worker(loop_closure_candidates_queue: Queue, loop_closures_queu
             
             first_to_second, matched_pair = solve_pnp(matched_pair)
         except Exception as e:
-            print(f"Failed to solve PnP for loop closure between {candidate.first_idx} and {candidate.second_idx} with {len(matched_pair.matches)} inliers: {e}")
+            print(f"[Worker {worker_id}] Failed to solve PnP for loop closure between {candidate.first_idx} and {candidate.second_idx} with {len(matched_pair.matches)} inliers: {e}")
             continue
 
         if len(matched_pair.matches) > min_inlier_count:
@@ -213,7 +217,7 @@ def loop_closure_worker(loop_closure_candidates_queue: Queue, loop_closures_queu
             )
             loop_closures_queue.put(result)
             # print(f"(Current keyframe index: {result.candidate.first_idx}) Added result for candidate {candidate.first_idx} and {candidate.second_idx}")
-            print(f"(Current keyframe index: {result.first_idx}) Added result for candidate {result.first_idx} and {result.second_idx}")
+            print(f"[Worker {worker_id}] (Current keyframe index: {result.first_idx}) Added result for candidate {result.first_idx} and {result.second_idx}")
         else:
             # print(f"Failed to solve PnP for loop closure between {candidate.first_idx} and {candidate.second_idx} with {len(matched_pair.matches)} inliers")
             pass
@@ -223,7 +227,7 @@ def loop_closure_worker(loop_closure_candidates_queue: Queue, loop_closures_queu
         i += 1
         
         if i % log_every == 0:
-            print(f"Mean Loop Closure Processing Time: {np.mean(times):.2f} seconds ({1 / np.mean(times):.2f} fps)")
+            print(f"[Worker {worker_id}] Mean Loop Closure Processing Time: {np.mean(times):.2f} seconds ({1 / np.mean(times):.2f} fps)")
             times = []
 
 
@@ -280,12 +284,12 @@ if __name__ == "__main__":
     # varying the noise based on the inlier count might also help?
     # a basic robust loss might also help with outliers
     # velocity factors might help as well
-    min_inlier_count = 60
+    min_inlier_count = 30
 
     # TODO: refactor keyframing logic into it's own class
     # goal: encourage high quality wide baseline loop closures
-    keyframe_translation_threshold = 0.2 # I notice that higher values let more wide baseline loop closures be detected
-    keyframe_rotation_threshold = np.deg2rad(8)
+    keyframe_translation_threshold = 1.5 # I notice that higher values let more wide baseline loop closures be detected
+    keyframe_rotation_threshold = np.deg2rad(24)
     cur_keyframe_pose = None
 
     raw_trajectory: list[gtsam.Pose3] = []
@@ -314,11 +318,37 @@ if __name__ == "__main__":
     # matcher = LighterglueMatcher(num_features=4096, compile=False, device='cuda', use_lighterglue_matching=True)
     matcher = OrbMatcher(num_features=2000)
 
-    # start the loop closure worker
-    loop_closure_worker_process = Process(target=loop_closure_worker, args=(loop_closure_candidates_queue, loop_closures_queue, loop_noise, min_inlier_count))
-    loop_closure_worker_process.start()
+    try:
+        available_cpus = mp.cpu_count()
+    except NotImplementedError:
+        available_cpus = 1
 
-    print("Waiting for the worker to start...")
+    if available_cpus and available_cpus > 1:
+        num_loop_closure_workers = min(4, max(2, available_cpus // 2))
+    else:
+        num_loop_closure_workers = 1
+
+    print(f"Starting {num_loop_closure_workers} loop closure workers")
+
+    loop_closure_worker_processes: list[Process] = []
+    for worker_idx in range(num_loop_closure_workers):
+        loop_closure_worker_process = Process(
+            target=loop_closure_worker,
+            args=(loop_closure_candidates_queue, loop_closures_queue, loop_noise, min_inlier_count, worker_idx),
+            daemon=True,
+        )
+        loop_closure_worker_process.start()
+        loop_closure_worker_processes.append(loop_closure_worker_process)
+
+    def _shutdown_loop_closure_workers():
+        for process in loop_closure_worker_processes:
+            if process.is_alive():
+                process.terminate()
+                process.join(timeout=1.0)
+
+    atexit.register(_shutdown_loop_closure_workers)
+
+    print(f"Waiting for {num_loop_closure_workers} loop closure workers to start...")
     time.sleep(6) # wait for the worker to start
 
     exc_ts_start = None
