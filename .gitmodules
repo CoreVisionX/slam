@@ -1,6 +1,3 @@
 [submodule "submodules/tartanairpy"]
 	path = submodules/tartanairpy
 	url = https://github.com/CoreVisionX/tartanair.git
-[submodule "submodules/LightGlue-ONNX"]
-	path = submodules/LightGlue-ONNX
-	url = https://github.com/fabio-sim/LightGlue-ONNX.git
