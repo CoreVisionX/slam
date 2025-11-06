@@ -5,6 +5,15 @@ name = "slam"
 platforms = ["linux-aarch64"]            # Jetson-only to avoid cross-platform solve headaches
 version = "0.1.0"
 
+[package]
+name = "slam"
+version = "0.1.0"
+description = "SLAM research stack optimized for Jetson-class devices"
+readme = "README.md"
+repository = "https://github.com/CoreVisionX/slam"
+authors = ["Jacob Van Meter <jacobvm04@gmail.com>"]
+
+
 [system-requirements]
 cuda = "12"
 
@@ -20,7 +29,6 @@ gtsam-develop = ">=4.3a0.dev202510200041, <5"
 kornia = ">=0.8.1, <0.9"
 opencv-python-headless = ">=4.12.0.88, <5"   # headless on Jetson
 rerun-sdk = { version = ">=0.26.2, <0.27", extras = ["notebook"] }
-triton = ">=3.5.0, <4"
 
 # ------------ Jetson CUDA 12.6 (JetPack 6.2.x) ------------
 [feature.jetson-cu126.pypi-options]
