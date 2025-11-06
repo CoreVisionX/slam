@@ -87,6 +87,12 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Log loop closures to console.",
     )
+    parser.add_argument(
+        "--matcher",
+        choices=("lighterglue", "orb"),
+        default="lighterglue",
+        help="Feature matcher backend to use for both frontend and loop closure.",
+    )
     return parser.parse_args()
 
 
@@ -103,6 +109,7 @@ def main() -> None:
         use_huber_loss=not args.disable_huber,
         align_ground_truth=not args.no_align_gt,
         enable_rerun_logging=not args.disable_rerun,
+        feature_matcher=args.matcher,
     )
 
     slam = create_default_slam_system(
@@ -153,7 +160,7 @@ def main() -> None:
                     print(msg)
 
                     if not args.disable_rerun:
-                        rr.set_time_sequence("frame", sequence=result.frame_index)
+                        rr.set_time("frame", sequence=result.frame_index)
                         rr.log("logs", rr.TextLog(msg))
                 else:
                     header = (
@@ -165,7 +172,7 @@ def main() -> None:
                     print(msg)
 
                     if not args.disable_rerun:
-                        rr.set_time_sequence("frame", sequence=result.frame_index)
+                        rr.set_time("frame", sequence=result.frame_index)
                         rr.log("logs", rr.TextLog(msg))
 
             if result.loop_closures_added:

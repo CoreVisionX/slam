@@ -2,8 +2,8 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
 import time
+from dataclasses import dataclass, field
 
 import gtsam
 import numpy as np
@@ -11,11 +11,11 @@ import numpy as np
 from backend.pose_graph import GtsamPoseGraph
 from backend.proximity_loop_detector import ProximityLoopDetector
 from depth.sgbm import SGBM
-from registration.lighterglue import LighterglueMatcher
 from registration.registration import StereoFrame
 from slam.frontend import FrontendOutput, FrontendTimings, StereoFrontend
 from slam.logger import RerunLogger, TrajectoryMetrics
 from slam.loop_closure import LoopClosureManager, LoopClosureResult
+from slam.matcher_factory import MatcherType, create_matcher
 from slam.metrics import PerformanceSnapshot, PerformanceTracker
 
 
@@ -47,6 +47,7 @@ class SlamConfig:
             dtype=float,
         )
     )
+    feature_matcher: MatcherType = "lighterglue"
 
 
 @dataclass(slots=True)
@@ -270,11 +271,10 @@ def create_default_slam_system(
     cfg = config or SlamConfig()
 
     pose_graph = GtsamPoseGraph(K=calibration_matrix)
+    feature_matcher = create_matcher(cfg.feature_matcher)
     frontend = StereoFrontend(
         depth_estimator=SGBM(num_disparities=16 * 4, block_size=5, image_color="RGB"),
-        feature_detector=LighterglueMatcher(
-            num_features=4096, compile=False, device="cuda", use_lighterglue_matching=True
-        ),
+        feature_detector=feature_matcher,
     )
     loop_detector = ProximityLoopDetector(
         max_translation=cfg.proximity_max_translation,
@@ -285,6 +285,7 @@ def create_default_slam_system(
     loop_manager = LoopClosureManager(
         min_inlier_count=cfg.loop_min_inliers,
         num_workers=cfg.loop_worker_count,
+        matcher_type=cfg.feature_matcher,
     )
     logger: RerunLogger | None = None
     if cfg.enable_rerun_logging:

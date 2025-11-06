@@ -6,8 +6,8 @@ from dataclasses import dataclass
 import time
 
 from depth.sgbm import SGBM
-from registration.lighterglue import LighterglueMatcher
 from registration.registration import FeatureFrame, StereoFrame
+from slam.matcher_factory import FeatureMatcher
 from util import share_feature_frame
 
 
@@ -31,7 +31,7 @@ class FrontendOutput:
 class StereoFrontend:
     """Compute depth and features for incoming stereo frames."""
 
-    def __init__(self, depth_estimator: SGBM, feature_detector: LighterglueMatcher) -> None:
+    def __init__(self, depth_estimator: SGBM, feature_detector: FeatureMatcher) -> None:
         self._depth_estimator = depth_estimator
         self._feature_detector = feature_detector
 
@@ -58,4 +58,3 @@ class StereoFrontend:
         )
 
         return FrontendOutput(feature_frame=feature_frame, timings=timings)
-

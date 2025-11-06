@@ -12,9 +12,10 @@ from typing import Iterable
 
 import numpy as np
 
-from registration.lighterglue import LighterglueMatcher
 from registration.registration import FeatureFrame, IndexedFramePair
 from registration.utils import solve_pnp
+from slam.matcher_factory import MatcherType, create_matcher
+from util import release_shared_features
 
 
 @dataclass(slots=True)
@@ -34,11 +35,12 @@ def _loop_closure_worker(
     loop_closures_queue: Queue,
     min_inlier_count: int,
     worker_id: int,
+    matcher_type: MatcherType,
     verbose: bool = False,
 ) -> None:
     """Background worker that estimates relative poses for candidate keyframe pairs."""
 
-    matcher = LighterglueMatcher(num_features=4096, compile=False, device="cuda", use_lighterglue_matching=True)
+    matcher = create_matcher(matcher_type)
     print(f"[LoopClosureWorker {worker_id}] started")
 
     pending_candidates: list[IndexedFramePair[FeatureFrame]] = []
@@ -52,6 +54,8 @@ def _loop_closure_worker(
             if candidate == _STOP_TOKEN:
                 print(f"[LoopClosureWorker {worker_id}] received stop signal")
                 return
+            release_shared_features(candidate.first)
+            release_shared_features(candidate.second)
             pending_candidates.append(candidate)
 
         if not pending_candidates:
@@ -70,6 +74,8 @@ def _loop_closure_worker(
                 f"[LoopClosureWorker {worker_id}] failed to solve PnP for "
                 f"({candidate.first_idx}, {candidate.second_idx}): {exc}"
             )
+            release_shared_features(candidate.first)
+            release_shared_features(candidate.second)
             continue
 
         inlier_count = len(matched_pair.matches)
@@ -101,6 +107,9 @@ def _loop_closure_worker(
             )
             processing_times.clear()
 
+        release_shared_features(candidate.first)
+        release_shared_features(candidate.second)
+
 
 class LoopClosureManager:
     """Manage loop-closure worker processes and queues."""
@@ -109,6 +118,7 @@ class LoopClosureManager:
         self,
         min_inlier_count: int,
         num_workers: int | None = None,
+        matcher_type: MatcherType = "lighterglue",
     ) -> None:
         if num_workers is None or num_workers < 1:
             available = mp.cpu_count()
@@ -116,6 +126,7 @@ class LoopClosureManager:
 
         self._min_inlier_count = min_inlier_count
         self._num_workers = num_workers
+        self._matcher_type = matcher_type
 
         self._candidates_queue: SimpleQueue = SimpleQueue()
         self._results_queue: Queue = Queue(maxsize=5000)
@@ -136,7 +147,13 @@ class LoopClosureManager:
         for worker_idx in range(self._num_workers):
             process = Process(
                 target=_loop_closure_worker,
-                args=(self._candidates_queue, self._results_queue, self._min_inlier_count, worker_idx),
+                args=(
+                    self._candidates_queue,
+                    self._results_queue,
+                    self._min_inlier_count,
+                    worker_idx,
+                    self._matcher_type,
+                ),
                 daemon=True,
             )
             process.start()

@@ -23,6 +23,10 @@ class SharedNDArray:
         shape: tuple[int, ...] | None = None,
         dtype: str | np.dtype | None = None,
     ) -> None:
+        self._shm: shared_memory.SharedMemory | None = None
+        self._array: np.ndarray | None = None
+        self._owns_shm = False
+
         if array is not None:
             array = np.ascontiguousarray(array)
 
@@ -35,43 +39,79 @@ class SharedNDArray:
             self.shm_name = self._shm.name
             self._array = np.ndarray(self.shape, dtype=self.dtype, buffer=self._shm.buf)
             self._array[:] = array
+            self._owns_shm = True
         elif name is not None and shape is not None and dtype is not None:
             self.shape = tuple(shape)
             self.dtype = np.dtype(dtype)
             self.shm_name = name
             self._shm = shared_memory.SharedMemory(name=self.shm_name)
             self._array = np.ndarray(self.shape, dtype=self.dtype, buffer=self._shm.buf)
+            self._owns_shm = False
         else:
             raise ValueError("Either array or shared memory metadata must be provided")
 
+    def _ensure_view(self) -> np.ndarray:
+        if self._array is not None:
+            return self._array
+
+        shm = shared_memory.SharedMemory(name=self.shm_name)
+        self._shm = shm
+        self._array = np.ndarray(self.shape, dtype=self.dtype, buffer=shm.buf)
+        return self._array
+
     def close(self) -> None:
-        if hasattr(self, "_shm") and self._shm is not None:
+        if self._shm is not None:
             self._shm.close()
             self._shm = None
+        self._array = None
+
+    def unlink(self) -> None:
+        if not self._owns_shm:
+            return
+
+        try:
+            if self._shm is not None:
+                self._shm.unlink()
+            else:
+                shm = shared_memory.SharedMemory(name=self.shm_name)
+                try:
+                    shm.unlink()
+                finally:
+                    shm.close()
+        except FileNotFoundError:
+            pass
 
     def __del__(self) -> None:  # pragma: no cover - best effort cleanup
         try:
             self.close()
         except FileNotFoundError:
             pass
+        try:
+            self.unlink()
+        except FileNotFoundError:
+            pass
 
     def __array__(self) -> np.ndarray:
-        return self._array
+        return self._ensure_view()
 
     def __len__(self) -> int:
-        return len(self._array)
+        return len(self._ensure_view())
 
     def __getitem__(self, item):
-        return self._array[item]
+        return self._ensure_view()[item]
 
     def __setitem__(self, key, value) -> None:
-        self._array[key] = value
+        self._ensure_view()[key] = value
 
     def __getattr__(self, name):
-        return getattr(self._array, name)
+        if name.startswith("_"):
+            raise AttributeError(name)
+
+        array = self._ensure_view()
+        return getattr(array, name)
 
     def to_numpy(self) -> np.ndarray:
-        return self._array
+        return self._ensure_view()
 
     def __getstate__(self) -> dict[str, object]:
         return {
@@ -86,6 +126,7 @@ class SharedNDArray:
         self.shm_name = str(state["name"])
         self._shm = shared_memory.SharedMemory(name=self.shm_name)
         self._array = np.ndarray(self.shape, dtype=self.dtype, buffer=self._shm.buf)
+        self._owns_shm = False
 
 
 @dataclass(slots=True)
@@ -138,12 +179,25 @@ def share_feature_frame(frame: "FeatureFrame") -> "FeatureFrame":
         if isinstance(value, SharedNDArray):
             continue
         if isinstance(value, np.ndarray) and value.nbytes > 0:
-            frame.features[key] = SharedNDArray(value)
+            shared = SharedNDArray(value)
+            shared.close()  # drop local handle; retain metadata for IPC
+            frame.features[key] = shared
 
     if getattr(frame, "calibration", None) is not None and not isinstance(frame.calibration, LightweightCalibration):
         frame.calibration = LightweightCalibration.from_calibration(frame.calibration)
 
     return frame
+
+
+def release_shared_features(frame: "FeatureFrame") -> None:
+    """Release shared-memory handles associated with the feature frame."""
+
+    for value in frame.features.values():
+        if isinstance(value, SharedNDArray):
+            try:
+                value.close()
+            except FileNotFoundError:
+                pass
 
 
 def se3_to_pose3(se3: np.ndarray) -> gtsam.Pose3:

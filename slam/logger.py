@@ -33,7 +33,7 @@ class RerunLogger:
     ) -> None:
         rr.init(app_id)
         if tcp_address:
-            rr.connect_tcp(tcp_address)
+            rr.connect_grpc(tcp_address)
 
         self._enable_alignment = enable_alignment
 
@@ -61,7 +61,7 @@ class RerunLogger:
         if len(estimated) != len(gt_keyframe_trajectory):
             return None
 
-        rr.set_time_sequence("frame", sequence=frame_index)
+        rr.set_time("frame", sequence=frame_index)
 
         gt_for_logging = list(gt_keyframe_trajectory)
         if self._enable_alignment:
@@ -74,8 +74,8 @@ class RerunLogger:
         rr_log_graph_edges(path="graph", nodes=pose_graph.values, graph=pose_graph.graph)
 
         metrics = self._compute_metrics(gt_for_logging, estimated)
-        rr.log("/translation/ate", rr.Scalar(metrics.translation_ate))
-        rr.log("/rotation/ate", rr.Scalar(metrics.rotation_ate_deg))
+        rr.log("/translation/ate", rr.Scalars(metrics.translation_ate))
+        rr.log("/rotation/ate", rr.Scalars(metrics.rotation_ate_deg))
 
         return metrics
 
