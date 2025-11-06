@@ -11,8 +11,9 @@ import rerun as rr
 from gtsam.symbol_shorthand import X
 
 from backend.pose_graph import GtsamPoseGraph
+from registration.registration import StereoDepthFrame
 from slam.alignment import compute_umeyama_alignment_pose, pose_translation_to_array
-from viz import rr_log_graph_edges, rr_log_map_points, rr_log_trajectory
+from viz import rr_log_graph_edges, rr_log_map_points, rr_log_pose, rr_log_trajectory
 
 
 @dataclass(slots=True)
@@ -36,7 +37,6 @@ class RerunLogger:
             rr.connect_grpc(tcp_address)
 
         self._enable_alignment = enable_alignment
-
     def log_step(
         self,
         frame_index: int,
@@ -44,6 +44,7 @@ class RerunLogger:
         gt_keyframe_trajectory: Sequence[gtsam.Pose3],
         raw_keyframe_trajectory: Sequence[gtsam.Pose3],
         *,
+        keyframe_frame: tuple[int, StereoDepthFrame] | None = None,
         loop_inlier_points: Sequence[tuple[int, np.ndarray, np.ndarray]] | None = None,
     ) -> TrajectoryMetrics | None:
         """Log current SLAM status. Returns metrics when available."""
@@ -74,6 +75,14 @@ class RerunLogger:
         rr_log_trajectory("gt_keyframe_trajectory", gt_for_logging, color=(0, 255, 0))
         rr_log_trajectory("raw_keyframe_trajectory", raw_keyframe_trajectory, color=(0, 0, 255))
         rr_log_graph_edges(path="graph", nodes=pose_graph.values, graph=pose_graph.graph)
+        if keyframe_frame is not None:
+            kf_idx, frame = keyframe_frame
+            try:
+                pose = pose_graph.get_pose(kf_idx)
+            except RuntimeError:
+                pass
+            else:
+                rr_log_pose("keyframes/current", pose, frame)
         if loop_inlier_points:
             rr_log_map_points(
                 "loop_closure/inliers",

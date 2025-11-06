@@ -6,7 +6,7 @@ from dataclasses import dataclass
 import time
 
 from depth.sgbm import SGBM
-from registration.registration import FeatureFrame, StereoFrame
+from registration.registration import FeatureFrame, StereoFrame, StereoDepthFrame
 from slam.matcher_factory import FeatureMatcher
 from util import share_feature_frame
 
@@ -25,6 +25,7 @@ class FrontendTimings:
 @dataclass(slots=True)
 class FrontendOutput:
     feature_frame: FeatureFrame
+    depth_frame: StereoDepthFrame
     timings: FrontendTimings
 
 
@@ -57,4 +58,8 @@ class StereoFrontend:
             feature_detection=detect_end - detect_start,
         )
 
-        return FrontendOutput(feature_frame=feature_frame, timings=timings)
+        return FrontendOutput(
+            feature_frame=feature_frame,
+            depth_frame=depth_frame,
+            timings=timings,
+        )

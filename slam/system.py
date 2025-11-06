@@ -11,7 +11,7 @@ import numpy as np
 from backend.pose_graph import GtsamPoseGraph
 from backend.proximity_loop_detector import ProximityLoopDetector
 from depth.sgbm import SGBM
-from registration.registration import StereoFrame
+from registration.registration import StereoDepthFrame, StereoFrame
 from slam.frontend import FrontendOutput, FrontendTimings, StereoFrontend
 from slam.logger import RerunLogger, TrajectoryMetrics
 from slam.loop_closure import LoopClosureManager, LoopClosureResult
@@ -131,6 +131,7 @@ class StereoSlamSystem:
         self._frame_index += 1
         step_start = time.perf_counter()
         self.performance.start_step(self._frame_index)
+        keyframe_depth_frame: tuple[int, StereoDepthFrame] | None = None
 
         with self.performance.time_section("odometry.integrate"):
             latest_pose = self._integrate_odometry(odometry)
@@ -146,6 +147,7 @@ class StereoSlamSystem:
             self._record_frontend_timings(frontend_output.timings)
             with self.performance.time_section("pose_graph.process_odometry"):
                 self.pose_graph.process_odometry(odometry, self._odometry_noise, frontend_output.feature_frame)
+            keyframe_depth_frame = (self.pose_graph.kf_idx, frontend_output.depth_frame)
 
             self._current_keyframe_pose = ground_truth_pose or latest_pose
             self._raw_keyframe_trajectory.append(latest_pose)
@@ -169,6 +171,7 @@ class StereoSlamSystem:
                     self.pose_graph.process_odometry(
                         relative_to_keyframe, self._odometry_noise, frontend_output.feature_frame
                     )
+                keyframe_depth_frame = (self.pose_graph.kf_idx, frontend_output.depth_frame)
 
                 self._current_keyframe_pose = latest_pose
                 self._raw_keyframe_trajectory.append(latest_pose)
@@ -195,6 +198,7 @@ class StereoSlamSystem:
                         self.pose_graph,
                         self._gt_keyframe_trajectory,
                         self._raw_keyframe_trajectory,
+                        keyframe_frame=keyframe_depth_frame,
                         loop_inlier_points=self._loop_closure_inlier_points,
                     )
 
