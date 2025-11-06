@@ -12,7 +12,7 @@ from gtsam.symbol_shorthand import X
 
 from backend.pose_graph import GtsamPoseGraph
 from slam.alignment import compute_umeyama_alignment_pose, pose_translation_to_array
-from viz import rr_log_graph_edges, rr_log_trajectory
+from viz import rr_log_graph_edges, rr_log_map_points, rr_log_trajectory
 
 
 @dataclass(slots=True)
@@ -43,6 +43,8 @@ class RerunLogger:
         pose_graph: GtsamPoseGraph,
         gt_keyframe_trajectory: Sequence[gtsam.Pose3],
         raw_keyframe_trajectory: Sequence[gtsam.Pose3],
+        *,
+        loop_inlier_points: Sequence[tuple[int, np.ndarray, np.ndarray]] | None = None,
     ) -> TrajectoryMetrics | None:
         """Log current SLAM status. Returns metrics when available."""
 
@@ -72,6 +74,13 @@ class RerunLogger:
         rr_log_trajectory("gt_keyframe_trajectory", gt_for_logging, color=(0, 255, 0))
         rr_log_trajectory("raw_keyframe_trajectory", raw_keyframe_trajectory, color=(0, 0, 255))
         rr_log_graph_edges(path="graph", nodes=pose_graph.values, graph=pose_graph.graph)
+        if loop_inlier_points:
+            rr_log_map_points(
+                "loop_closure/inliers",
+                pose_graph,
+                list(loop_inlier_points),
+                height_colormap=True,
+            )
 
         metrics = self._compute_metrics(gt_for_logging, estimated)
         rr.log("/translation/ate", rr.Scalars(metrics.translation_ate))
@@ -101,4 +110,3 @@ class RerunLogger:
             translation_ate=translation_ate,
             rotation_ate_deg=rotation_ate_deg,
         )
-

@@ -102,6 +102,8 @@ class StereoSlamSystem:
         self._gt_trajectory: list[gtsam.Pose3] = []
         self._raw_keyframe_trajectory: list[gtsam.Pose3] = []
         self._gt_keyframe_trajectory: list[gtsam.Pose3] = []
+        # Accumulated loop-closure inliers for rerun visualization.
+        self._loop_closure_inlier_points: list[tuple[int, np.ndarray, np.ndarray]] = []
 
     def shutdown(self) -> None:
         self.loop_manager.stop()
@@ -193,6 +195,7 @@ class StereoSlamSystem:
                         self.pose_graph,
                         self._gt_keyframe_trajectory,
                         self._raw_keyframe_trajectory,
+                        loop_inlier_points=self._loop_closure_inlier_points,
                     )
 
         total_time = time.perf_counter() - step_start
@@ -247,19 +250,38 @@ class StereoSlamSystem:
             added = 0
             for result in results:
                 with self.performance.time_section("loop_results.apply"):
-                    self._add_loop_closure(result)
+                    points = self._add_loop_closure(result)
+                if points is not None:
+                    self._loop_closure_inlier_points.append(points)
                 added += 1
             return added
 
-    def _add_loop_closure(self, result: LoopClosureResult) -> None:
+    def _add_loop_closure(self, result: LoopClosureResult) -> tuple[int, np.ndarray, np.ndarray] | None:
         first_to_second = gtsam.Pose3(
             gtsam.Rot3(result.rotation_matrix), gtsam.Point3(result.translation)
         )
+
+        inlier_points: tuple[int, np.ndarray, np.ndarray] | None = None
+        frame = self.pose_graph.frames.get(result.first_idx)
+        if frame is not None and result.inlier_matches.size > 0:
+            match_indices = np.asarray(result.inlier_matches, dtype=np.int32)
+            match_indices = np.atleast_2d(match_indices)
+
+            if match_indices.ndim == 2 and match_indices.shape[1] >= 1:
+                first_indices = match_indices[:, 0]
+                keypoints_3d_src = frame.features.get("keypoints_3d")
+                keypoints_color_src = frame.features.get("keypoints_color")
+
+                if keypoints_3d_src is not None and keypoints_color_src is not None:
+                    keypoints_3d = np.asarray(keypoints_3d_src)[first_indices]
+                    keypoints_color = np.asarray(keypoints_color_src)[first_indices]
+                    inlier_points = (result.first_idx, keypoints_3d, keypoints_color)
+
         with self.performance.time_section("pose_graph.add_loop_closure"):
             self.pose_graph.add_between_pose_factor(
                 result.first_idx, result.second_idx, first_to_second, self._loop_noise
             )
-
+        return inlier_points
 
 def create_default_slam_system(
     *,

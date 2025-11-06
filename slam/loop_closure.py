@@ -25,6 +25,7 @@ class LoopClosureResult:
     rotation_matrix: np.ndarray
     translation: np.ndarray
     inlier_count: int
+    inlier_matches: np.ndarray
 
 
 _STOP_TOKEN = "__LOOP_CLOSURE_STOP__"
@@ -88,6 +89,7 @@ def _loop_closure_worker(
                     rotation_matrix=first_to_second.rotation().matrix(),
                     translation=first_to_second.translation(),
                     inlier_count=inlier_count,
+                    inlier_matches=matched_pair.matches.astype(np.int32, copy=False),
                 )
             )
             if verbose:
