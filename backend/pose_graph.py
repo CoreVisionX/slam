@@ -203,7 +203,6 @@ class GtsamPoseGraph:
         key = X(kf_idx)
         assert self._has_value(key)
         factor = gtsam.PoseRotationPrior3D(key, rotation, noise)
-        print(f"Adding pose rotation prior for key {key}: {rotation} with noise {noise}")
         self.graph.add(factor)
         self.pending_factors.add(factor)
 
