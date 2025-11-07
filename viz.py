@@ -60,9 +60,9 @@ def rr_log_graph_edges(path: str, nodes, graph):
             else:
                 loops.append([pose_a.translation(), pose_b.translation()])
 
-    rr.log(path + "/odom", rr.LineStrips3D(odom, colors=[[255, 0, 0]], radii=[0.1]))
-    rr.log(path + "/closures", rr.LineStrips3D(loops, colors=[[128, 128, 0]], radii=[0.1]))
-    rr.log(path + "/scale_free_closures", rr.LineStrips3D(scale_free_loops, colors=[[0, 128, 128]], radii=[0.1]))
+    rr.log(path + "/odom", rr.LineStrips3D(odom, colors=[[255, 0, 0]], radii=[0.004]))
+    rr.log(path + "/closures", rr.LineStrips3D(loops, colors=[[128, 128, 0]], radii=[0.004]))
+    rr.log(path + "/scale_free_closures", rr.LineStrips3D(scale_free_loops, colors=[[0, 128, 128]], radii=[0.004]))
 
 def rr_log_map_points(path: str, pose_graph: GtsamPoseGraph, points: list[tuple[int, np.ndarray, np.ndarray]], height_colormap: bool = True):
     if len(points) == 0:
@@ -92,4 +92,4 @@ def rr_log_map_points(path: str, pose_graph: GtsamPoseGraph, points: list[tuple[
 
         world_points_colors = height_colors
 
-    rr.log(path, rr.Points3D(world_points, colors=world_points_colors, radii=[0.01]))
+    rr.log(path, rr.Points3D(world_points, colors=world_points_colors, radii=[0.004]))

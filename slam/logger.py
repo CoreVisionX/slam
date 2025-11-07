@@ -56,34 +56,8 @@ class RerunLogger:
     ) -> TrajectoryMetrics | None:
         """Log current SLAM status. Returns metrics when available."""
 
-        if len(gt_keyframe_trajectory) < 2:
-            return None
-
-        estimated: list[gtsam.Pose3] = []
-        for idx in range(1, pose_graph.kf_idx + 1):
-            key = X(idx)
-            if pose_graph.values.exists(key):
-                estimated.append(pose_graph.values.atPose3(key))
-            else:
-                estimated.clear()
-                break
-
-        if len(estimated) != len(gt_keyframe_trajectory):
-            return None
-
         rr.set_time("frame", sequence=frame_index)
 
-        gt_for_logging = list(gt_keyframe_trajectory)
-        if self._enable_alignment:
-            alignment = compute_umeyama_alignment_pose(gt_for_logging, estimated)
-            if alignment is not None:
-                rotation, translation, scale = alignment
-                gt_for_logging = [
-                    apply_similarity_transform(pose, rotation, translation, scale)
-                    for pose in gt_for_logging
-                ]
-
-        rr_log_trajectory("gt_keyframe_trajectory", gt_for_logging, color=(0, 255, 0))
         rr_log_trajectory("raw_keyframe_trajectory", raw_keyframe_trajectory, color=(0, 0, 255))
         rr_log_graph_edges(path="graph", nodes=pose_graph.values, graph=pose_graph.graph)
         if keyframe_frame is not None:
@@ -102,14 +76,37 @@ class RerunLogger:
                 height_colormap=True,
             )
 
-        metrics = self._compute_metrics(gt_for_logging, estimated)
-        rr.log("/translation/ate", rr.Scalars(metrics.translation_ate))
-        rr.log("/translation/total_distance", rr.Scalars(metrics.total_distance))
-        rr.log(
-            "/translation/ate_percentage",
-            rr.Scalars(metrics.translation_ate_pct),
-        )
-        rr.log("/rotation/ate", rr.Scalars(metrics.rotation_ate_deg))
+        metrics: TrajectoryMetrics | None = None
+        if len(gt_keyframe_trajectory) >= 2:
+            estimated: list[gtsam.Pose3] = []
+            for idx in range(1, pose_graph.kf_idx + 1):
+                key = X(idx)
+                if pose_graph.values.exists(key):
+                    estimated.append(pose_graph.values.atPose3(key))
+                else:
+                    estimated.clear()
+                    break
+
+            if len(estimated) == len(gt_keyframe_trajectory) and estimated:
+                gt_for_logging = list(gt_keyframe_trajectory)
+                if self._enable_alignment:
+                    alignment = compute_umeyama_alignment_pose(gt_for_logging, estimated)
+                    if alignment is not None:
+                        rotation, translation, scale = alignment
+                        gt_for_logging = [
+                            apply_similarity_transform(pose, rotation, translation, scale)
+                            for pose in gt_for_logging
+                        ]
+
+                rr_log_trajectory("gt_keyframe_trajectory", gt_for_logging, color=(0, 255, 0))
+                metrics = self._compute_metrics(gt_for_logging, estimated)
+                rr.log("/translation/ate", rr.Scalars(metrics.translation_ate))
+                rr.log("/translation/total_distance", rr.Scalars(metrics.total_distance))
+                rr.log(
+                    "/translation/ate_percentage",
+                    rr.Scalars(metrics.translation_ate_pct),
+                )
+                rr.log("/rotation/ate", rr.Scalars(metrics.rotation_ate_deg))
 
         return metrics
 

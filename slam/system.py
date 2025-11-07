@@ -232,7 +232,7 @@ class StereoSlamSystem:
         if is_keyframe or loop_closures_added > 0:
             with self.performance.time_section("optimization"):
                 self.pose_graph.optimize()
-            if self.logger is not None and self._gt_keyframe_trajectory:
+            if self.logger is not None:
                 with self.performance.time_section("logging.rerun"):
                     metrics = self.logger.log_step(
                         self._frame_index,

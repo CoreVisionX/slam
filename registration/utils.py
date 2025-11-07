@@ -84,9 +84,15 @@ def solve_pnp(pair: MatchedFramePair[FeatureFrame]) -> tuple[gtsam.Pose3, Matche
     mkpts1 = mkpts1[valid_mask]
     mkpts2 = mkpts2[valid_mask]
 
+    if mkpts1_3d.shape[0] < 4:
+        raise ValueError("Not enough 3D correspondences for PnP")
+
+    obj_points = np.ascontiguousarray(mkpts1_3d.astype(np.float32))
+    img_points = np.ascontiguousarray(mkpts2.reshape(-1, 1, 2).astype(np.float32))
+
     ret, rvec, tvec, inliers = cv2.solvePnPRansac(
-        mkpts1_3d, 
-        mkpts2, 
+        obj_points,
+        img_points,
         pair.first.calibration.K_left_rect, 
         np.zeros((5, 1)),
         reprojectionError=2.0, # TODO: benchmark reprojectionError. plot error distributions for different reprojectionError values. with a proper config system this should be easy?
