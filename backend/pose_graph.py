@@ -25,9 +25,8 @@ class GtsamPoseGraph:
     # TODO: do we need to incorporate timestamps more than is done here?
     # TODO: use velocity factors derived from the encoders
 
-    def __init__(self, K, pim=None):
-        self.pose_prior_noise = gtsam.noiseModel.Isotropic.Sigma(6, 0.1)
-        self.vel_prior_noise = gtsam.noiseModel.Isotropic.Sigma(3, 0.1)
+    def __init__(self, K, pim=None, optimizer: str = "nonlinear"):
+        self.pose_prior_noise = gtsam.noiseModel.Constrained.All(6)
 
         self.K = K
 
@@ -41,8 +40,14 @@ class GtsamPoseGraph:
         # TODO: look into gtsam's IMU combined factors? maybe they do something better than the regular IMU factors
         self.pim = pim
 
-        self.isam_params = gtsam.ISAM2Params()
-        self.isam = gtsam.ISAM2(self.isam_params)
+        optimizer_normalized = optimizer.lower()
+        if optimizer_normalized not in {"isam2", "nonlinear"}:
+            raise ValueError(f"Unsupported optimizer '{optimizer}'. Expected 'isam2' or 'nonlinear'.")
+        self._use_isam2 = optimizer_normalized == "isam2"
+
+        if self._use_isam2:
+            self.isam_params = gtsam.ISAM2Params()
+            self.isam = gtsam.ISAM2(self.isam_params)
 
         # track incremental additions for the iSAM2 optimizer
         self.pending_factors = gtsam.NonlinearFactorGraph()
@@ -50,6 +55,9 @@ class GtsamPoseGraph:
 
         # latest estimate from the optimizer
         self.values = gtsam.Values()
+
+        # initial guess cache for nonlinear optimization
+        self._initial_values_cache: dict[int, object] = {}
 
         # keep an initial estimate for the IMU bias so we can add it when the first IMU factor arrives
         self._bias_initial = self.pim.biasHat() if self.pim is not None else None
@@ -76,7 +84,15 @@ class GtsamPoseGraph:
 
     # TODO: velocity constraints on the odometry
     # TODO: decouple the frame from the odometry processing so they can be processed at different rates
-    def process_odometry(self, prev_to_latest, prev_to_latest_noise, frame: FeatureFrame):
+    def process_odometry(
+        self,
+        prev_to_latest,
+        prev_to_latest_noise,
+        frame: FeatureFrame,
+        *,
+        absolute_rotation: gtsam.Rot3 | None = None,
+        absolute_rotation_noise: object | None = None,
+    ):
         prev_idx = self.kf_idx
         next_idx = self.kf_idx + 1
 
@@ -88,7 +104,7 @@ class GtsamPoseGraph:
         # chain the new pose from the latest pose (if it doesn't already exist)
         if not self._has_value(X(next_idx)):
             prev_pose = self.values.atPose3(X(prev_idx))
-            initial_pose = prev_pose.compose(prev_to_latest) if prev_to_latest is not None else prev_pose
+            initial_pose = prev_pose.compose(prev_to_latest)
             self._ensure_initial_value(X(next_idx), initial_pose)
 
         # TODO: add an option to initialize the new pose's velocity using constant velocity (and add a factor?) without requiring an IMU
@@ -105,6 +121,11 @@ class GtsamPoseGraph:
             
         if prev_to_latest is not None:
             self.append_pose_factor(prev_to_latest, prev_to_latest_noise)
+
+        if absolute_rotation is not None:
+            if absolute_rotation_noise is None:
+                raise ValueError("absolute_rotation_noise is required when passing absolute_rotation.")
+            self.add_pose_rotation_prior(next_idx, absolute_rotation, absolute_rotation_noise)
 
         # add imu factor and reset preintegration
         if self.pim is not None:
@@ -171,20 +192,20 @@ class GtsamPoseGraph:
         self.graph.add(factor)
         self.pending_factors.add(factor)
 
-    def add_vel_prior(self, kf_idx, vel):
-        key = V(kf_idx)
-        if not self._has_value(key):
-            self._ensure_initial_value(key, vel)
-
-        factor = gtsam.PriorFactorVector(V(kf_idx), np.zeros(3), self.vel_prior_noise)
-        self.graph.add(factor)
-        self.pending_factors.add(factor)
-
     def add_stationary_prior(self, kf_idx):
         self.add_pose_prior(kf_idx, gtsam.Pose3.Identity())
 
         if self.pim is not None:
-            self.add_vel_prior(kf_idx, np.zeros(3))
+            raise NotImplementedError("Velocity prior not supported yet")
+            # self.add_vel_prior(kf_idx, np.zeros(3))
+
+    def add_pose_rotation_prior(self, kf_idx: int, rotation: gtsam.Rot3, noise) -> None:
+        key = X(kf_idx)
+        assert self._has_value(key)
+        factor = gtsam.PoseRotationPrior3D(key, rotation, noise)
+        print(f"Adding pose rotation prior for key {key}: {rotation} with noise {noise}")
+        self.graph.add(factor)
+        self.pending_factors.add(factor)
 
     def get_latest_pose(self):
         return self.get_pose(self.kf_idx)
@@ -198,15 +219,66 @@ class GtsamPoseGraph:
     def _ensure_initial_value(self, key, value):
         if not self.pending_values.exists(key) and not self.values.exists(key):
             self.pending_values.insert(key, value)
+            if not self._use_isam2 and key not in self._initial_values_cache:
+                self._initial_values_cache[key] = value
 
     def _update_solver(self, relinearize=False):
-        has_new_factors = self.pending_factors.size() > 0
+        has_new_updates = self.pending_factors.size() > 0 or self.pending_values.size() > 0
 
-        if has_new_factors:
-            self.isam.update(self.pending_factors, self.pending_values)
-            self.pending_factors = gtsam.NonlinearFactorGraph()
-            self.pending_values = gtsam.Values()
-            self.values = self.isam.calculateEstimate()
-        elif relinearize:
-            self.isam.update()
-            self.values = self.isam.calculateEstimate()
+        if self._use_isam2:
+            if has_new_updates:
+                self.isam.update(self.pending_factors, self.pending_values)
+                self.pending_factors = gtsam.NonlinearFactorGraph()
+                self.pending_values = gtsam.Values()
+                self.values = self.isam.calculateEstimate()
+            elif relinearize:
+                self.isam.update()
+                self.values = self.isam.calculateEstimate()
+            return
+
+        if not has_new_updates and not relinearize:
+            return
+
+        initial_values = self._build_initial_values()
+        optimizer = gtsam.LevenbergMarquardtOptimizer(self.graph, initial_values)
+        self.values = optimizer.optimize()
+
+        # refresh caches after optimization
+        self.pending_factors = gtsam.NonlinearFactorGraph()
+        self.pending_values = gtsam.Values()
+        self._initial_values_cache = self._values_to_dict(self.values)
+
+    def _build_initial_values(self):
+        initial_values = gtsam.Values()
+
+        if self.values.size() > 0:
+            for key in self.values.keys():
+                initial_values.insert(key, self._value_from_values(self.values, key))
+
+        for key, value in self._initial_values_cache.items():
+            if not initial_values.exists(key):
+                initial_values.insert(key, value)
+
+        return initial_values
+
+    def _values_to_dict(self, values: gtsam.Values) -> dict[int, object]:
+        cache: dict[int, object] = {}
+        for key in values.keys():
+            cache[key] = self._value_from_values(values, key)
+        return cache
+
+    def _value_from_values(self, values: gtsam.Values, key: int):
+        symbol = gtsam.Symbol(key)
+        symbol_chr = symbol.chr()
+        if isinstance(symbol_chr, int):
+            symbol_char = chr(symbol_chr)
+        else:
+            symbol_char = symbol_chr
+        symbol_char = symbol_char.lower()
+        if symbol_char == "x":
+            return values.atPose3(key)
+        if symbol_char == "v":
+            return np.array(values.atVector(key), copy=True)
+        if symbol_char == "b":
+            return values.atConstantBias(key)
+        raise ValueError(f"Unsupported key type '{symbol_char}' for key {key}")

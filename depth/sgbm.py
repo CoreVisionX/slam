@@ -86,7 +86,7 @@ class SGBM:
 
         return np.ascontiguousarray(array)
 
-    def compute_depth(self, frame: RectifiedStereoFrame, max_depth: float = 20.0) -> StereoDepthFrame:
+    def compute_depth(self, frame: RectifiedStereoFrame, max_depth: float = 60.0) -> StereoDepthFrame:
         disparity = self(frame.left_rect, frame.right_rect)
 
         depth_xyz = cv2.reprojectImageTo3D(disparity, frame.calibration.Q)
@@ -100,7 +100,7 @@ class SGBM:
             left_depth_xyz=depth_xyz
         )
 
-    def compute_depth_pair(self, pair: FramePair[RectifiedStereoFrame], max_depth: float = 20.0) -> FramePair[StereoDepthFrame]:
+    def compute_depth_pair(self, pair: FramePair[RectifiedStereoFrame], max_depth: float = 60.0) -> FramePair[StereoDepthFrame]:
         first_depth = self.compute_depth(pair.first, max_depth)
         second_depth = self.compute_depth(pair.second, max_depth)
 

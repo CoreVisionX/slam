@@ -6,7 +6,12 @@ from dataclasses import dataclass
 import time
 
 from depth.sgbm import SGBM
-from registration.registration import FeatureFrame, StereoFrame, StereoDepthFrame
+from registration.registration import (
+    FeatureFrame,
+    RectifiedStereoFrame,
+    StereoFrame,
+    StereoDepthFrame,
+)
 from slam.matcher_factory import FeatureMatcher
 from util import share_feature_frame
 
@@ -32,16 +37,38 @@ class FrontendOutput:
 class StereoFrontend:
     """Compute depth and features for incoming stereo frames."""
 
-    def __init__(self, depth_estimator: SGBM, feature_detector: FeatureMatcher) -> None:
+    def __init__(
+        self,
+        depth_estimator: SGBM,
+        feature_detector: FeatureMatcher,
+        *,
+        rectify_inputs: bool = True,
+    ) -> None:
         self._depth_estimator = depth_estimator
         self._feature_detector = feature_detector
+        self._rectify_inputs = rectify_inputs
 
     def process(self, frame: StereoFrame) -> FrontendOutput:
         """Rectify the frame, compute depth, and detect features."""
 
         rectify_start = time.perf_counter()
-        rectified_frame = frame.rectify()
-        rectify_end = time.perf_counter()
+        if self._rectify_inputs:
+            rectified_frame = frame.rectify()
+            rectify_end = time.perf_counter()
+            rectify_duration = rectify_end - rectify_start
+        else:
+            if isinstance(frame, RectifiedStereoFrame):
+                rectified_frame = frame
+            else:
+                rectified_frame = RectifiedStereoFrame(
+                    left=frame.left,
+                    right=frame.right,
+                    left_rect=frame.left,
+                    right_rect=frame.right,
+                    calibration=frame.calibration,
+                )
+            rectify_end = time.perf_counter()
+            rectify_duration = 0.0
 
         depth_start = rectify_end
         depth_frame = self._depth_estimator.compute_depth(rectified_frame)
@@ -53,7 +80,7 @@ class StereoFrontend:
         detect_end = time.perf_counter()
 
         timings = FrontendTimings(
-            rectify=rectify_end - rectify_start,
+            rectify=rectify_duration,
             depth=depth_end - depth_start,
             feature_detection=detect_end - detect_start,
         )

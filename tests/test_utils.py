@@ -14,6 +14,8 @@ import numpy as np
 tartanair_data_root = str(Path(__file__).parent / 'data')
 ta.init(tartanair_data_root)
 
+kitti_data_root = Path(__file__).parent / 'data' / 'ktti'
+
 # converts the TartanAir coordinate frame to the CV coordinate frame
 TA_TO_CV = np.array([
     [0.0, 1.0, 0.0],
@@ -48,7 +50,21 @@ class TartanAirSequence:
         return len(self.left_paths)
 
 
-_sequence_cache: Dict[Tuple[str, str, str], TartanAirSequence] = {}
+@dataclass
+class KittiSequence:
+    left_paths: list[Path]
+    right_paths: list[Path]
+    poses: list[gtsam.Pose3]
+    frame_ids: list[int]
+    calibration: StereoCalibration
+
+    @property
+    def size(self) -> int:
+        return len(self.left_paths)
+
+
+_tartanair_sequence_cache: Dict[Tuple[str, str, str], TartanAirSequence] = {}
+_kitti_sequence_cache: Dict[str, KittiSequence] = {}
 
 S = TypeVar("S")
 
@@ -84,8 +100,8 @@ def _parse_frame_id(path: Path, fallback: int) -> int:
 
 def _load_tartanair_sequence(env: str, difficulty: str, traj: str) -> TartanAirSequence:
     key = (env, difficulty, traj)
-    if key in _sequence_cache:
-        return _sequence_cache[key]
+    if key in _tartanair_sequence_cache:
+        return _tartanair_sequence_cache[key]
 
     traj_root = Path(tartanair_data_root) / env / f"Data_{difficulty}" / traj
     left_dir = traj_root / "image_lcam_front"
@@ -131,7 +147,7 @@ def _load_tartanair_sequence(env: str, difficulty: str, traj: str) -> TartanAirS
         poses=poses,
         frame_ids=frame_ids,
     )
-    _sequence_cache[key] = sequence
+    _tartanair_sequence_cache[key] = sequence
     return sequence
 
 def _load_stereo_frame(sequence: TartanAirSequence, index: int) -> StereoFrame:
@@ -157,6 +173,327 @@ def _load_stereo_frame(sequence: TartanAirSequence, index: int) -> StereoFrame:
         right=right,
         calibration=tartanair_calib
     )
+
+
+def _normalize_kitti_sequence_id(sequence_id: str | int) -> str:
+    seq_str = str(sequence_id).strip()
+    if not seq_str:
+        raise ValueError("sequence_id cannot be empty.")
+    if seq_str.isdigit() and len(seq_str) < 2:
+        seq_str = seq_str.zfill(2)
+    return seq_str
+
+
+def _projection_matrix_to_pose(P: np.ndarray) -> np.ndarray:
+    """
+    Convert a 3x4 projection matrix into a 4x4 pose transforming camera coordinates to world coordinates.
+    """
+    if P.shape != (3, 4):
+        raise ValueError("Projection matrix must be 3x4.")
+
+    K = P[:, :3]
+    K_inv = np.linalg.inv(K)
+    Rt = K_inv @ P
+    R_world_to_cam = Rt[:, :3]
+    t_world_to_cam = Rt[:, 3]
+
+    R_cam_to_world = R_world_to_cam.T
+    t_cam_to_world = -R_cam_to_world @ t_world_to_cam
+
+    pose = np.eye(4, dtype=np.float64)
+    pose[:3, :3] = R_cam_to_world
+    pose[:3, 3] = t_cam_to_world
+    return pose
+
+
+def _load_kitti_sequence(sequence_id: str | int) -> KittiSequence:
+    seq_id = _normalize_kitti_sequence_id(sequence_id)
+    if seq_id in _kitti_sequence_cache:
+        return _kitti_sequence_cache[seq_id]
+
+    sequence_root = kitti_data_root / 'sequences' / seq_id
+    poses_root = kitti_data_root / 'poses'
+
+    if not sequence_root.exists():
+        raise FileNotFoundError(f"Missing KITTI sequence at {sequence_root}")
+
+    left_dir = sequence_root / "image_2"
+    right_dir = sequence_root / "image_3"
+    calib_path = sequence_root / "calib.txt"
+    pose_path = poses_root / f"{seq_id}.txt"
+
+    if not left_dir.exists() or not right_dir.exists():
+        raise FileNotFoundError(f"Missing stereo image directories for sequence {seq_id}")
+    if not calib_path.exists():
+        raise FileNotFoundError(f"Missing calibration file at {calib_path}")
+    if not pose_path.exists():
+        raise FileNotFoundError(f"Missing pose file at {pose_path}")
+
+    left_paths = sorted(left_dir.glob("*.png"))
+    right_paths = sorted(right_dir.glob("*.png"))
+
+    if not left_paths or not right_paths:
+        raise ValueError(f"No images found for KITTI sequence {seq_id}")
+    if len(left_paths) != len(right_paths):
+        raise ValueError(f"Left/right image count mismatch for KITTI sequence {seq_id}")
+
+    sample_left = cv2.imread(str(left_paths[0]), cv2.IMREAD_COLOR)
+    sample_right = cv2.imread(str(right_paths[0]), cv2.IMREAD_COLOR)
+
+    if sample_left is None or sample_right is None:
+        raise ValueError(f"Failed to load sample images for KITTI sequence {seq_id}")
+    if sample_left.shape != sample_right.shape:
+        raise ValueError(f"Left/right image shapes differ for KITTI sequence {seq_id}")
+
+    height, width = sample_left.shape[:2]
+
+    projection_mats: Dict[str, np.ndarray] = {}
+    for line in calib_path.read_text().strip().splitlines():
+        if not line:
+            continue
+        key, values = line.split(":", 1)
+        data = np.fromstring(values, sep=" ", dtype=np.float64)
+        if data.size != 12:
+            raise ValueError(f"Unexpected calibration format in {calib_path}")
+        projection_mats[key.strip()] = data.reshape(3, 4)
+
+    for key in ("P0", "P2", "P3"):
+        if key not in projection_mats:
+            raise ValueError(f"Missing projection matrix '{key}' in {calib_path}")
+
+    pose_cam0 = _projection_matrix_to_pose(projection_mats["P0"])
+    pose_left = _projection_matrix_to_pose(projection_mats["P2"])
+    pose_right = _projection_matrix_to_pose(projection_mats["P3"])
+
+    left_to_cam0 = np.linalg.inv(pose_cam0) @ pose_left
+    left_to_right = np.linalg.inv(pose_left) @ pose_right
+
+    K_left = projection_mats["P2"][:, :3].copy()
+    K_right = projection_mats["P3"][:, :3].copy()
+    K_left /= K_left[2, 2]
+    K_right /= K_right[2, 2]
+
+    D_left = np.zeros((5, 1), dtype=np.float64)
+    D_right = np.zeros((5, 1), dtype=np.float64)
+
+    R = left_to_right[:3, :3]
+    T = left_to_right[:3, 3].reshape(3, 1)
+
+    image_size = (width, height)
+    R1, R2, P_left_rect, P_right_rect, Q, _, _ = cv2.stereoRectify(
+        K_left, D_left,
+        K_right, D_right,
+        image_size, R, T,
+        flags=cv2.CALIB_ZERO_DISPARITY,
+        alpha=0,
+    )
+
+    map_left_x, map_left_y = cv2.initUndistortRectifyMap(
+        K_left, D_left, R1, P_left_rect, image_size, cv2.CV_32FC1
+    )
+    map_right_x, map_right_y = cv2.initUndistortRectifyMap(
+        K_right, D_right, R2, P_right_rect, image_size, cv2.CV_32FC1
+    )
+
+    calibration = StereoCalibration(
+        K_left=K_left,
+        K_right=K_right,
+        K_left_rect=P_left_rect[:3, :3],
+        K_right_rect=P_right_rect[:3, :3],
+        D_left=D_left,
+        D_right=D_right,
+        R=R,
+        T=T,
+        R_left=R1,
+        R_right=R2,
+        P_left=P_left_rect,
+        P_right=P_right_rect,
+        Q=Q,
+        map_left_x=map_left_x,
+        map_left_y=map_left_y,
+        map_right_x=map_right_x,
+        map_right_y=map_right_y,
+        width=width,
+        height=height,
+    )
+
+    pose_array = np.loadtxt(pose_path, dtype=np.float64)
+    pose_array = pose_array.reshape(-1, 12)
+    pose_matrices = pose_array.reshape(-1, 3, 4)
+
+    if pose_matrices.shape[0] < len(left_paths):
+        raise ValueError(
+            f"Pose count ({pose_matrices.shape[0]}) shorter than image count "
+            f"({len(left_paths)}) for sequence {seq_id}"
+        )
+
+    poses: list[gtsam.Pose3] = []
+    for matrix in pose_matrices[:len(left_paths)]:
+        T_w_cam0 = np.eye(4, dtype=np.float64)
+        T_w_cam0[:3, :3] = matrix[:, :3]
+        T_w_cam0[:3, 3] = matrix[:, 3]
+
+        T_w_cam_left = T_w_cam0 @ left_to_cam0
+
+        pose = gtsam.Pose3(
+            gtsam.Rot3(T_w_cam_left[:3, :3]),
+            gtsam.Point3(T_w_cam_left[:3, 3]),
+        )
+        poses.append(pose)
+
+    frame_ids = [_parse_frame_id(path, idx) for idx, path in enumerate(left_paths)]
+
+    sequence = KittiSequence(
+        left_paths=left_paths,
+        right_paths=right_paths,
+        poses=poses,
+        frame_ids=frame_ids,
+        calibration=calibration,
+    )
+    _kitti_sequence_cache[seq_id] = sequence
+    return sequence
+
+
+def _load_kitti_frame(sequence: KittiSequence, index: int) -> StereoFrame:
+    left_path = sequence.left_paths[index]
+    right_path = sequence.right_paths[index]
+
+    left = cv2.imread(str(left_path), cv2.IMREAD_COLOR)
+    right = cv2.imread(str(right_path), cv2.IMREAD_COLOR)
+
+    if left is None or right is None:
+        raise ValueError(f"Failed to load images for index {index} at {left_path} / {right_path}")
+
+    left = cv2.cvtColor(left, cv2.COLOR_BGR2RGB)
+    right = cv2.cvtColor(right, cv2.COLOR_BGR2RGB)
+
+    return StereoFrame(
+        left=left,
+        right=right,
+        calibration=sequence.calibration,
+    )
+
+
+def load_kitti_sequence_segment(
+    sequence_id: str | int = "00",
+    sequence_length: int = 4,
+    seed: int = 0,
+    sampling_mode: str = "contiguous",
+    min_stride: int = 1,
+    max_stride: int | None = None,
+) -> FrameSequenceWithGroundTruth[StereoFrame]:
+    if sequence_length < 2:
+        raise ValueError("sequence_length must be at least 2.")
+    if min_stride < 1:
+        raise ValueError("min_stride must be >= 1.")
+    if max_stride is None:
+        max_stride = min_stride
+    if max_stride < min_stride:
+        raise ValueError("max_stride must be >= min_stride.")
+
+    sequence = _load_kitti_sequence(sequence_id)
+    if sequence.size < sequence_length:
+        raise ValueError(
+            f"Sequence too short ({sequence.size}) for requested length {sequence_length}."
+        )
+
+    rng = random.Random(seed)
+    sampling_mode = sampling_mode.lower()
+
+    if sampling_mode == "contiguous":
+        max_start = sequence.size - sequence_length
+        start_idx = rng.randint(0, max_start)
+        sampled_indices = list(range(start_idx, start_idx + sequence_length))
+    elif sampling_mode == "stride":
+        max_attempts = min(1024, sequence.size * 8)
+        sampled_indices: list[int] = []
+        for _ in range(max_attempts):
+            start_idx = rng.randint(0, sequence.size - 1)
+            current_idx = start_idx
+            candidate = [current_idx]
+            for _ in range(sequence_length - 1):
+                stride = rng.randint(min_stride, max_stride)
+                current_idx += stride
+                if current_idx >= sequence.size:
+                    break
+                candidate.append(current_idx)
+            if len(candidate) == sequence_length:
+                sampled_indices = candidate
+                break
+        if len(sampled_indices) != sequence_length:
+            raise RuntimeError(
+                "Could not sample a sequence satisfying the requested stride bounds."
+            )
+    else:
+        raise ValueError(
+            f"Unsupported sampling_mode '{sampling_mode}'. Expected 'contiguous' or 'stride'."
+        )
+
+    frames = [_load_kitti_frame(sequence, idx) for idx in sampled_indices]
+    poses = [sequence.poses[idx] for idx in sampled_indices]
+    frame_ids = [sequence.frame_ids[idx] for idx in sampled_indices]
+
+    return FrameSequenceWithGroundTruth[StereoFrame](
+        frames=frames,
+        world_poses=poses,
+        frame_indices=sampled_indices,
+        frame_ids=frame_ids,
+    )
+
+
+def get_kitti_iterator_with_odometry(
+    sequence_id: str | int = "00",
+    rotation_noise_sigmas: np.ndarray | None = None,
+    translation_noise_sigmas: np.ndarray | None = None,
+    include_ground_truth: bool = False,
+):
+    sequence = _load_kitti_sequence(sequence_id)
+
+    if rotation_noise_sigmas is None:
+        rotation_noise_sigmas = np.zeros(3, dtype=np.float64)
+    else:
+        rotation_noise_sigmas = np.asarray(rotation_noise_sigmas, dtype=np.float64).reshape(3)
+
+    if translation_noise_sigmas is None:
+        translation_noise_sigmas = np.zeros(3, dtype=np.float64)
+    else:
+        translation_noise_sigmas = np.asarray(translation_noise_sigmas, dtype=np.float64).reshape(3)
+
+    world_to_prev_robot: gtsam.Pose3 | None = None
+    world_to_first_robot: gtsam.Pose3 | None = None
+
+    for idx in range(sequence.size):
+        world_to_robot = sequence.poses[idx]
+
+        if world_to_prev_robot is None or world_to_first_robot is None:
+            world_to_prev_robot = world_to_robot
+            world_to_first_robot = world_to_robot
+            continue
+
+        prev_robot_to_robot = world_to_prev_robot.inverse() * world_to_robot
+
+        rotation_noise = gtsam.Rot3.Expmap(np.random.normal(0.0, rotation_noise_sigmas))
+        translation_noise = gtsam.Point3(np.random.normal(0.0, translation_noise_sigmas))
+        prev_robot_to_robot_noise = gtsam.Pose3(rotation_noise, translation_noise)
+        noisy_prev_robot_to_robot = prev_robot_to_robot.compose(prev_robot_to_robot_noise)
+
+        first_robot_to_robot = world_to_first_robot.inverse() * world_to_robot
+        world_to_prev_robot = world_to_robot
+
+        frame = _load_kitti_frame(sequence, idx)
+
+        if include_ground_truth:
+            yield frame, noisy_prev_robot_to_robot, first_robot_to_robot
+        else:
+            yield frame, noisy_prev_robot_to_robot
+
+
+def get_kitti_calibration(sequence_id: str | int = "00") -> StereoCalibration:
+    """
+    Retrieve the stereo calibration for a KITTI sequence.
+    """
+    return _load_kitti_sequence(sequence_id).calibration
+
 
 
 def load_tartanair_sequence_segment(

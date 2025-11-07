@@ -47,7 +47,14 @@ class SlamConfig:
             dtype=float,
         )
     )
+    absolute_rotation_noise_sigmas: np.ndarray | None = field(
+        default_factory=lambda: np.array(
+            [np.deg2rad(1.0), np.deg2rad(1.0), np.deg2rad(1.0)],
+            dtype=float,
+        )
+    )
     feature_matcher: MatcherType = "lighterglue"
+    rectify_inputs: bool = True
 
 
 @dataclass(slots=True)
@@ -93,10 +100,17 @@ class StereoSlamSystem:
             )
         else:
             self._loop_noise = base_loop_noise
+        self._absolute_rotation_noise_default = (
+            gtsam.noiseModel.Diagonal.Sigmas(self.config.absolute_rotation_noise_sigmas)
+            if self.config.absolute_rotation_noise_sigmas is not None
+            else None
+        )
 
         self._frame_index = -1
         self._raw_pose = gtsam.Pose3.Identity()
         self._current_keyframe_pose: gtsam.Pose3 | None = None
+        self._pending_keyframe_odometry = gtsam.Pose3.Identity()
+        self._has_pending_keyframe_odometry = False
 
         self._raw_trajectory: list[gtsam.Pose3] = []
         self._gt_trajectory: list[gtsam.Pose3] = []
@@ -112,6 +126,8 @@ class StereoSlamSystem:
         self,
         frame: StereoFrame,
         odometry: gtsam.Pose3 | None,
+        absolute_rotation: gtsam.Rot3 | None = None,
+        absolute_rotation_noise: np.ndarray | object | None = None,
         *,
         timestamp: float | None = None,  # reserved for future real-time gating
         ground_truth_pose: gtsam.Pose3 | None = None,
@@ -122,6 +138,8 @@ class StereoSlamSystem:
         Args:
             frame: Rectified or raw stereo frame.
             odometry: Relative pose from the previous keyframe to the current frame.
+            absolute_rotation: Optional absolute orientation measurement for the current frame.
+            absolute_rotation_noise: Either a noise model or 3-vector of sigmas for the rotation prior.
             timestamp: Optional timestamp for future real-time handling.
             ground_truth_pose: Optional world pose, used only for evaluation/logging.
         """
@@ -135,8 +153,17 @@ class StereoSlamSystem:
 
         with self.performance.time_section("odometry.integrate"):
             latest_pose = self._integrate_odometry(odometry)
+        self._accumulate_keyframe_odometry(odometry)
         frontend_output: FrontendOutput | None = None
         is_keyframe = False
+        rotation_measurement: tuple[gtsam.Rot3, object] | None = None
+        if absolute_rotation is not None:
+            noise_model = self._resolve_absolute_rotation_noise(absolute_rotation_noise)
+            if noise_model is None:
+                raise ValueError(
+                    "Absolute rotation noise must be provided when supplying absolute rotations."
+                )
+            rotation_measurement = (absolute_rotation, noise_model)
 
         if ground_truth_pose is not None:
             self._gt_trajectory.append(ground_truth_pose)
@@ -145,11 +172,19 @@ class StereoSlamSystem:
             with self.performance.time_section("frontend.total"):
                 frontend_output = self.frontend.process(frame)
             self._record_frontend_timings(frontend_output.timings)
-            with self.performance.time_section("pose_graph.process_odometry"):
-                self.pose_graph.process_odometry(odometry, self._odometry_noise, frontend_output.feature_frame)
+            pending_odometry = self._consume_pending_keyframe_odometry()
+            if pending_odometry is not None:
+                with self.performance.time_section("pose_graph.process_odometry"):
+                    self.pose_graph.process_odometry(
+                        pending_odometry,
+                        self._odometry_noise,
+                        frontend_output.feature_frame,
+                        absolute_rotation=None if rotation_measurement is None else rotation_measurement[0],
+                        absolute_rotation_noise=None if rotation_measurement is None else rotation_measurement[1],
+                    )
             keyframe_depth_frame = (self.pose_graph.kf_idx, frontend_output.depth_frame)
 
-            self._current_keyframe_pose = ground_truth_pose or latest_pose
+            self._current_keyframe_pose = latest_pose
             self._raw_keyframe_trajectory.append(latest_pose)
             if ground_truth_pose is not None:
                 self._gt_keyframe_trajectory.append(ground_truth_pose)
@@ -167,10 +202,16 @@ class StereoSlamSystem:
                 with self.performance.time_section("frontend.total"):
                     frontend_output = self.frontend.process(frame)
                 self._record_frontend_timings(frontend_output.timings)
-                with self.performance.time_section("pose_graph.process_odometry"):
-                    self.pose_graph.process_odometry(
-                        relative_to_keyframe, self._odometry_noise, frontend_output.feature_frame
-                    )
+                pending_odometry = self._consume_pending_keyframe_odometry()
+                if pending_odometry is not None:
+                    with self.performance.time_section("pose_graph.process_odometry"):
+                        self.pose_graph.process_odometry(
+                            pending_odometry,
+                            self._odometry_noise,
+                            frontend_output.feature_frame,
+                            absolute_rotation=None if rotation_measurement is None else rotation_measurement[0],
+                            absolute_rotation_noise=None if rotation_measurement is None else rotation_measurement[1],
+                        )
                 keyframe_depth_frame = (self.pose_graph.kf_idx, frontend_output.depth_frame)
 
                 self._current_keyframe_pose = latest_pose
@@ -224,10 +265,38 @@ class StereoSlamSystem:
         self._raw_trajectory.append(self._raw_pose)
         return self._raw_pose
 
+    def _accumulate_keyframe_odometry(self, odometry: gtsam.Pose3 | None) -> None:
+        if odometry is None:
+            return
+        if self._has_pending_keyframe_odometry:
+            self._pending_keyframe_odometry = self._pending_keyframe_odometry.compose(odometry)
+        else:
+            self._pending_keyframe_odometry = odometry
+            self._has_pending_keyframe_odometry = True
+
+    def _consume_pending_keyframe_odometry(self) -> gtsam.Pose3 | None:
+        if not self._has_pending_keyframe_odometry:
+            return None
+        odometry = self._pending_keyframe_odometry
+        self._pending_keyframe_odometry = gtsam.Pose3.Identity()
+        self._has_pending_keyframe_odometry = False
+        return odometry
+
     def _record_frontend_timings(self, timings: FrontendTimings) -> None:
         self.performance.record("frontend.rectify", timings.rectify)
         self.performance.record("frontend.depth", timings.depth)
         self.performance.record("frontend.features", timings.feature_detection)
+
+    def _resolve_absolute_rotation_noise(
+        self,
+        noise: object | np.ndarray | None,
+    ):
+        if noise is None:
+            return self._absolute_rotation_noise_default
+        if hasattr(noise, "dim"):
+            return noise
+        sigmas = np.asarray(noise, dtype=float).reshape(3)
+        return gtsam.noiseModel.Diagonal.Sigmas(sigmas)
 
     def _queue_loop_closure_candidates(self) -> None:
         total_start = time.perf_counter()
@@ -301,6 +370,7 @@ def create_default_slam_system(
     frontend = StereoFrontend(
         depth_estimator=SGBM(num_disparities=16 * 4, block_size=5, image_color="RGB"),
         feature_detector=feature_matcher,
+        rectify_inputs=cfg.rectify_inputs,
     )
     loop_detector = ProximityLoopDetector(
         max_translation=cfg.proximity_max_translation,

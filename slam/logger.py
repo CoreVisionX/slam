@@ -12,7 +12,11 @@ from gtsam.symbol_shorthand import X
 
 from backend.pose_graph import GtsamPoseGraph
 from registration.registration import StereoDepthFrame
-from slam.alignment import compute_umeyama_alignment_pose, pose_translation_to_array
+from slam.alignment import (
+    apply_similarity_transform,
+    compute_umeyama_alignment_pose,
+    pose_translation_to_array,
+)
 from viz import rr_log_graph_edges, rr_log_map_points, rr_log_pose, rr_log_trajectory
 
 
@@ -20,6 +24,8 @@ from viz import rr_log_graph_edges, rr_log_map_points, rr_log_pose, rr_log_traje
 class TrajectoryMetrics:
     translation_ate: float
     rotation_ate_deg: float
+    total_distance: float
+    translation_ate_pct: float
 
 
 class RerunLogger:
@@ -37,6 +43,7 @@ class RerunLogger:
             rr.connect_grpc(tcp_address)
 
         self._enable_alignment = enable_alignment
+
     def log_step(
         self,
         frame_index: int,
@@ -68,9 +75,13 @@ class RerunLogger:
 
         gt_for_logging = list(gt_keyframe_trajectory)
         if self._enable_alignment:
-            alignment_pose = compute_umeyama_alignment_pose(gt_for_logging, estimated)
-            if alignment_pose is not None:
-                gt_for_logging = [alignment_pose.compose(pose) for pose in gt_for_logging]
+            alignment = compute_umeyama_alignment_pose(gt_for_logging, estimated)
+            if alignment is not None:
+                rotation, translation, scale = alignment
+                gt_for_logging = [
+                    apply_similarity_transform(pose, rotation, translation, scale)
+                    for pose in gt_for_logging
+                ]
 
         rr_log_trajectory("gt_keyframe_trajectory", gt_for_logging, color=(0, 255, 0))
         rr_log_trajectory("raw_keyframe_trajectory", raw_keyframe_trajectory, color=(0, 0, 255))
@@ -93,6 +104,11 @@ class RerunLogger:
 
         metrics = self._compute_metrics(gt_for_logging, estimated)
         rr.log("/translation/ate", rr.Scalars(metrics.translation_ate))
+        rr.log("/translation/total_distance", rr.Scalars(metrics.total_distance))
+        rr.log(
+            "/translation/ate_percentage",
+            rr.Scalars(metrics.translation_ate_pct),
+        )
         rr.log("/rotation/ate", rr.Scalars(metrics.rotation_ate_deg))
 
         return metrics
@@ -109,6 +125,16 @@ class RerunLogger:
         ]
         translation_ate = float(np.mean(translation_errors))
 
+        gt_positions = np.array([pose_translation_to_array(pose) for pose in aligned_gt])
+        if len(gt_positions) >= 2:
+            segment_lengths = np.linalg.norm(np.diff(gt_positions, axis=0), axis=1)
+            total_distance = float(np.sum(segment_lengths))
+        else:
+            total_distance = 0.0
+        translation_ate_pct = (
+            float((translation_ate / total_distance) * 100.0) if total_distance > 1e-9 else 0.0
+        )
+
         rotation_errors = [
             np.linalg.norm(gt_pose.rotation().ypr() - est_pose.rotation().ypr())
             for gt_pose, est_pose in zip(aligned_gt, estimated)
@@ -118,4 +144,6 @@ class RerunLogger:
         return TrajectoryMetrics(
             translation_ate=translation_ate,
             rotation_ate_deg=rotation_ate_deg,
+            total_distance=total_distance,
+            translation_ate_pct=translation_ate_pct,
         )

@@ -156,7 +156,9 @@ def main() -> None:
                     msg += f"    sections: {section_breakdown}\n"
                     if result.metrics:
                         msg += f"    ATE transl {result.metrics.translation_ate:.3f} m, "
-                        msg += f"rot {result.metrics.rotation_ate_deg:.3f} deg\n"
+                        msg += f"distance {result.metrics.total_distance:.3f} m, "
+                        msg += f"{result.metrics.translation_ate_pct:.3f}%"
+                        msg += f", rot {result.metrics.rotation_ate_deg:.3f} deg\n"
                     print(msg)
 
                     if not args.disable_rerun:
