@@ -217,7 +217,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--translation-noise",
         type=float,
-        default=0.05,
+        default=0.2,
         help="Std-dev (meters) for per-axis translation noise added to odometry.",
     )
     parser.add_argument(
