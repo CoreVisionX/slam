@@ -206,6 +206,43 @@ def _projection_matrix_to_pose(P: np.ndarray) -> np.ndarray:
     return pose
 
 
+def _identity_rectification_maps(width: int, height: int) -> tuple[np.ndarray, np.ndarray]:
+    """
+    Build rectification maps that leave the image unchanged (used when data is already rectified).
+    """
+    xs = np.arange(width, dtype=np.float32)
+    ys = np.arange(height, dtype=np.float32)
+    map_x, map_y = np.meshgrid(xs, ys)
+    return map_x, map_y
+
+
+def _rectified_q_matrix(
+    K_left_rect: np.ndarray,
+    K_right_rect: np.ndarray,
+    T: np.ndarray,
+) -> np.ndarray:
+    """
+    Construct the reprojection matrix for a rectified stereo pair using standard
+    OpenCV conventions (see reprojectImageTo3D documentation).
+    """
+    Tx = float(np.asarray(T, dtype=np.float64).ravel()[0])
+    if np.isclose(Tx, 0.0):
+        raise ValueError("KITTI baseline is zero; cannot build reprojection matrix.")
+
+    cx_left = float(K_left_rect[0, 2])
+    cy_left = float(K_left_rect[1, 2])
+    cx_right = float(K_right_rect[0, 2])
+    fx = float(K_left_rect[0, 0])
+
+    Q = np.array([
+        [1.0, 0.0, 0.0, -cx_left],
+        [0.0, 1.0, 0.0, -cy_left],
+        [0.0, 0.0, 0.0, fx],
+        [0.0, 0.0, -1.0 / Tx, (cx_left - cx_right) / Tx],
+    ], dtype=np.float64)
+    return Q
+
+
 def _load_kitti_sequence(sequence_id: str | int) -> KittiSequence:
     seq_id = _normalize_kitti_sequence_id(sequence_id)
     if seq_id in _kitti_sequence_cache:
@@ -279,35 +316,25 @@ def _load_kitti_sequence(sequence_id: str | int) -> KittiSequence:
     R = left_to_right[:3, :3]
     T = left_to_right[:3, 3].reshape(3, 1)
 
-    image_size = (width, height)
-    R1, R2, P_left_rect, P_right_rect, Q, _, _ = cv2.stereoRectify(
-        K_left, D_left,
-        K_right, D_right,
-        image_size, R, T,
-        flags=cv2.CALIB_ZERO_DISPARITY,
-        alpha=0,
-    )
-
-    map_left_x, map_left_y = cv2.initUndistortRectifyMap(
-        K_left, D_left, R1, P_left_rect, image_size, cv2.CV_32FC1
-    )
-    map_right_x, map_right_y = cv2.initUndistortRectifyMap(
-        K_right, D_right, R2, P_right_rect, image_size, cv2.CV_32FC1
-    )
+    K_left_rect = K_left.copy()
+    K_right_rect = K_right.copy()
+    map_left_x, map_left_y = _identity_rectification_maps(width, height)
+    map_right_x, map_right_y = _identity_rectification_maps(width, height)
+    Q = _rectified_q_matrix(K_left_rect, K_right_rect, T)
 
     calibration = StereoCalibration(
         K_left=K_left,
         K_right=K_right,
-        K_left_rect=P_left_rect[:3, :3],
-        K_right_rect=P_right_rect[:3, :3],
+        K_left_rect=K_left_rect,
+        K_right_rect=K_right_rect,
         D_left=D_left,
         D_right=D_right,
         R=R,
         T=T,
-        R_left=R1,
-        R_right=R2,
-        P_left=P_left_rect,
-        P_right=P_right_rect,
+        R_left=np.eye(3, dtype=np.float64),
+        R_right=np.eye(3, dtype=np.float64),
+        P_left=projection_mats["P2"].copy(),
+        P_right=projection_mats["P3"].copy(),
         Q=Q,
         map_left_x=map_left_x,
         map_left_y=map_left_y,
