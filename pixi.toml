@@ -5,6 +5,9 @@ name = "slam"
 platforms = ["linux-aarch64", "osx-arm64"]
 version = "0.1.0"
 
+[build]
+build-backend = "pypi"
+
 [system-requirements]
 cuda = "12"
 
