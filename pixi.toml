@@ -9,7 +9,7 @@ version = "0.1.0"
 authors = ["Jacob Van Meter <jacobvm04@gmail.com>"]
 
 [package.build]
-backend = { name = "pixi-build-python" }
+backend = { name = "pixi-build-python", channel = "conda-forge" }
 
 [package.host-dependencies]
 setuptools = ">=61.0"
