@@ -5,8 +5,12 @@ name = "slam"
 platforms = ["linux-aarch64", "osx-arm64"]
 version = "0.1.0"
 
-[build]
-build-backend = "pypi"
+[package.build]
+backend = { name = "pixi-build-python" }
+
+[package.host-dependencies]
+setuptools = ">=61.0"
+wheel = "*"
 
 [system-requirements]
 cuda = "12"
