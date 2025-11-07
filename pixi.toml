@@ -21,7 +21,6 @@ cuda = "12"
 [tasks]
 
 [dependencies]
-python = ">=3.10,<3.11"                  # Jetson GPU wheels exist; 3.12 often doesn't
 pip = ">=25.2,<26"
 
 # Cross-platform-safe (for Jetson) PyPI deps
@@ -34,6 +33,9 @@ rerun-sdk = { version = ">=0.26.2, <0.27", extras = ["notebook"] }
 # ------------ Jetson CUDA 12.6 (JetPack 6.2.x) ------------
 [feature.jetson-cu126]
 platforms = ["linux-aarch64"]
+
+[feature.jetson-cu126.dependencies]
+python = ">=3.10,<3.11"  # Jetson GPU wheels exist for 3.10; 3.12 often doesn't
 
 [feature.jetson-cu126.pypi-options]
 index-url = "https://pypi.jetson-ai-lab.io/jp6/cu126"
@@ -53,6 +55,9 @@ triton = ">=3.5.0, <4"
 # ------------ Mac OS feature ------------
 [feature.macos]
 platforms = ["osx-arm64"]
+
+[feature.macos.dependencies]
+python = ">=3.10"  # Allow any Python 3.10+
 
 [feature.macos.pypi-dependencies]
 torch = "*"
