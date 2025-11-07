@@ -10,7 +10,7 @@ authors = [
     {name = "Jacob Van Meter", email = "jacobvm04@gmail.com"}
 ]
 readme = "README.md"
-requires-python = ">=3.10,<3.11"
+requires-python = ">=3.10"
 dependencies = [
     "gtsam-develop>=4.3a0.dev202510200041,<5",
     "kornia>=0.8.1,<0.9",
