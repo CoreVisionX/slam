@@ -11,6 +11,9 @@ authors = ["Jacob Van Meter <jacobvm04@gmail.com>"]
 [package.build]
 backend = { name = "pixi-build-python", channel = "conda-forge" }
 
+[package.build.config]
+ignore-pyproject-manifest = false
+
 [package.host-dependencies]
 setuptools = ">=61.0"
 wheel = "*"
