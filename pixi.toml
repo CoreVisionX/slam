@@ -1,4 +1,4 @@
-[workspace]
+[package]
 authors = ["Jacob Van Meter <jacobvm04@gmail.com>"]
 channels = ["conda-forge"]
 name = "slam"
