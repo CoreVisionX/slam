@@ -27,6 +27,7 @@ TA_TO_CV = np.array([
 # https://tartanair.org/modalities.html
 WIDTH = 640
 HEIGHT = 640
+GRAVITY_VECTOR_CV = np.array([0.0, -9.81, 0.0], dtype=np.float64)
 tartanair_calib = StereoCalibration.create(
     K=np.array([
         [WIDTH / 2, 0.0, WIDTH / 2],
@@ -39,11 +40,63 @@ tartanair_calib = StereoCalibration.create(
 )
 
 @dataclass
+class FrameImuMeasurements:
+    frame_timestamp: float
+    timestamps: np.ndarray
+    linear_accelerations: np.ndarray
+    angular_velocities: np.ndarray
+    world_velocity: np.ndarray | None = None
+    body_velocity: np.ndarray | None = None
+
+    def __post_init__(self) -> None:
+        timestamps = np.asarray(self.timestamps, dtype=np.float64).reshape(-1)
+        linear_acc = np.asarray(self.linear_accelerations, dtype=np.float64)
+        angular_vel = np.asarray(self.angular_velocities, dtype=np.float64)
+
+        if linear_acc.size == 0:
+            linear_acc = np.zeros((0, 3), dtype=np.float64)
+        else:
+            linear_acc = linear_acc.reshape(-1, 3)
+
+        if angular_vel.size == 0:
+            angular_vel = np.zeros((0, 3), dtype=np.float64)
+        else:
+            angular_vel = angular_vel.reshape(-1, 3)
+
+        if linear_acc.shape[0] != timestamps.size or angular_vel.shape[0] != timestamps.size:
+            raise ValueError("IMU measurement counts must align between timestamps, accel, and gyro.")
+
+        world_vel = self.world_velocity
+        if world_vel is None:
+            world_vel = np.zeros(3, dtype=np.float64)
+        else:
+            world_vel = np.asarray(world_vel, dtype=np.float64).reshape(3)
+
+        body_vel = self.body_velocity
+        if body_vel is None:
+            body_vel = np.zeros(3, dtype=np.float64)
+        else:
+            body_vel = np.asarray(body_vel, dtype=np.float64).reshape(3)
+
+        self.timestamps = timestamps
+        self.linear_accelerations = linear_acc
+        self.angular_velocities = angular_vel
+        self.world_velocity = world_vel
+        self.body_velocity = body_vel
+
+    def __len__(self) -> int:
+        return self.timestamps.size
+
+
+@dataclass
 class TartanAirSequence:
     left_paths: list[Path]
     right_paths: list[Path]
     poses: list[gtsam.Pose3]
     frame_ids: list[int]
+    frame_timestamps: np.ndarray | None = None
+    imu_measurements: list[FrameImuMeasurements] | None = None
+    left_depth_paths: list[Path] | None = None
 
     @property
     def size(self) -> int:
@@ -75,6 +128,10 @@ class FrameSequenceWithGroundTruth(Generic[S]):
     world_poses: list[gtsam.Pose3]
     frame_indices: list[int]
     frame_ids: list[int]
+    imu_measurements: list[FrameImuMeasurements] | None = None
+    full_imu_measurements: list[FrameImuMeasurements] | None = None
+    frame_timestamps: np.ndarray | None = None
+    ground_truth_depths: list[np.ndarray] | None = None
 
     @property
     def length(self) -> int:
@@ -87,6 +144,13 @@ class FrameSequenceWithGroundTruth(Generic[S]):
             raise IndexError("Frame index out of range for this sequence.")
         return self.world_poses[first_idx].inverse() * self.world_poses[second_idx]
 
+    def get_frame_imu(self, idx: int) -> FrameImuMeasurements | None:
+        if idx < 0 or idx >= self.length:
+            raise IndexError("Frame index out of range for this sequence.")
+        if self.imu_measurements is None:
+            return None
+        return self.imu_measurements[idx]
+
 
 def _parse_frame_id(path: Path, fallback: int) -> int:
     stem = path.stem
@@ -97,6 +161,76 @@ def _parse_frame_id(path: Path, fallback: int) -> int:
         except ValueError:
             pass
     return fallback
+
+
+def _load_array_from_disk(base_path: Path) -> np.ndarray:
+    npy_path = base_path.with_suffix(".npy")
+    txt_path = base_path.with_suffix(".txt")
+    if npy_path.exists():
+        return np.load(npy_path)
+    if txt_path.exists():
+        return np.loadtxt(txt_path)
+    raise FileNotFoundError(f"Could not find array at {npy_path} or {txt_path}")
+
+
+def _load_tartanair_imu_measurements(imu_dir: Path, num_frames: int) -> tuple[list[FrameImuMeasurements], np.ndarray]:
+    required_files = ["acc_nograv_body", "gyro", "imu_time", "cam_time", "vel_global", "vel_body"]
+    arrays: dict[str, np.ndarray] = {}
+    for name in required_files:
+        arrays[name] = _load_array_from_disk(imu_dir / name).astype(np.float64, copy=False)
+
+    acc = arrays["acc_nograv_body"]
+    gyro = arrays["gyro"]
+    imu_time = arrays["imu_time"].reshape(-1)
+    cam_time = arrays["cam_time"].reshape(-1)
+    vel_global = arrays["vel_global"]
+    vel_body = arrays["vel_body"]
+
+    if cam_time.size != num_frames:
+        raise ValueError(
+            f"Camera timestamp count ({cam_time.size}) does not match number of frames ({num_frames})."
+        )
+    if acc.shape[0] != imu_time.size or gyro.shape[0] != imu_time.size:
+        raise ValueError(
+            "IMU accel/gyro samples must align with imu_time entries."
+        )
+
+    acc = (TA_TO_CV @ acc.T).T
+    gyro = (TA_TO_CV @ gyro.T).T
+    vel_global = (TA_TO_CV @ vel_global.T).T
+    vel_body = (TA_TO_CV @ vel_body.T).T
+
+    measurements: list[FrameImuMeasurements] = []
+    imu_idx = 0
+    for frame_idx, frame_timestamp in enumerate(cam_time):
+        if frame_idx + 1 < cam_time.size:
+            next_timestamp = cam_time[frame_idx + 1]
+            next_idx = int(np.searchsorted(imu_time, next_timestamp, side="left"))
+        else:
+            next_idx = imu_time.size
+
+        timestamps = imu_time[imu_idx:next_idx]
+        lin_acc = acc[imu_idx:next_idx]
+        ang_vel = gyro[imu_idx:next_idx]
+        frame_vel_world = vel_global[imu_idx] if imu_idx < vel_global.shape[0] else np.zeros(3, dtype=np.float64)
+        frame_vel_body = vel_body[imu_idx] if imu_idx < vel_body.shape[0] else np.zeros(3, dtype=np.float64)
+        measurements.append(
+            FrameImuMeasurements(
+                frame_timestamp=float(frame_timestamp),
+                timestamps=timestamps,
+                linear_accelerations=lin_acc,
+                angular_velocities=ang_vel,
+                world_velocity=frame_vel_world,
+                body_velocity=frame_vel_body,
+            )
+        )
+        imu_idx = next_idx
+
+    if imu_idx != imu_time.size:
+        raise ValueError("Not all IMU samples were assigned to frames.")
+
+    return measurements, cam_time
+
 
 def _load_tartanair_sequence(env: str, difficulty: str, traj: str) -> TartanAirSequence:
     key = (env, difficulty, traj)
@@ -119,6 +253,20 @@ def _load_tartanair_sequence(env: str, difficulty: str, traj: str) -> TartanAirS
     if len(left_paths) != len(right_paths):
         raise ValueError(f"Left/right image count mismatch for {env}/{difficulty}/{traj}")
 
+    depth_dir = traj_root / "depth_lcam_front"
+    left_depth_paths: list[Path] | None = None
+    if depth_dir.exists():
+        candidate_paths: list[Path] = []
+        missing_depth = False
+        for left_path in left_paths:
+            depth_path = depth_dir / f"{left_path.stem}_depth{left_path.suffix}"
+            if not depth_path.exists():
+                missing_depth = True
+                break
+            candidate_paths.append(depth_path)
+        if not missing_depth:
+            left_depth_paths = candidate_paths
+
     pose_array = np.loadtxt(pose_path)
     if pose_array.ndim == 1:
         pose_array = pose_array.reshape(1, -1)
@@ -140,12 +288,22 @@ def _load_tartanair_sequence(env: str, difficulty: str, traj: str) -> TartanAirS
         raise ValueError("Pose count does not match number of images.")
 
     frame_ids = [_parse_frame_id(path, idx) for idx, path in enumerate(left_paths)]
+    imu_dir = traj_root / "imu"
+    imu_measurements: list[FrameImuMeasurements] | None = None
+    frame_timestamps: np.ndarray | None = None
+    if imu_dir.exists():
+        imu_measurements, frame_timestamps = _load_tartanair_imu_measurements(
+            imu_dir, len(left_paths)
+        )
 
     sequence = TartanAirSequence(
         left_paths=left_paths,
         right_paths=right_paths,
         poses=poses,
         frame_ids=frame_ids,
+        frame_timestamps=frame_timestamps,
+        imu_measurements=imu_measurements,
+        left_depth_paths=left_depth_paths,
     )
     _tartanair_sequence_cache[key] = sequence
     return sequence
@@ -173,6 +331,34 @@ def _load_stereo_frame(sequence: TartanAirSequence, index: int) -> StereoFrame:
         right=right,
         calibration=tartanair_calib
     )
+
+
+def _read_tartanair_depth_map(depth_path: Path) -> np.ndarray:
+    suffix = depth_path.suffix.lower()
+    if suffix == ".npy":
+        depth = np.load(depth_path)
+    else:
+        depth_image = cv2.imread(str(depth_path), cv2.IMREAD_UNCHANGED)
+        if depth_image is None:
+            raise FileNotFoundError(f"Failed to load depth map at {depth_path}")
+        depth_image = np.ascontiguousarray(depth_image)
+        if depth_image.ndim == 2 and depth_image.dtype != np.uint8:
+            depth = depth_image.astype(np.float32, copy=False)
+        elif depth_image.ndim == 2:
+            depth = depth_image.astype(np.float32, copy=False)
+        elif depth_image.ndim == 3 and depth_image.shape[2] >= 4:
+            depth = depth_image.view("<f4")
+            depth = np.squeeze(depth, axis=-1)
+        else:
+            raise ValueError(f"Unsupported depth image format at {depth_path}")
+
+    if depth.ndim != 2:
+        raise ValueError(f"Depth map at {depth_path} must be 2D.")
+
+    if depth.shape != (HEIGHT, WIDTH):
+        depth = cv2.resize(depth, (WIDTH, HEIGHT), interpolation=cv2.INTER_NEAREST)
+
+    return depth.astype(np.float32, copy=False)
 
 
 def _normalize_kitti_sequence_id(sequence_id: str | int) -> str:
@@ -532,6 +718,7 @@ def load_tartanair_sequence_segment(
     sampling_mode: str = "contiguous",
     min_stride: int = 1,
     max_stride: int | None = None,
+    load_ground_truth_depth: bool = False,
 ) -> FrameSequenceWithGroundTruth[StereoFrame]:
     """
     Sample a sequence of stereo frames with associated ground-truth poses.
@@ -546,6 +733,8 @@ def load_tartanair_sequence_segment(
     min_stride, max_stride:
         Bounds on the stride when sampling in "stride" mode. The stride applies between consecutive
         frames within the sequence. Defaults to 1 (contiguous sampling).
+    load_ground_truth_depth:
+        When True, load and return the dataset-provided left camera depth maps alongside the images.
     """
 
     if sequence_length < 2:
@@ -598,12 +787,36 @@ def load_tartanair_sequence_segment(
     frames = [_load_stereo_frame(sequence, idx) for idx in sampled_indices]
     poses = [sequence.poses[idx] for idx in sampled_indices]
     frame_ids = [sequence.frame_ids[idx] for idx in sampled_indices]
+    imu_measurements = (
+        [sequence.imu_measurements[idx] for idx in sampled_indices]
+        if sequence.imu_measurements is not None
+        else None
+    )
+    frame_timestamps = (
+        np.asarray(sequence.frame_timestamps, dtype=np.float64)
+        if sequence.frame_timestamps is not None
+        else None
+    )
+    ground_truth_depths = None
+    if load_ground_truth_depth:
+        if sequence.left_depth_paths is None:
+            raise FileNotFoundError(
+                f"Ground-truth depth unavailable for {env}/{difficulty}/{traj}."
+            )
+        ground_truth_depths = [
+            _read_tartanair_depth_map(sequence.left_depth_paths[idx])
+            for idx in sampled_indices
+        ]
 
     return FrameSequenceWithGroundTruth[StereoFrame](
         frames=frames,
         world_poses=poses,
         frame_indices=sampled_indices,
         frame_ids=frame_ids,
+        imu_measurements=imu_measurements,
+        full_imu_measurements=sequence.imu_measurements,
+        frame_timestamps=frame_timestamps,
+        ground_truth_depths=ground_truth_depths,
     )
 
 
