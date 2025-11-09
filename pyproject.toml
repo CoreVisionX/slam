@@ -25,7 +25,7 @@ dev = [
 ]
 
 [project.scripts]
-slam-live = "tests.live_slam:main"
+slam-live = "slam.cli:cli_main"
 
 [tool.setuptools.packages.find]
-include = ["slam*", "backend*", "depth*", "registration*"]
+include = ["slam*", "backend*", "depth*", "registration*", "tests*"]
