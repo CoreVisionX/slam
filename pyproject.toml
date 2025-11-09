@@ -24,5 +24,8 @@ dev = [
     "matplotlib>=3.10.7,<4",
 ]
 
+[project.scripts]
+slam-live = "tests.live_slam:main"
+
 [tool.setuptools.packages.find]
 include = ["slam*", "backend*", "depth*", "registration*"]
