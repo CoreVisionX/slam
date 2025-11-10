@@ -29,10 +29,11 @@ class OdometryEstimate:
 class VisionOdometryEstimator:
     """Estimate frame-to-frame odometry via feature matching + PnP."""
 
-    def __init__(self, matcher_type: MatcherType, *, rectify_inputs: bool) -> None:
+    def __init__(self, matcher_type: MatcherType, *, rectify_inputs: bool, max_depth_meters: float = 60.0) -> None:
         self._matcher = create_matcher(matcher_type)
         self._depth_estimator = SGBM(num_disparities=16 * 4, block_size=5, image_color="RGB")
         self._rectify_inputs = rectify_inputs
+        self._max_depth_meters = max_depth_meters
         self._prev_feature_frame: FeatureFrame | None = None
         self._last_depth_frame: StereoDepthFrame | None = None
 
@@ -86,7 +87,7 @@ class VisionOdometryEstimator:
                 calibration=frame.calibration,
             )
 
-        depth_frame = self._depth_estimator.compute_depth(rectified_frame)
+        depth_frame = self._depth_estimator.compute_depth(rectified_frame, max_depth=self._max_depth_meters)
         self._last_depth_frame = depth_frame
         feature_frame = self._matcher.detect_features([depth_frame])[0]
         return feature_frame

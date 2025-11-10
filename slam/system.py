@@ -35,6 +35,7 @@ class SlamConfig:
     proximity_max_candidates: int = 20
     proximity_min_separation: int = 1
     loop_worker_count: int | None = None
+    max_depth_meters: float = 60.0
     odometry_noise_sigmas: np.ndarray = field(
         default_factory=lambda: np.array(
             [np.deg2rad(0.3), np.deg2rad(0.3), np.deg2rad(0.3), 0.007, 0.007, 0.007],
@@ -371,6 +372,7 @@ def create_default_slam_system(
         depth_estimator=SGBM(num_disparities=16 * 4, block_size=5, image_color="RGB"),
         feature_detector=feature_matcher,
         rectify_inputs=cfg.rectify_inputs,
+        max_depth_meters=cfg.max_depth_meters,
     )
     loop_detector = ProximityLoopDetector(
         max_translation=cfg.proximity_max_translation,

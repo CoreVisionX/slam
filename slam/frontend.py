@@ -43,10 +43,12 @@ class StereoFrontend:
         feature_detector: FeatureMatcher,
         *,
         rectify_inputs: bool = True,
+        max_depth_meters: float = 60.0,
     ) -> None:
         self._depth_estimator = depth_estimator
         self._feature_detector = feature_detector
         self._rectify_inputs = rectify_inputs
+        self._max_depth_meters = max_depth_meters
 
     def process(self, frame: StereoFrame) -> FrontendOutput:
         """Rectify the frame, compute depth, and detect features."""
@@ -71,7 +73,7 @@ class StereoFrontend:
             rectify_duration = 0.0
 
         depth_start = rectify_end
-        depth_frame = self._depth_estimator.compute_depth(rectified_frame)
+        depth_frame = self._depth_estimator.compute_depth(rectified_frame, max_depth=self._max_depth_meters)
         depth_end = time.perf_counter()
 
         detect_start = depth_end

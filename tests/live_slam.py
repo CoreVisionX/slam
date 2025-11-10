@@ -240,14 +240,6 @@ def should_accept_vo(estimate: OdometryEstimate, args: argparse.Namespace) -> bo
     return True
 
 
-def clip_depth_frame(depth_frame: StereoDepthFrame | None, max_depth_meters: float) -> None:
-    """Clip depth values beyond the maximum threshold to prevent them from affecting calculations."""
-    if depth_frame is None:
-        return
-    # Set all depth values beyond the threshold to NaN (in-place)
-    depth_frame.left_depth[depth_frame.left_depth > max_depth_meters] = np.nan
-
-
 class LiveRerunStreamLogger:
     """Log rectified imagery, depth, and live pose each frame for easier debugging."""
 
@@ -334,13 +326,18 @@ def main() -> None:
         enable_rerun_logging=not args.disable_rerun,
         feature_matcher=matcher_type,
         rectify_inputs=args.rectify_inputs,
+        max_depth_meters=args.max_depth_meters,
     )
 
     slam = create_default_slam_system(
         calibration_matrix=calibration.K_left_rect,
         config=config,
     )
-    vision_odometry = VisionOdometryEstimator(matcher_type, rectify_inputs=args.vo_rectify_inputs)
+    vision_odometry = VisionOdometryEstimator(
+        matcher_type,
+        rectify_inputs=args.vo_rectify_inputs,
+        max_depth_meters=args.max_depth_meters,
+    )
     stream_logger = None
     if not args.disable_rerun:
         stream_logger = LiveRerunStreamLogger(calibration)
@@ -372,11 +369,9 @@ def main() -> None:
 
             if first_frame:
                 vision_odometry.prime(frame)
-                clip_depth_frame(vision_odometry.latest_depth_frame, args.max_depth_meters)
                 first_frame = False
             else:
                 vo_estimate = vision_odometry.estimate(frame)
-                clip_depth_frame(vision_odometry.latest_depth_frame, args.max_depth_meters)
                 if should_accept_vo(vo_estimate, args):
                     odometry_input = vo_estimate.pose
                     last_good_odometry = vo_estimate.pose
