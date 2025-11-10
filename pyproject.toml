@@ -29,3 +29,6 @@ slam-live = "slam.cli:cli_main"
 
 [tool.setuptools.packages.find]
 include = ["slam*", "backend*", "depth*", "registration*", "tests*"]
+
+[tool.setuptools]
+py-modules = ["util", "viz"]
