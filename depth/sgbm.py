@@ -68,7 +68,7 @@ class SGBM:
         raw_disparity = self._matcher.compute(left_image, right_image)
         disparity = raw_disparity.astype(np.float32) / self._scale
         disparity[raw_disparity <= self._invalid_raw_disparity] = np.nan
-        return -disparity
+        return disparity
 
     def _prepare_image(self, image: np.ndarray) -> np.ndarray:
         array = np.asarray(image)
@@ -86,13 +86,19 @@ class SGBM:
 
         return np.ascontiguousarray(array)
 
-    def compute_depth(self, frame: RectifiedStereoFrame, max_depth: float = 20.0) -> StereoDepthFrame:
+    def compute_depth(self, frame: RectifiedStereoFrame, max_depth: float = 60.0) -> StereoDepthFrame:
         disparity = self(frame.left_rect, frame.right_rect)
+        depth_xyz, depth = self._reproject(disparity, frame.calibration.Q, max_depth)
 
-        depth_xyz = cv2.reprojectImageTo3D(disparity, frame.calibration.Q)
+        pos_depth = np.count_nonzero(np.isfinite(depth) & (depth > 0.0))
+        neg_depth = np.count_nonzero(np.isfinite(depth) & (depth < 0.0))
+        if neg_depth > pos_depth:
+            disparity = -disparity
+            depth_xyz, depth = self._reproject(disparity, frame.calibration.Q, max_depth)
 
-        depth = depth_xyz[:, :, 2]
-        depth[depth > max_depth] = np.nan
+        invalid = ~np.isfinite(depth) | (depth <= 0.0)
+        depth[invalid] = np.nan
+        depth_xyz[invalid, :] = np.nan
     
         return StereoDepthFrame(
             **{k: v for k, v in frame.__dict__.items() if not k.startswith('__')},
@@ -100,7 +106,7 @@ class SGBM:
             left_depth_xyz=depth_xyz
         )
 
-    def compute_depth_pair(self, pair: FramePair[RectifiedStereoFrame], max_depth: float = 20.0) -> FramePair[StereoDepthFrame]:
+    def compute_depth_pair(self, pair: FramePair[RectifiedStereoFrame], max_depth: float = 60.0) -> FramePair[StereoDepthFrame]:
         first_depth = self.compute_depth(pair.first, max_depth)
         second_depth = self.compute_depth(pair.second, max_depth)
 
@@ -109,3 +115,11 @@ class SGBM:
             first=first_depth,
             second=second_depth
         )
+
+    @staticmethod
+    def _reproject(disparity: np.ndarray, Q: np.ndarray, max_depth: float) -> tuple[np.ndarray, np.ndarray]:
+        depth_xyz = cv2.reprojectImageTo3D(disparity, Q)
+        depth = depth_xyz[:, :, 2].astype(np.float32, copy=False)
+        depth[~np.isfinite(depth)] = np.nan
+        depth[np.abs(depth) > max_depth] = np.nan
+        return depth_xyz.astype(np.float32, copy=False), depth

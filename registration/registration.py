@@ -1,12 +1,14 @@
 
 
 from dataclasses import dataclass
+from typing import Generic, TypeVar
 import gtsam
 import numpy as np
 
 from dataclasses import dataclass
 import numpy as np
 import cv2
+import kornia.feature as KF
 
 @dataclass
 class StereoCalibration:
@@ -27,9 +29,38 @@ class StereoCalibration:
     map_left_y: np.ndarray
     map_right_x: np.ndarray
     map_right_y: np.ndarray
+    width: int
+    height: int
+
+    def resize(self, new_width: int, new_height: int) -> 'StereoCalibration':
+        s_x = new_width / self.width
+        s_y = new_height / self.height
+        K_left_rect = np.array([
+            [self.K_left_rect[0, 0] * s_x, 0, self.K_left_rect[0, 2] * s_x],
+            [0, self.K_left_rect[1, 1] * s_y, self.K_left_rect[1, 2] * s_y],
+            [0, 0, 1]
+        ])
+        K_right_rect = np.array([
+            [self.K_right_rect[0, 0] * s_x, 0, self.K_right_rect[0, 2] * s_x],
+            [0, self.K_right_rect[1, 1] * s_y, self.K_right_rect[1, 2] * s_y],
+            [0, 0, 1]
+        ])
+
+        return StereoCalibration(
+            K_left=self.K_left, K_right=self.K_right,
+            K_left_rect=K_left_rect, K_right_rect=K_right_rect,
+            D_left=self.D_left, D_right=self.D_right,
+            R=self.R, T=self.T,
+            R_left=self.R_left, R_right=self.R_right,
+            P_left=self.P_left, P_right=self.P_right,
+            Q=self.Q,
+            map_left_x=self.map_left_x, map_left_y=self.map_left_y,
+            map_right_x=self.map_right_x, map_right_y=self.map_right_y,
+            width=new_width, height=new_height
+        )
 
     @classmethod
-    def create(cls, K, T, R) -> 'StereoCalibration':
+    def create(cls, K, T, R, width: int, height: int) -> 'StereoCalibration':
         K = np.asarray(K, dtype=np.float64)
         if K.shape != (3, 3):
             raise ValueError("K must be 3x3.")
@@ -81,6 +112,7 @@ class StereoCalibration:
             Q=Q,
             map_left_x=map_lx, map_left_y=map_ly,
             map_right_x=map_rx, map_right_y=map_ry,
+            width=width, height=height
         )
 
     def rectify(self, left: np.ndarray, right: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
@@ -126,23 +158,78 @@ class RectifiedStereoFrame(StereoFrame):
     left_rect: np.ndarray
     right_rect: np.ndarray
 
+    def resize(self, new_width: int, new_height: int) -> 'RectifiedStereoFrame':
+        left_rect = cv2.resize(self.left_rect, (new_width, new_height), interpolation=cv2.INTER_LINEAR)
+        right_rect = cv2.resize(self.right_rect, (new_width, new_height), interpolation=cv2.INTER_LINEAR)
+        calibration = self.calibration.resize(new_width, new_height)
+
+        return RectifiedStereoFrame(
+            left=self.left,
+            right=self.right,
+            left_rect=left_rect,
+            right_rect=right_rect,
+            calibration=calibration,
+        )
+
 @dataclass
 class StereoDepthFrame(RectifiedStereoFrame):
     left_depth: np.ndarray
     left_depth_xyz: np.ndarray
 
+
+F = TypeVar("F")
+
+# tbh composition over inheritance would make this easier
 @dataclass
-class FramePair[S]:
+class FeatureFrame(StereoDepthFrame, Generic[F]):
+    # discard the memory intensive images to save memory
+    left: None
+    right: None
+    left_rect: None
+    right_rect: None
+    left_depth: None
+    left_depth_xyz: None
+    features: F
+
+
+S = TypeVar("S")
+
+@dataclass
+class FramePair(Generic[S]):
     first: S
     second: S
 
 @dataclass
-class IndexedFramePair[S](FramePair[S]):
+class MatchedFramePair(FramePair[S], Generic[S]):
     first: S
     second: S
+    matches: np.ndarray
+
+    @property
+    def mkpts1(self) -> np.ndarray:
+        return self.first.features['keypoints'][self.matches[:, 0], :]
+
+    @property
+    def mkpts2(self) -> np.ndarray:
+        return self.second.features['keypoints'][self.matches[:, 1], :]
+
+    @property
+    def mkpts1_3d(self) -> np.ndarray:
+        return self.first.features['keypoints_3d'][self.matches[:, 0]]
+
+    @property
+    def mkpts1_depth(self) -> np.ndarray:
+        return self.first.features['keypoints_depth'][self.matches[:, 0]]
+
+    @property
+    def mkpts1_color(self) -> np.ndarray:
+        return self.first.features['keypoints_color'][self.matches[:, 0]]
+
+@dataclass
+class IndexedFramePair(FramePair[S], Generic[S]):
     first_idx: int
     second_idx: int
 
 @dataclass
-class FramePairWithGroundTruth[S](FramePair[S]):
-    first_T_second: gtsam.Pose3
+class FramePairWithGroundTruth(FramePair[S], Generic[S]):
+    first_T_second: "gtsam.Pose3"

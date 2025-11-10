@@ -4,7 +4,7 @@ import numpy as np
 import torch
 import kornia as K
 
-from registration.registration import FramePair, RectifiedStereoFrame, StereoDepthFrame, StereoFrame
+from registration.registration import FramePair, MatchedFramePair, RectifiedStereoFrame, StereoDepthFrame, FeatureFrame, StereoFrame
 
 def rectify_stereo_frame_pair(pair: FramePair[StereoFrame]) -> FramePair[RectifiedStereoFrame]:
     first_rect = pair.first.rectify()
@@ -51,34 +51,54 @@ def get_matching_keypoints(kp1, kp2, idxs):
 
 def fundamental_fitler(mkpts1: np.ndarray, mkpts2: np.ndarray) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     Fm, inliers = cv2.findFundamentalMat(
-        mkpts1, mkpts2, cv2.USAC_MAGSAC, 2.0, 0.999, 100000
+        mkpts1, mkpts2, cv2.USAC_MAGSAC, 2.0, 0.999, 10_000
     )
     mask = inliers.ravel() > 0
 
     return mkpts1[mask], mkpts2[mask], mask
 
 
-def solve_pnp(pair: FramePair[StereoDepthFrame], mkpts1: np.ndarray, mkpts2: np.ndarray) -> tuple[gtsam.Pose3, np.ndarray, np.ndarray, np.ndarray]:
-    u = mkpts1[:, 1].astype(int)
-    v = mkpts1[:, 0].astype(int)
+def solve_pnp(pair: MatchedFramePair[FeatureFrame]) -> tuple[gtsam.Pose3, MatchedFramePair[FeatureFrame]]:
+    # mkpts1 = pair.first.features['keypoints'].cpu().numpy()[pair.matches[:, 0]]
+    # mkpts2 = pair.second.features['keypoints'].cpu().numpy()[pair.matches[:, 1]]
+    mkpts1, mkpts2 = get_matching_keypoints(
+        kp1=pair.first.features['keypoints'].cpu().numpy() if isinstance(pair.first.features['keypoints'], torch.Tensor) else pair.first.features['keypoints'],
+        kp2=pair.second.features['keypoints'].cpu().numpy() if isinstance(pair.second.features['keypoints'], torch.Tensor) else pair.second.features['keypoints'],
+        idxs=pair.matches
+    )
 
-    mkpts1_3d = pair.first.left_depth_xyz[u, v, :]
-    mkpts1_depth = pair.first.left_depth[u, v]
+    # u = mkpts1[:, 1].astype(int)
+    # v = mkpts1[:, 0].astype(int)
+
+    # mkpts1_3d = pair.first.left_depth_xyz[u, v, :]
+    # mkpts1_depth = pair.first.left_depth[u, v]
+    # mkpts1_color = pair.first.left[u, v]
+
+    mkpts1_3d = pair.first.features['keypoints_3d'][pair.matches[:, 0]]
+    mkpts1_depth = pair.first.features['keypoints_depth'][pair.matches[:, 0]]
+    mkpts1_color = pair.first.features['keypoints_color'][pair.matches[:, 0]]
 
     valid_mask = mkpts1_depth > 0
     mkpts1_3d = mkpts1_3d[valid_mask]
+    mkpts1_color = mkpts1_color[valid_mask]
     mkpts1 = mkpts1[valid_mask]
     mkpts2 = mkpts2[valid_mask]
 
+    if mkpts1_3d.shape[0] < 4:
+        raise ValueError("Not enough 3D correspondences for PnP")
+
+    obj_points = np.ascontiguousarray(mkpts1_3d.astype(np.float32))
+    img_points = np.ascontiguousarray(mkpts2.reshape(-1, 1, 2).astype(np.float32))
+
     ret, rvec, tvec, inliers = cv2.solvePnPRansac(
-        mkpts1_3d, 
-        mkpts2, 
+        obj_points,
+        img_points,
         pair.first.calibration.K_left_rect, 
         np.zeros((5, 1)),
-        reprojectionError=2.0,
+        reprojectionError=2.0, # TODO: benchmark reprojectionError. plot error distributions for different reprojectionError values. with a proper config system this should be easy?
         confidence=0.999,
-        iterationsCount=10_000,
-        flags=cv2.SOLVEPNP_ITERATIVE
+        iterationsCount=100_000,
+        flags=cv2.USAC_MAGSAC # TODO: benchmark USAC_MAGSAC vs SOLVEPNP_ITERATIVE
     )
     inliers = inliers.ravel()
 
@@ -91,5 +111,10 @@ def solve_pnp(pair: FramePair[StereoDepthFrame], mkpts1: np.ndarray, mkpts2: np.
     if len(inliers) < 10:
         raise ValueError("Not enough inliers to solve PnP")
 
-    return gtsam.Pose3(gtsam.Rot3(R), t).inverse(), mkpts1[inliers], mkpts2[inliers], inliers
+    matched_pair = MatchedFramePair(
+        first=pair.first,
+        second=pair.second,
+        matches=pair.matches[valid_mask][inliers]
+    )
 
+    return gtsam.Pose3(gtsam.Rot3(R), t).inverse(), matched_pair

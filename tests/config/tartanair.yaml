@@ -1,6 +1,6 @@
 env: ["AbandonedFactory"]
-traj: ["P000"]
+traj: ["P001"]
 difficulty: ["easy"]
-modality: ["image", "depth"]
+modality: ["image", "depth", "imu"]
 camera_name: ["lcam_front", "rcam_front"]
 unzip: True

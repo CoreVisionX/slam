@@ -18,6 +18,7 @@ class ProximityLoopDetector:
     def candidates(self, pose_graph: GtsamPoseGraph, pose_key_idx: int) -> list[IndexedFramePair[StereoDepthFrame]]: # factor graph nodes
         keys = []
         distances = []
+        angular_distances = []
 
         pose = pose_graph.values.atPose3(X(pose_key_idx))
         pose_symbol = gtsam.Symbol(X(pose_key_idx))
@@ -40,12 +41,17 @@ class ProximityLoopDetector:
             if relative_distance < self.max_translation and relative_rotation < self.max_rotation:
                 keys.append(gtsam.Symbol(key).index())
                 distances.append(relative_distance)
+                angular_distances.append(relative_rotation)
 
         keys = np.array(keys)
         distances = np.array(distances)
+        angular_distances = np.array(angular_distances)
 
         # sort by distance and take the top candidates
         keys = keys[np.argsort(distances)][:self.max_candidates]
+
+        # # sort by angle
+        # keys = keys[np.argsort(angular_distances)][:self.max_candidates]
 
         return [IndexedFramePair[StereoDepthFrame](
             first=pose_graph.frames[pose_key_idx],

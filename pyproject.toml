@@ -1,0 +1,34 @@
+[build-system]
+requires = ["setuptools>=61.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "slam"
+version = "0.1.0"
+description = "SLAM system for visual odometry and 3D reconstruction"
+authors = [
+    {name = "Jacob Van Meter", email = "jacobvm04@gmail.com"}
+]
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+    "gtsam-develop>=4.3a0.dev202510200041,<5",
+    "kornia>=0.8.1,<0.9",
+    "opencv-python-headless>=4.12.0,<5",
+    "rerun-sdk[notebook]>=0.26.2,<0.27",
+]
+
+[project.optional-dependencies]
+dev = [
+    "ipykernel>=7.1.0,<8",
+    "matplotlib>=3.10.7,<4",
+]
+
+[project.scripts]
+slam-live = "slam.cli:cli_main"
+
+[tool.setuptools.packages.find]
+include = ["slam*", "backend*", "depth*", "registration*", "tests*"]
+
+[tool.setuptools]
+py-modules = ["util", "viz"]
