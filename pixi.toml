@@ -20,6 +20,7 @@ gtsam-develop = ">=4.3a0.dev202510200041, <5"
 kornia = ">=0.8.1, <0.9"
 opencv-python-headless = ">=4.12.0.88, <5"   # headless on Jetson
 rerun-sdk = { version = ">=0.26.2, <0.27", extras = ["notebook"] }
+open3d = ">=0.18.0, <0.20"
 
 # ------------ Jetson CUDA 12.6 (JetPack 6.2.x) ------------
 [feature.jetson-cu126]

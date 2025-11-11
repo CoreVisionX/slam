@@ -7,7 +7,7 @@ import cv2
 import gtsam
 from registration.registration import StereoCalibration, StereoFrame, FramePairWithGroundTruth
 import tartanair as ta
-from util import convert_coordinate_frame, se3_flattened_to_pose3
+from cvx_utils import convert_coordinate_frame, se3_flattened_to_pose3
 import numpy as np
 
 # setup tartanair
@@ -34,7 +34,7 @@ tartanair_calib = StereoCalibration.create(
         [0.0, HEIGHT / 2, HEIGHT / 2],
         [0.0, 0.0, 1.0]
     ]),
-    T=np.array([0.0, 0.25, 0.0]),
+    T=np.array([0.25, 0.0, 0.0]),
     R=np.eye(3),
     width=WIDTH, height=HEIGHT
 )
@@ -43,6 +43,7 @@ tartanair_calib = StereoCalibration.create(
 class FrameImuMeasurements:
     frame_timestamp: float
     timestamps: np.ndarray
+    dts: np.ndarray
     linear_accelerations: np.ndarray
     angular_velocities: np.ndarray
     world_velocity: np.ndarray | None = None
@@ -86,6 +87,46 @@ class FrameImuMeasurements:
 
     def __len__(self) -> int:
         return self.timestamps.size
+
+
+def add_sch16t_noise(omega_true, acc_true, dt, seed=0, tau_bias=500.0):
+    """
+    omega_true: (N,3) rad/s   (body rates)
+    acc_true:   (N,3) m/s^2   (specific force incl. gravity per your convention)
+    dt:         float seconds (assumed constant; if not, pass a vector and adapt)
+    tau_bias:   bias correlation time [s] for OU bias (200–1000 s reasonable)
+
+    Returns: (omega_noisy, acc_noisy)
+    """
+    rng = np.random.default_rng(seed)
+    N = omega_true.shape[0]
+
+    # SCH16T typical (datasheet)
+    gyro_nd = 0.0006 * np.pi / 180.0      # rad/s/√Hz
+    accel_nd = 0.8e-3                    # m/s²/√Hz
+    gyro_bias_inst = 0.5 * np.pi / 180.0 / 3600.0  # rad/s
+    accel_bias_inst = 0.20e-3                    # m/s²
+
+    # Discrete white-noise std (per sample)
+    sg = gyro_nd / np.sqrt(dt)
+    sa = accel_nd / np.sqrt(dt)
+
+    # OU bias with steady-state std = bias-instability, corr time tau_bias
+    phi = np.exp(-dt / tau_bias)
+    s_g_u = gyro_bias_inst * np.sqrt(1 - phi**2)
+    s_a_u = accel_bias_inst * np.sqrt(1 - phi**2)
+
+    b_g = np.zeros(3)
+    b_a = np.zeros(3)
+    omega_noisy = np.empty_like(omega_true)
+    acc_noisy = np.empty_like(acc_true)
+
+    for k in range(N):
+        b_g = phi * b_g + s_g_u * rng.standard_normal(3)
+        b_a = phi * b_a + s_a_u * rng.standard_normal(3)
+        omega_noisy[k] = omega_true[k] + b_g + sg * rng.standard_normal(3)
+        acc_noisy[k] = acc_true[k] + b_a + sa * rng.standard_normal(3)
+    return omega_noisy, acc_noisy
 
 
 @dataclass
@@ -174,17 +215,25 @@ def _load_array_from_disk(base_path: Path) -> np.ndarray:
 
 
 def _load_tartanair_imu_measurements(imu_dir: Path, num_frames: int) -> tuple[list[FrameImuMeasurements], np.ndarray]:
-    required_files = ["acc_nograv_body", "gyro", "imu_time", "cam_time", "vel_global", "vel_body"]
+    required_files = ["acc", "gyro", "imu_time", "cam_time", "vel_global", "vel_body"]
     arrays: dict[str, np.ndarray] = {}
     for name in required_files:
         arrays[name] = _load_array_from_disk(imu_dir / name).astype(np.float64, copy=False)
 
-    acc = arrays["acc_nograv_body"]
+    acc = arrays["acc"]
     gyro = arrays["gyro"]
     imu_time = arrays["imu_time"].reshape(-1)
     cam_time = arrays["cam_time"].reshape(-1)
     vel_global = arrays["vel_global"]
     vel_body = arrays["vel_body"]
+
+    imu_dts = np.diff(imu_time)
+    # TODO: make sure 1: is right here instead of -1:
+    imu_time = imu_time[1:]
+    acc = acc[1:]
+    gyro = gyro[1:]
+    vel_global = vel_global[1:]
+    vel_body = vel_body[1:]
 
     if cam_time.size != num_frames:
         raise ValueError(
@@ -201,33 +250,48 @@ def _load_tartanair_imu_measurements(imu_dir: Path, num_frames: int) -> tuple[li
     vel_body = (TA_TO_CV @ vel_body.T).T
 
     measurements: list[FrameImuMeasurements] = []
-    imu_idx = 0
     for frame_idx, frame_timestamp in enumerate(cam_time):
-        if frame_idx + 1 < cam_time.size:
-            next_timestamp = cam_time[frame_idx + 1]
-            next_idx = int(np.searchsorted(imu_time, next_timestamp, side="left"))
-        else:
-            next_idx = imu_time.size
+        if frame_idx < 1:
+            # add an empty batch for the first frame
+            measurements.append(
+                FrameImuMeasurements(
+                    frame_timestamp=float(frame_timestamp),
+                    timestamps=np.array([], dtype=np.float64),
+                    dts=np.array([], dtype=np.float64),
+                    linear_accelerations=np.array([], dtype=np.float64),
+                    angular_velocities=np.array([], dtype=np.float64),
+                )
+            )
 
-        timestamps = imu_time[imu_idx:next_idx]
-        lin_acc = acc[imu_idx:next_idx]
-        ang_vel = gyro[imu_idx:next_idx]
-        frame_vel_world = vel_global[imu_idx] if imu_idx < vel_global.shape[0] else np.zeros(3, dtype=np.float64)
-        frame_vel_body = vel_body[imu_idx] if imu_idx < vel_body.shape[0] else np.zeros(3, dtype=np.float64)
+            continue
+
+        prev_frame_timestamp = cam_time[frame_idx - 1]
+        frame_timestamp = cam_time[frame_idx]
+        mask = (np.round(imu_time, 3) > np.round(prev_frame_timestamp, 2)) & (np.round(imu_time, 3) <= np.round(frame_timestamp, 2))
+
+        timestamps = imu_time[mask]
+        if frame_idx != num_frames - 1:
+            assert len(timestamps) == 10, f"Expected 10 IMU samples for frame {frame_idx}, got {len(timestamps)}: {timestamps} for {prev_frame_timestamp} to {frame_timestamp}"
+        else:
+            assert len(timestamps) == 9, f"Expected 9 IMU samples for last frame {frame_idx}, got {len(timestamps)}: {timestamps} for {prev_frame_timestamp} to {frame_timestamp}"
+
+        dts = imu_dts[mask]
+        lin_acc = acc[mask]
+        ang_vel = gyro[mask]
+        frame_vel_world = vel_global[mask][-1] # TODO: store whole batch of velocities? this should be closest to the camera right now?
         measurements.append(
             FrameImuMeasurements(
                 frame_timestamp=float(frame_timestamp),
                 timestamps=timestamps,
+                dts=dts,
                 linear_accelerations=lin_acc,
                 angular_velocities=ang_vel,
                 world_velocity=frame_vel_world,
-                body_velocity=frame_vel_body,
             )
         )
-        imu_idx = next_idx
 
-    if imu_idx != imu_time.size:
-        raise ValueError("Not all IMU samples were assigned to frames.")
+    assert len(measurements) == num_frames
+    print(f'Loaded {len(measurements)} IMU measurements')
 
     return measurements, cam_time
 
@@ -295,6 +359,7 @@ def _load_tartanair_sequence(env: str, difficulty: str, traj: str) -> TartanAirS
         imu_measurements, frame_timestamps = _load_tartanair_imu_measurements(
             imu_dir, len(left_paths)
         )
+        print('imu measurements loaded', len(imu_measurements))
 
     sequence = TartanAirSequence(
         left_paths=left_paths,
@@ -709,6 +774,58 @@ def get_kitti_calibration(sequence_id: str | int = "00") -> StereoCalibration:
 
 
 
+def _apply_sch16t_noise_to_measurements(
+    measurements: list[FrameImuMeasurements],
+    seed: int,
+    tau_bias: float,
+) -> list[FrameImuMeasurements]:
+    """
+    Clone IMU measurements while injecting SCH16T noise per timeseries.
+    """
+    if not measurements:
+        return []
+
+    rng = np.random.default_rng(seed)
+    seeds = rng.integers(0, np.iinfo(np.int32).max, size=len(measurements), dtype=np.int64)
+
+    noisy_measurements: list[FrameImuMeasurements] = []
+    for meas, meas_seed in zip(measurements, seeds):
+        timestamps = meas.timestamps.copy()
+        dts = meas.dts.copy()
+        omega_true = meas.angular_velocities
+        acc_true = meas.linear_accelerations
+
+        dt = 0.0
+        if timestamps.size >= 2:
+            dt = float(np.mean(np.diff(timestamps)))
+
+        if dt > 0.0:
+            omega_noisy, acc_noisy = add_sch16t_noise(
+                omega_true,
+                acc_true,
+                dt,
+                seed=int(meas_seed),
+                tau_bias=float(tau_bias),
+            )
+        else:
+            omega_noisy = omega_true.copy()
+            acc_noisy = acc_true.copy()
+
+        noisy_measurements.append(
+            FrameImuMeasurements(
+                frame_timestamp=meas.frame_timestamp,
+                timestamps=timestamps,
+                dts=dts,
+                linear_accelerations=acc_noisy,
+                angular_velocities=omega_noisy,
+                world_velocity=meas.world_velocity.copy(),
+                body_velocity=meas.body_velocity.copy(),
+            )
+        )
+
+    return noisy_measurements
+
+
 def load_tartanair_sequence_segment(
     env: str = "ArchVizTinyHouseDay",
     difficulty: str = "easy",
@@ -719,6 +836,9 @@ def load_tartanair_sequence_segment(
     min_stride: int = 1,
     max_stride: int | None = None,
     load_ground_truth_depth: bool = False,
+    add_imu_noise: bool = False,
+    imu_noise_seed: int = 0,
+    imu_noise_tau_bias: float = 500.0,
 ) -> FrameSequenceWithGroundTruth[StereoFrame]:
     """
     Sample a sequence of stereo frames with associated ground-truth poses.
@@ -735,6 +855,13 @@ def load_tartanair_sequence_segment(
         frames within the sequence. Defaults to 1 (contiguous sampling).
     load_ground_truth_depth:
         When True, load and return the dataset-provided left camera depth maps alongside the images.
+    add_imu_noise:
+        When True, inject SCH16T-style noise into the frame IMU data returned by this helper.
+        Has no effect if the sequence has no IMU data.
+    imu_noise_seed:
+        Base RNG seed used when sampling noise for each frame chunk.
+    imu_noise_tau_bias:
+        Bias correlation time (seconds) passed to the SCH16T noise model.
     """
 
     if sequence_length < 2:
@@ -792,6 +919,12 @@ def load_tartanair_sequence_segment(
         if sequence.imu_measurements is not None
         else None
     )
+    if imu_measurements is not None and add_imu_noise:
+        imu_measurements = _apply_sch16t_noise_to_measurements(
+            imu_measurements,
+            seed=imu_noise_seed,
+            tau_bias=imu_noise_tau_bias,
+        )
     frame_timestamps = (
         np.asarray(sequence.frame_timestamps, dtype=np.float64)
         if sequence.frame_timestamps is not None

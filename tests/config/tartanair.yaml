@@ -1,6 +1,6 @@
-env: ["AbandonedFactory"]
+env: ["ArchVizTinyHouseDay"]
 traj: ["P001"]
 difficulty: ["easy"]
-modality: ["image", "depth", "imu"]
+modality: ["imu"]
 camera_name: ["lcam_front", "rcam_front"]
 unzip: True

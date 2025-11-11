@@ -13,7 +13,7 @@ from registration.registration import (
     StereoDepthFrame,
 )
 from slam.matcher_factory import FeatureMatcher
-from util import share_feature_frame
+from cvx_utils import share_feature_frame
 
 
 @dataclass(slots=True)

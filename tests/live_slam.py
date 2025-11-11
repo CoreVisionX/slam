@@ -19,11 +19,12 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
-from registration.registration import StereoCalibration, StereoDepthFrame, StereoFrame
+from registration.registration import RectifiedStereoFrame, StereoCalibration, StereoDepthFrame, StereoFrame
+from depth.sgbm import SGBM
 from slam import SlamConfig, create_default_slam_system
 from slam.camera_utils import load_stereo_calibration_npz, split_wide_frame
 from slam.matcher_factory import MatcherType
-from slam.vision_odometry import OdometryEstimate, VisionOdometryEstimator
+from slam.vision_odometry import OdometryEstimate
 
 
 def parse_args() -> argparse.Namespace:
@@ -32,8 +33,8 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--calib", type=str, default="calib.npz", help="Path to calib.npz.")
     parser.add_argument("--camera", type=int, default=0, help="OpenCV camera index.")
-    parser.add_argument("--width", type=int, default=1280, help="Capture width for the stereo stream.")
-    parser.add_argument("--height", type=int, default=640, help="Capture height for the stereo stream.")
+    parser.add_argument("--width", type=int, default=None, help="Capture width for the stereo stream.")
+    parser.add_argument("--height", type=int, default=None, help="Capture height for the stereo stream.")
     parser.add_argument("--fps", type=int, default=None, help="Requested capture framerate.")
     parser.add_argument(
         "--split-mode",
@@ -61,19 +62,19 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--keyframe-translation",
         type=float,
-        default=0.2,
+        default=1.0,
         help="Translation threshold (meters) for creating a new keyframe.",
     )
     parser.add_argument(
         "--keyframe-rotation",
         type=float,
-        default=10.0,
+        default=20.0,
         help="Rotation threshold (degrees) for creating a new keyframe.",
     )
     parser.add_argument(
         "--loop-min-inliers",
         type=int,
-        default=30,
+        default=60,
         help="Minimum inliers required for accepting a loop closure.",
     )
     parser.add_argument(
@@ -137,13 +138,13 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--vo-min-inliers",
         type=int,
-        default=30,
+        default=60,
         help="Minimum PnP inliers required before accepting a visual odometry estimate.",
     )
     parser.add_argument(
         "--vo-failure-behavior",
         choices=("repeat", "identity"),
-        default="repeat",
+        default="identity",
         help="Fallback odometry to use when visual odometry fails. "
         "'repeat' reuses the last successful delta, 'identity' injects no motion.",
     )
@@ -182,8 +183,7 @@ def parse_args() -> argparse.Namespace:
 
 
 def open_camera(args: argparse.Namespace) -> cv2.VideoCapture:
-    backend = cv2.CAP_DSHOW if os.name == "nt" else 0
-    cap = cv2.VideoCapture(args.camera, backend)
+    cap = cv2.VideoCapture(args.camera)
     if args.width and args.height:
         cap.set(cv2.CAP_PROP_FRAME_WIDTH, args.width)
         cap.set(cv2.CAP_PROP_FRAME_HEIGHT, args.height)
@@ -232,6 +232,216 @@ def should_accept_vo(estimate: OdometryEstimate, args: argparse.Namespace) -> bo
     if estimate.inlier_count < args.vo_min_inliers:
         return False
     return True
+
+
+class OpticalFlowTracker:
+    """Simple stereo VO using LK optical flow + PnP on depth-backed tracks."""
+
+    def __init__(
+        self,
+        *, 
+        rectify_inputs: bool,
+        max_features: int = 1500,
+        feature_quality: float = 0.01,
+        feature_min_distance: int = 8,
+        min_track_count: int = 60,
+        min_pnp_points: int = 20,
+        pnp_reprojection_error: float = 2.0,
+        pnp_iterations: int = 200,
+    ) -> None:
+        self._rectify_inputs = rectify_inputs
+        self._depth_estimator = SGBM(num_disparities=16 * 4, block_size=5, image_color="RGB")
+        self._latest_depth_frame: StereoDepthFrame | None = None
+
+        self._prev_gray: np.ndarray | None = None
+        self._prev_pts: np.ndarray | None = None
+        self._prev_pts3d: np.ndarray | None = None
+
+        self._max_features = max_features
+        self._feature_quality = feature_quality
+        self._feature_min_distance = feature_min_distance
+        self._min_track_count = min_track_count
+        self._min_pnp_points = min_pnp_points
+        self._pnp_reprojection_error = pnp_reprojection_error
+        self._pnp_iterations = pnp_iterations
+
+    def prime(self, frame: StereoFrame) -> None:
+        depth_frame = self._compute_depth(frame)
+        gray = self._to_gray(depth_frame.left_rect)
+        self._refresh_tracks(gray, depth_frame)
+
+    def estimate(self, frame: StereoFrame) -> OdometryEstimate:
+        depth_frame = self._compute_depth(frame)
+        gray = self._to_gray(depth_frame.left_rect)
+        estimate = OdometryEstimate(pose=None, match_count=0, inlier_count=0, failure_reason=None)
+
+        if (
+            self._prev_gray is None
+            or self._prev_pts is None
+            or self._prev_pts3d is None
+            or len(self._prev_pts) < self._min_track_count
+        ):
+            self._refresh_tracks(gray, depth_frame)
+            estimate.failure_reason = "bootstrap"
+            return estimate
+
+        flow = cv2.calcOpticalFlowPyrLK(
+            self._prev_gray,
+            gray,
+            self._prev_pts,
+            None,
+            winSize=(21, 21),
+            maxLevel=3,
+            criteria=(cv2.TERM_CRITERIA_EPS | cv2.TERM_CRITERIA_COUNT, 30, 0.01),
+        )
+        if flow[0] is None or flow[1] is None:
+            self._refresh_tracks(gray, depth_frame)
+            estimate.failure_reason = "optical_flow_failed"
+            return estimate
+
+        next_pts, status = flow[0], flow[1]
+        status = status.reshape(-1)
+        good_mask = status == 1
+
+        if not np.any(good_mask):
+            self._refresh_tracks(gray, depth_frame)
+            estimate.failure_reason = "no_tracks"
+            return estimate
+
+        matched_prev2d = self._prev_pts[good_mask]
+        matched_prev3d = self._prev_pts3d[good_mask]
+        matched_curr2d = next_pts[good_mask]
+
+        match_count = int(matched_prev2d.shape[0])
+        pose: gtsam.Pose3 | None = None
+        inlier_count = 0
+        failure_reason: str | None = None
+
+        if match_count >= self._min_pnp_points:
+            obj_points, img_points = self._prepare_pnp_correspondences(matched_prev3d, matched_curr2d)
+            if obj_points.shape[0] >= self._min_pnp_points:
+                cam_matrix = depth_frame.calibration.K_left_rect
+                ret, rvec, tvec, inliers = cv2.solvePnPRansac(
+                    obj_points,
+                    img_points,
+                    cam_matrix,
+                    None,
+                    iterationsCount=self._pnp_iterations,
+                    reprojectionError=self._pnp_reprojection_error,
+                    confidence=0.999,
+                    flags=cv2.SOLVEPNP_ITERATIVE,
+                )
+                if ret and inliers is not None and len(inliers) >= self._min_pnp_points:
+                    R, _ = cv2.Rodrigues(rvec)
+                    t = tvec.reshape(3)
+                    pose = gtsam.Pose3(gtsam.Rot3(R), t).inverse()
+                    inlier_count = int(len(inliers))
+                else:
+                    failure_reason = "pnp_failed"
+            else:
+                failure_reason = "insufficient_obj_points"
+        else:
+            failure_reason = "insufficient_tracks"
+
+        self._refresh_tracks(gray, depth_frame)
+        return OdometryEstimate(
+            pose=pose,
+            match_count=match_count,
+            inlier_count=inlier_count,
+            failure_reason=failure_reason,
+        )
+
+    def _compute_depth(self, frame: StereoFrame) -> StereoDepthFrame:
+        rectified = self._rectify(frame) if self._rectify_inputs else self._ensure_rectified(frame)
+        depth_frame = self._depth_estimator.compute_depth(rectified)
+        self._latest_depth_frame = depth_frame
+        return depth_frame
+
+    def _rectify(self, frame: StereoFrame) -> RectifiedStereoFrame:
+        return frame.rectify()
+
+    def _ensure_rectified(self, frame: StereoFrame) -> RectifiedStereoFrame:
+        if isinstance(frame, RectifiedStereoFrame):
+            return frame
+        return RectifiedStereoFrame(
+            left=frame.left,
+            right=frame.right,
+            left_rect=frame.left,
+            right_rect=frame.right,
+            calibration=frame.calibration,
+        )
+
+    def _refresh_tracks(self, gray: np.ndarray, depth_frame: StereoDepthFrame) -> None:
+        pts2d, pts3d = self._sample_depth_tracks(gray, depth_frame)
+        self._prev_gray = gray
+        self._prev_pts = pts2d
+        self._prev_pts3d = pts3d
+
+    def _sample_depth_tracks(
+        self, gray: np.ndarray, depth_frame: StereoDepthFrame
+    ) -> tuple[np.ndarray | None, np.ndarray | None]:
+        valid_mask = np.isfinite(depth_frame.left_depth) & (depth_frame.left_depth > 0.0)
+        mask = np.where(valid_mask, 255, 0).astype(np.uint8)
+        features = cv2.goodFeaturesToTrack(
+            gray,
+            mask=mask,
+            maxCorners=self._max_features,
+            qualityLevel=self._feature_quality,
+            minDistance=self._feature_min_distance,
+            blockSize=7,
+        )
+        if features is None:
+            return None, None
+        return self._gather_depth_samples(features, depth_frame.left_depth_xyz)
+
+    @staticmethod
+    def _to_gray(image: np.ndarray) -> np.ndarray:
+        if image.ndim == 2:
+            return image
+        return cv2.cvtColor(image, cv2.COLOR_RGB2GRAY)
+
+    @staticmethod
+    def _gather_depth_samples(
+        points: np.ndarray, depth_xyz: np.ndarray
+    ) -> tuple[np.ndarray | None, np.ndarray | None]:
+        if points is None or len(points) == 0:
+            return None, None
+
+        h, w = depth_xyz.shape[:2]
+        pts2d: list[list[float]] = []
+        pts3d: list[list[float]] = []
+        for pt in points.reshape(-1, 2):
+            u = int(round(float(pt[0])))
+            v = int(round(float(pt[1])))
+            if u < 0 or u >= w or v < 0 or v >= h:
+                continue
+            xyz = depth_xyz[v, u]
+            if not np.all(np.isfinite(xyz)):
+                continue
+            pts2d.append([float(pt[0]), float(pt[1])])
+            pts3d.append(xyz.tolist())
+
+        if not pts2d:
+            return None, None
+
+        pts2d_arr = np.asarray(pts2d, dtype=np.float32).reshape(-1, 1, 2)
+        pts3d_arr = np.asarray(pts3d, dtype=np.float32)
+        return pts2d_arr, pts3d_arr
+
+    @staticmethod
+    def _prepare_pnp_correspondences(
+        prev_pts3d: np.ndarray, curr_pts2d: np.ndarray
+    ) -> tuple[np.ndarray, np.ndarray]:
+        obj_points = np.asarray(prev_pts3d, dtype=np.float32).reshape(-1, 3)
+        img_points = np.asarray(curr_pts2d, dtype=np.float32).reshape(-1, 1, 2)
+        finite_mask = np.all(np.isfinite(obj_points), axis=1)
+        obj_points = obj_points[finite_mask]
+        img_points = img_points[finite_mask]
+        return obj_points, img_points
+
+    @property
+    def latest_depth_frame(self) -> StereoDepthFrame | None:
+        return self._latest_depth_frame
 
 
 class LiveRerunStreamLogger:
@@ -326,7 +536,7 @@ def main() -> None:
         calibration_matrix=calibration.K_left_rect,
         config=config,
     )
-    vision_odometry = VisionOdometryEstimator(matcher_type, rectify_inputs=args.vo_rectify_inputs)
+    vo_tracker = OpticalFlowTracker(rectify_inputs=args.vo_rectify_inputs)
     stream_logger = None
     if not args.disable_rerun:
         stream_logger = LiveRerunStreamLogger(calibration)
@@ -357,10 +567,10 @@ def main() -> None:
             vo_estimate: OdometryEstimate | None = None
 
             if first_frame:
-                vision_odometry.prime(frame)
+                vo_tracker.prime(frame)
                 first_frame = False
             else:
-                vo_estimate = vision_odometry.estimate(frame)
+                vo_estimate = vo_tracker.estimate(frame)
                 if should_accept_vo(vo_estimate, args):
                     odometry_input = vo_estimate.pose
                     last_good_odometry = vo_estimate.pose
@@ -389,7 +599,7 @@ def main() -> None:
             last_snapshot = result.performance
 
             if stream_logger is not None:
-                stream_logger.log_frame(result.frame_index, vision_odometry.latest_depth_frame)
+                stream_logger.log_frame(result.frame_index, vo_tracker.latest_depth_frame)
                 stream_logger.log_pose(result.frame_index, result.latest_pose)
 
             if (

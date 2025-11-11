@@ -118,7 +118,11 @@ class SGBM:
 
     @staticmethod
     def _reproject(disparity: np.ndarray, Q: np.ndarray, max_depth: float) -> tuple[np.ndarray, np.ndarray]:
-        depth_xyz = cv2.reprojectImageTo3D(disparity, Q)
+        if disparity.dtype != np.float32:
+            disparity = disparity.astype(np.float32, copy=False)
+        disparity = np.ascontiguousarray(np.nan_to_num(disparity, nan=0.0, posinf=0.0, neginf=0.0))
+        Q_mat = np.ascontiguousarray(np.asarray(Q, dtype=np.float64))
+        depth_xyz = cv2.reprojectImageTo3D(disparity, Q_mat)
         depth = depth_xyz[:, :, 2].astype(np.float32, copy=False)
         depth[~np.isfinite(depth)] = np.nan
         depth[np.abs(depth) > max_depth] = np.nan
