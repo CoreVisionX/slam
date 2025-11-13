@@ -10,19 +10,12 @@ from gtsam.symbol_shorthand import L, X, V, B
 import matplotlib.pyplot as plt
 import numpy as np
 import torch
-
-try:
-    import rerun as rr
-except ImportError:
-    rr = None
-
-try:
-    from viz import rr_log_pose, rr_log_trajectory
-except ImportError:
-    rr_log_pose = None
-    rr_log_trajectory = None
+import tartanair as ta
+import rerun as rr
 
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
+from viz import rr_log_pose, rr_log_trajectory
 
 from depth.sgbm import SGBM  # noqa: E402
 from registration.registration import (  # noqa: E402
@@ -44,14 +37,14 @@ import tests.test_utils as test_utils  # noqa: E402
 # Configuration
 # ----------------------------------------------------------------------
 NUM_SEQUENCE_SAMPLES = 1
-SEQUENCE_LENGTH = 25
-ENVIRONMENT = "ArchVizTinyHouseDay"
-DIFFICULTY = "easy"
-TRAJECTORY = "P002"
+SEQUENCE_LENGTH = 800
+ENVIRONMENT = "Hospital"
+DIFFICULTY = "diff"
+TRAJECTORY = "P1000"
 SAMPLING_MODE = "stride"
 MIN_STRIDE = 1
 MAX_STRIDE = 1
-BASE_SEED = 10
+BASE_SEED = 11
 
 USE_IMU_FACTORS = True
 DEPTH_MODE = os.environ.get("LOCAL_VO_DEPTH_MODE", "sgbm").strip().lower()
@@ -74,15 +67,15 @@ LK_CRITERIA = (cv2.TERM_CRITERIA_EPS | cv2.TERM_CRITERIA_COUNT, 40, 0.01)
 LK_MIN_EIG_THRESHOLD = 1e-3
 
 MIN_MATCHES_FOR_PNP = 6
-MAX_DEPTH = 40.0
+MAX_DEPTH = 30.0
 
 # Bundle adjustment
-MIN_OBSERVATIONS_PER_LANDMARK = 8
+MIN_OBSERVATIONS_PER_LANDMARK = 12
 MIN_OBSERVATIONS_PER_FRAME = 5
 PROJECTION_NOISE_PX = 1.0
-DISPARITY_NOISE_PX = 0.4
+DISPARITY_NOISE_PX = 2.5 # scale based on distance?
 PROJECTION_NOISE_HUBER = True
-REPROJECTION_GATING_THRESHOLD_PX = 1.5
+REPROJECTION_GATING_THRESHOLD_PX = 1.0
 USE_INLIER_OBSERVATIONS_ONLY = False
 POSE_PRIOR_SIGMAS = np.array(
     [
@@ -101,18 +94,19 @@ IMU_GRAVITY_MAGNITUDE = 9.80665
 # IMU_GYRO_NOISE = np.deg2rad(0.0006)
 # IMU_INTEGRATION_NOISE = 5e-4
 # IMU_VELOCITY_PRIOR_SIGMA = 0.1
-# IMU_BIAS_PRIOR_SIGMAS = np.array(
-#     [
-#         1.5e-3,
-#         1.5e-3,
-#         1.5e-3,
-#         1.0e-5,
-#         1.0e-5,
-#         1.0e-5,
-#     ],
-#     dtype=float,
-# )
-IMU_BIAS_PRIOR_SIGMAS = np.array([0.02, 0.02, 0.02, 0.001, 0.001, 0.001], dtype=float)
+IMU_BIAS_PRIOR_SIGMAS = np.array(
+    [
+        1.5e-3,
+        1.5e-3,
+        1.5e-3,
+        1.0e-5,
+        1.0e-5,
+        1.0e-5,
+    ],
+    dtype=float,
+)
+# * 0.001 # imu should be perfect
+# IMU_BIAS_PRIOR_SIGMAS = np.array([0.02, 0.02, 0.02, 0.001, 0.001, 0.001], dtype=float)
 # IMU_ACCEL_NOISE = 0.04
 # IMU_GYRO_NOISE = 1e-3
 # IMU_INTEGRATION_NOISE = 5e-0
@@ -120,10 +114,11 @@ IMU_ACCEL_NOISE = 2.0e-3
 IMU_GYRO_NOISE = 1.7e-4
 # IMU_ACCEL_NOISE = 1.0e-3
 # IMU_GYRO_NOISE = 8.5e-5
-IMU_INTEGRATION_NOISE = 1e-3
+IMU_INTEGRATION_NOISE = 5e-4
 IMU_VELOCITY_PRIOR_SIGMA = 0.1
 # IMU_BIAS_PRIOR_SIGMAS = np.array([0.01, 0.01, 0.01, 0.01, 0.01, 0.01], dtype=float) * 100.0
 
+# IMU_GRAVITY_VECTOR = np.array([0.0, 0.0, IMU_GRAVITY_MAGNITUDE], dtype=float)
 IMU_GRAVITY_VECTOR = np.array([0.0, IMU_GRAVITY_MAGNITUDE, 0.0], dtype=float)
 
 RESULTS_DIR = Path(__file__).parent / "results"
@@ -147,7 +142,7 @@ def _env_flag(key: str, default: bool) -> bool:
     return raw.strip().lower() not in _FALSE_ENV_VALUES
 
 
-ENABLE_RERUN = _env_flag("LOCAL_VO_RERUN", True)
+ENABLE_RERUN = _env_flag("LOCAL_VO_RERUN", False)
 RERUN_APP_ID = os.environ.get("LOCAL_VO_RERUN_APP_ID", "local_vo_bundle_adjustment")
 RERUN_TCP_ADDRESS = os.environ.get("LOCAL_VO_RERUN_TCP")
 RERUN_SPAWN_VIEWER = _env_flag("LOCAL_VO_RERUN_SPAWN", True)
@@ -455,7 +450,7 @@ def build_ground_truth_depth_frames(
 
 
 def create_preintegration_params() -> gtsam.PreintegrationParams:
-    params = gtsam.PreintegrationParams.MakeSharedU(IMU_GRAVITY_MAGNITUDE)
+    params = gtsam.PreintegrationCombinedParams.MakeSharedU(IMU_GRAVITY_MAGNITUDE)
     params.n_gravity = IMU_GRAVITY_VECTOR
     params.setAccelerometerCovariance(np.eye(3) * (IMU_ACCEL_NOISE ** 2))
     params.setGyroscopeCovariance(np.eye(3) * (IMU_GYRO_NOISE ** 2))
@@ -1116,8 +1111,8 @@ def select_frames_for_ba(
 
 
 def build_calibration(frame: RectifiedStereoFrame) -> gtsam.Cal3_S2:
-    # K = frame.calibration.K_left_rect
-    K = frame.calibration.K_left
+    K = frame.calibration.K_left_rect
+    # K = frame.calibration.K_left
     fx = float(K[0, 0])
     fy = float(K[1, 1])
     skew = float(K[0, 1])
@@ -1128,8 +1123,8 @@ def build_calibration(frame: RectifiedStereoFrame) -> gtsam.Cal3_S2:
 
 def build_stereo_calibration(frame: RectifiedStereoFrame) -> gtsam.Cal3_S2Stereo:
     calib = frame.calibration
-    # K = calib.K_left_rect
-    K = calib.K_left
+    K = calib.K_left_rect
+    # K = calib.K_left
     fx = float(K[0, 0])
     fy = float(K[1, 1])
     skew = float(K[0, 1])
@@ -1222,9 +1217,9 @@ def run_bundle_adjustment(
     imu_params.n_gravity = IMU_GRAVITY_VECTOR
     imu_params.setAccelerometerCovariance(np.eye(3) * (IMU_ACCEL_NOISE**2))     # e.g. 2e-3^2
     imu_params.setGyroscopeCovariance(np.eye(3) * (IMU_GYRO_NOISE**2))      # e.g. 1.7e-4^2
-    imu_params.setIntegrationCovariance(np.eye(3) * 1e-6)                     # not ~0
-    imu_params.setBiasAccCovariance(np.eye(3) * (3e-3**2))                # RW densities
-    imu_params.setBiasOmegaCovariance(np.eye(3) * (2e-5**2))
+    imu_params.setIntegrationCovariance(np.eye(3) * (IMU_INTEGRATION_NOISE**2))                     # not ~0
+    imu_params.setBiasAccCovariance(np.eye(3) * (IMU_BIAS_PRIOR_SIGMAS[0]**2))                # RW densities
+    imu_params.setBiasOmegaCovariance(np.eye(3) * (IMU_BIAS_PRIOR_SIGMAS[3]**2))
 
 
     imu_bias_key = None
@@ -1239,38 +1234,38 @@ def run_bundle_adjustment(
         if not values.exists(imu_bias_key):
             values.insert(imu_bias_key, imu_bias_initial)
 
-        # TODO: don't use gt velocities for initialization
-        for frame_idx in frames_for_ba:
-            vel = (
-                sequence_velocities[frame_idx]
-            )
-            values.insert(V(frame_idx), vel)
-        first_velocity = (
-            sequence_velocities[frames_for_ba[0]]
-        )
-        graph.add(gtsam.PriorFactorVector(V(frames_for_ba[0]), first_velocity, velocity_prior_noise))
-        # graph.add(gtsam.PriorFactorConstantBias(imu_bias_key, imu_bias_initial, bias_prior_noise))
-
-        # # only use gt for first velocity
-        # first_velocity = sequence_velocities[frames_for_ba[0]]
-        # values.insert(V(frames_for_ba[0]), first_velocity)
+        # # TODO: don't use gt velocities for initialization
+        # for frame_idx in frames_for_ba:
+        #     vel = (
+        #         sequence_velocities[frame_idx]
+        #     )
+        #     values.insert(V(frame_idx), vel)
+        # first_velocity = (
+        #     sequence_velocities[frames_for_ba[0]]
+        # )
         # graph.add(gtsam.PriorFactorVector(V(frames_for_ba[0]), first_velocity, velocity_prior_noise))
         # graph.add(gtsam.PriorFactorConstantBias(imu_bias_key, imu_bias_initial, bias_prior_noise))
 
-        # # initialize the rest of the velocities by differeniating the poses
-        # for prev_frame, next_frame in zip(frames_for_ba[:-1], frames_for_ba[1:]):
-        #     assert next_frame > prev_frame
+        # only use gt for first velocity
+        first_velocity = sequence_velocities[frames_for_ba[0]]
+        values.insert(V(frames_for_ba[0]), first_velocity)
+        graph.add(gtsam.PriorFactorVector(V(frames_for_ba[0]), first_velocity, velocity_prior_noise))
+        # graph.add(gtsam.PriorFactorConstantBias(imu_bias_key, imu_bias_initial, bias_prior_noise))
 
-        #     prev_pose = values.atPose3(X(prev_frame))
-        #     next_pose = values.atPose3(X(next_frame))
+        # initialize the rest of the velocities by differeniating the poses
+        for prev_frame, next_frame in zip(frames_for_ba[:-1], frames_for_ba[1:]):
+            assert next_frame > prev_frame
 
-        #     prev_ts = sequence_sample.frame_timestamps[prev_frame]
-        #     next_ts = sequence_sample.frame_timestamps[next_frame]
-        #     dt = next_ts - prev_ts
-        #     assert dt > 0.0 and np.isfinite(dt)
+            prev_pose = values.atPose3(X(prev_frame))
+            next_pose = values.atPose3(X(next_frame))
 
-        #     velocity = (next_pose.translation() - prev_pose.translation()) / dt
-        #     values.insert(V(next_frame), velocity)
+            prev_ts = sequence_sample.frame_timestamps[prev_frame]
+            next_ts = sequence_sample.frame_timestamps[next_frame]
+            dt = next_ts - prev_ts
+            assert dt > 0.0 and np.isfinite(dt)
+
+            velocity = (next_pose.translation() - prev_pose.translation()) / dt
+            values.insert(V(next_frame), velocity)
         
         # # add a prior for the bias
         # graph.add(gtsam.PriorFactorConstantBias(imu_bias_key, imu_bias_initial, bias_prior_noise))
@@ -1282,14 +1277,17 @@ def run_bundle_adjustment(
         B(frames_for_ba[0]),
         gtsam.imuBias.ConstantBias(),
         gtsam.noiseModel.Diagonal.Sigmas(
-            np.array([0.02,0.02,0.02, 0.001,0.001,0.001], float))))
+            IMU_BIAS_PRIOR_SIGMAS)))
 
         for k in frames_for_ba:
             if not values.exists(B(k)):
                 values.insert(B(k), gtsam.imuBias.ConstantBias())
+            #     if k != frames_for_ba[0]:
+            #         graph.add(gtsam.PriorFactorConstantBias(B(k), gtsam.imuBias.ConstantBias(), gtsam.noiseModel.Diagonal.Sigmas(
+            # IMU_BIAS_PRIOR_SIGMAS)))
 
         for prev_frame, next_frame in zip(frames_for_ba[:-1], frames_for_ba[1:]):
-            print(f'Adding imu factor for {prev_frame} and {next_frame}')
+            # print(f'Adding imu factor for {prev_frame} and {next_frame}')
             assert next_frame == prev_frame + 1
 
             # pim = gtsam.PreintegratedImuMeasurements(imu_params, imu_bias_initial)
@@ -1408,6 +1406,14 @@ def run_bundle_adjustment(
         values.insert(L(landmark_key), world_point)
         initial_landmarks.append(world_point_np)
 
+        # # add prior to enforce pseduo motion only BA
+        # ma_factor = gtsam.PriorFactorPoint3(
+        #     L(landmark_key),
+        #     world_point,
+        #     gtsam.noiseModel.Diagonal.Sigmas(np.array([1.0, 1.0, 1.0], dtype=float) * 0.00001),
+        # )
+        # graph.add(ma_factor)
+
         for frame_idx, observation in observation_frames:
             measurement_vec = np.asarray(observation.keypoint, dtype=np.float64)
             if frame_idx == track.anchor_frame:
@@ -1434,8 +1440,8 @@ def run_bundle_adjustment(
                 stereo_counts[frame_idx] += 1
             else:
                 depth_value = float(observation.depth)
-                if False:
-                # if np.isfinite(depth_value) and depth_value > 0.0:
+                # if False:
+                if np.isfinite(depth_value) and depth_value > 0.0:
                     fx = stereo_calibration.fx()
                     baseline = stereo_calibration.baseline()
                     disparity = (fx * baseline) / depth_value
@@ -1543,15 +1549,27 @@ def run_bundle_adjustment(
     }
 
 
+# is this right?? I just want percent error over WHOLE trajectory, not average cummulative error? maybe that means I should just look at the end of the graph or at the dots? idk
+# I want to calculate rmse over whole trajectory basically
 def compute_pose_errors_against_ground_truth(
     optimized_pose_dict: dict[int, gtsam.Pose3],
     sequence_sample: test_utils.FrameSequenceWithGroundTruth,  # type: ignore[type-arg]
 ) -> dict[int, dict[str, np.ndarray]]:
+    gt_distance = 0.0
+    prev_pose = None
     errors: dict[int, dict[str, np.ndarray]] = {}
     for frame_idx, pose in optimized_pose_dict.items():
         gt_pose = gtsam.Pose3(gtsam.Rot3.Identity(), sequence_sample.world_poses[0].translation()).inverse() * sequence_sample.world_poses[frame_idx]
         gt_translation = to_numpy_vec3(gt_pose.translation())
-        gt_distance = float(np.linalg.norm(gt_translation))
+
+        # gt_distance = float(np.linalg.norm(gt_translation))
+        if prev_pose is None:
+            prev_pose = pose
+            gt_distance = float(np.linalg.norm(gt_translation)) # is this starting at the origin correctly so this will be valid?
+        else:
+            gt_distance += float(np.linalg.norm(gt_translation - prev_pose.translation()))
+            prev_pose = pose
+
         error = gt_pose.between(pose)
         trans, rot = pose_error_components(error)
         translation_norm = float(np.linalg.norm(trans))
@@ -1569,18 +1587,54 @@ def compute_pose_errors_against_ground_truth(
     return errors
 
 
+# def distance_percentage_series(
+#     pose_errors: dict[int, dict[str, np.ndarray]],
+# ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+#     distances: list[float] = []
+#     translations: list[np.ndarray] = []
+#     percentages: list[float] = []
+#     for frame_idx in sorted(pose_errors):
+#         info = pose_errors[frame_idx]
+#         trans = info.get("translation", np.nan)
+#         pct = float(info.get("translation_error_pct", np.nan))
+#         dist = float(info.get("ground_truth_distance", np.nan))
+#         if not np.isfinite(pct) or not np.isfinite(dist):
+#             continue
+#         distances.append(dist)
+#         translations.append(trans)
+#         percentages.append(pct)
+
+#     if not distances:
+#         empty = np.asarray([], dtype=np.float64)
+#         return empty, empty, empty
+
+#     distances_arr = np.asarray(distances, dtype=np.float64)
+#     percentages_arr = np.asarray(percentages, dtype=np.float64)
+#     translations_arr = np.asarray(translations, dtype=np.float64)
+#     order = np.argsort(distances_arr)
+#     distances_sorted = distances_arr[order]
+#     percentages_sorted = percentages_arr[order]
+#     translations_sorted = translations_arr[order]
+#     cumulative_mean = np.cumsum(percentages_sorted) / np.arange(1, percentages_sorted.size + 1, dtype=np.float64)
+
+#     return distances_sorted, percentages_sorted, cumulative_mean
+
 def distance_percentage_series(
     pose_errors: dict[int, dict[str, np.ndarray]],
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     distances: list[float] = []
+    translations: list[np.ndarray] = []
     percentages: list[float] = []
+
     for frame_idx in sorted(pose_errors):
         info = pose_errors[frame_idx]
+        trans = info.get("translation", np.nan)
         pct = float(info.get("translation_error_pct", np.nan))
         dist = float(info.get("ground_truth_distance", np.nan))
-        if not np.isfinite(pct) or not np.isfinite(dist):
+        if not np.isfinite(dist) or not np.isfinite(pct):
             continue
         distances.append(dist)
+        translations.append(trans)
         percentages.append(pct)
 
     if not distances:
@@ -1588,11 +1642,29 @@ def distance_percentage_series(
         return empty, empty, empty
 
     distances_arr = np.asarray(distances, dtype=np.float64)
+    translations_arr = np.asarray(translations, dtype=np.float64)  # shape (N, 3)
     percentages_arr = np.asarray(percentages, dtype=np.float64)
+
+    # Sort by ground-truth distance
     order = np.argsort(distances_arr)
     distances_sorted = distances_arr[order]
+    translations_sorted = translations_arr[order]
     percentages_sorted = percentages_arr[order]
-    cumulative_mean = np.cumsum(percentages_sorted) / np.arange(1, percentages_sorted.size + 1, dtype=np.float64)
+
+    # Per-frame translation norm
+    trans_norms = np.linalg.norm(translations_sorted, axis=1)  # (N,)
+
+    # Cumulative RMSE of translation error up to each point
+    sq_err = trans_norms ** 2
+    cum_sq_err = np.cumsum(sq_err)
+    counts = np.arange(1, len(trans_norms) + 1, dtype=np.float64)
+    rmse = np.sqrt(cum_sq_err / counts)  # (N,)
+
+    # Cumulative "percent drift" = RMSE / total distance so far
+    cumulative_mean = np.full_like(rmse, np.nan)
+    valid = distances_sorted > 1e-9
+    cumulative_mean[valid] = (rmse[valid] / distances_sorted[valid]) * 100.0
+
     return distances_sorted, percentages_sorted, cumulative_mean
 
 
@@ -1718,15 +1790,12 @@ def plot_match_debug(
 
 def plot_imu_measurements(sequence_sample: test_utils.FrameSequenceWithGroundTruth, title: str | None = None) -> None:
     imu_batches = sequence_sample.imu_measurements
-    print('imu batches: ', len(imu_batches))
-    print('imu batches: ', imu_batches[0])
 
     timestamps_list: list[np.ndarray] = []
     accelerations: list[np.ndarray] = []
     gyroscopes: list[np.ndarray] = []
 
     for batch in imu_batches:
-        print('batch: ', batch.timestamps)
         if batch.timestamps.size == 0:
             continue
         timestamps_list.append(batch.timestamps)
@@ -1746,7 +1815,7 @@ def plot_imu_measurements(sequence_sample: test_utils.FrameSequenceWithGroundTru
     times = times - base_time
 
     component_labels = ["X", "Y", "Z"]
-    fig, axes = plt.subplots(2, 1, figsize=(10, 8), sharex=True)
+    fig, axes = plt.subplots(3, 1, figsize=(10, 12))
     fig.suptitle(title or "IMU measurements", fontsize=14)
 
     for idx in range(3):
@@ -1762,8 +1831,54 @@ def plot_imu_measurements(sequence_sample: test_utils.FrameSequenceWithGroundTru
     axes[1].legend()
     axes[1].grid(True, linestyle="--", alpha=0.5)
 
+    ypr_axis = axes[2]
+    frame_times = np.array([batch.frame_timestamp for batch in imu_batches], dtype=np.float64)
+    frame_times = frame_times - float(frame_times[0])
+    ypr_axis.set_xlabel("Time (s)")
+    ypr_axis.set_ylabel("Angle (deg)")
+    ypr_axis.set_title("Orientation (Y/P/R)")
+
+    inertial_poses: list[gtsam.Pose3] | None = None
+    inertial_poses = integrate_inertial_trajectory(sequence_sample)
+
+    if inertial_poses:
+        gt_ypr = np.array(
+            [np.asarray(pose.rotation().ypr(), dtype=np.float64) for pose in sequence_sample.world_poses],
+            dtype=np.float64,
+        )
+        imu_ypr = np.array(
+            [np.asarray(pose.rotation().ypr(), dtype=np.float64) for pose in inertial_poses],
+            dtype=np.float64,
+        )
+        count = min(frame_times.shape[0], gt_ypr.shape[0], imu_ypr.shape[0])
+        frame_times_plot = frame_times[:count]
+        gt_ypr_deg = np.rad2deg(gt_ypr[:count])
+        imu_ypr_deg = np.rad2deg(imu_ypr[:count])
+        ypr_labels = ["Yaw", "Pitch", "Roll"]
+        colors = ["tab:blue", "tab:orange", "tab:green"]
+
+        for idx, label in enumerate(ypr_labels):
+            color = colors[idx % len(colors)]
+            ypr_axis.plot(frame_times_plot, gt_ypr_deg[:, idx], color=color, linestyle="-", label=f"GT {label}")
+            ypr_axis.plot(frame_times_plot, imu_ypr_deg[:, idx], color=color, linestyle="--", label=f"IMU {label}")
+        ypr_axis.legend(ncol=2)
+    else:
+        ypr_axis.text(
+            0.5,
+            0.5,
+            "IMU integration unavailable",
+            transform=ypr_axis.transAxes,
+            ha="center",
+            va="center",
+        )
+    ypr_axis.grid(True, linestyle="--", alpha=0.5)
+
     plt.tight_layout(rect=[0, 0.03, 1, 0.95])
     plt.show()
+
+    mean_ypr_end_error = np.mean(np.abs(imu_ypr_deg[-1] - gt_ypr_deg[-1]))
+    mean_ypr_error_per_sec = mean_ypr_end_error / (frame_times[-1] - frame_times[0])
+    print(f"Mean YPR end error: {mean_ypr_end_error:.3f} deg ({mean_ypr_error_per_sec * 3600:.3f} deg/hr)")
 
 
 def log_imu_bias_values(
@@ -2048,6 +2163,13 @@ def plot_translation_error_percentages(
             label=f"{label} cumulative mean",
         )
 
+        # plt.plot(
+        #     distances,
+        #     per_frame_pct,
+        #     linewidth=2,
+        #     label=f"{label} per-frame",
+        # )
+
     plt.xlabel("Ground-truth distance (m)")
     plt.ylabel("Translation error (% of distance)")
     plt.title("Translation error percentage vs distance")
@@ -2203,8 +2325,13 @@ for sample_idx in range(NUM_SEQUENCE_SAMPLES):
         min_stride=MIN_STRIDE,
         max_stride=MAX_STRIDE,
         load_ground_truth_depth=USE_GROUND_TRUTH_DEPTH,
-        add_imu_noise=False
+        add_imu_noise=True
     )
+    # sequence = test_utils.load_euroc_sequence_segment(
+    #     seq_name="MH_01_easy",
+    #     sequence_length=SEQUENCE_LENGTH,
+    #     seed=seed,
+    # )
     plot_imu_measurements(sequence, title=f"IMU data (sample {sample_idx})")
     inertial_poses = integrate_inertial_trajectory(sequence)
 
@@ -2280,22 +2407,28 @@ for sample_idx in range(NUM_SEQUENCE_SAMPLES):
         print(
             f"  Reprojection RMS: {result['rms_before']:.3f} px -> {result['rms_after']:.3f} px"
         )
-        print(
-            "  Translation error norms (m):",
-            np.array2string(np.asarray(result["optimized_translation_norms"]), precision=3),
-        )
-        print(
-            "  Rotation error norms (deg):",
-            np.array2string(np.asarray(result["optimized_rotation_norms_deg"]), precision=2),
-        )
+        # print(
+        #     "  Translation error norms (m):",
+        #     np.array2string(np.asarray(result["optimized_translation_norms"]), precision=3),
+        # )
+        # print(
+        #     "  Rotation error norms (deg):",
+        #     np.array2string(np.asarray(result["optimized_rotation_norms_deg"]), precision=2),
+        # )
         print(f"Stereo Factors: {sum(result_ba['stereo_counts'].values())}")
         print(f"Mono Factors: {sum(result_ba['mono_counts'].values())}")
         dist_pf, pct_pf, pct_cum = distance_percentage_series(result["pose_errors"])
         if dist_pf.size:
-            print("  Translation error as % of distance:")
+            # print("  Translation error as % of distance:")
             print("    Distances (m):", np.array2string(dist_pf, precision=2))
-            print("    Per-frame (%):", np.array2string(pct_pf, precision=2))
-            print("    Cumulative mean (%):", np.array2string(pct_cum, precision=2))
+            # print("    Per-frame (%):", np.array2string(pct_pf, precision=2))
+            # print("    Cumulative mean (%):", np.array2string(pct_cum, precision=2))
+
+        total_distance = result["pose_errors"][sorted(result["pose_errors"])[-1]]["ground_truth_distance"]
+        translation_errors = np.asarray([result["pose_errors"][idx]["translation_norm"] for idx in sorted(result["pose_errors"])])
+        print(f"Total distance travelled ({result['label']}): {np.sum(translation_errors):.2f} m")
+        print(f"RMSE ({result['label']}): {np.sqrt(np.mean(translation_errors ** 2)):.2f} m")
+        print(f"% RMSE per meter travelled ({result['label']}): {(np.sqrt(np.mean(translation_errors ** 2)) / total_distance) * 100:.2f}")
 
         if result["ba_result_no_imu"] is not None:
             result_no_imu = result["ba_result_no_imu"]
@@ -2305,26 +2438,32 @@ for sample_idx in range(NUM_SEQUENCE_SAMPLES):
             print(f"  Frames optimised: {result_no_imu['frames_for_ba']}")
             print(f"  Landmarks optimised: {len(result_no_imu['landmark_original_indices'])}")
             print(f"  Reprojection RMS: {rms_before_no_imu:.3f} px -> {rms_after_no_imu:.3f} px")
-            print(
-                "  Translation error norms (m):",
-                np.array2string(np.asarray(result["optimized_translation_norms_no_imu"]), precision=3),
-            )
-            print(
-                "  Rotation error norms (deg):",
-                np.array2string(np.asarray(result["optimized_rotation_norms_deg_no_imu"]), precision=2),
-            )
+            # print(
+            #     "  Translation error norms (m):",
+            #     np.array2string(np.asarray(result["optimized_translation_norms_no_imu"]), precision=3),
+            # )
+            # print(
+            #     "  Rotation error norms (deg):",
+            #     np.array2string(np.asarray(result["optimized_rotation_norms_deg_no_imu"]), precision=2),
+            # )
             print(f"Stereo Factors: {sum(result_no_imu['stereo_counts'].values())}")
             print(f"Mono Factors: {sum(result_no_imu['mono_counts'].values())}")
             dist_no_imu, pct_no_imu, pct_no_imu_cum = distance_percentage_series(result["pose_errors_no_imu"])
-            if dist_no_imu.size:
-                print("  Translation error as % of distance (vision only):")
-                print("    Distances (m):", np.array2string(dist_no_imu, precision=2))
-                print("    Per-frame (%):", np.array2string(pct_no_imu, precision=2))
-                print("    Cumulative mean (%):", np.array2string(pct_no_imu_cum, precision=2))
+            # if dist_no_imu.size:
+            #     print("  Translation error as % of distance (vision only):")
+            #     print("    Distances (m):", np.array2string(dist_no_imu, precision=2))
+            #     print("    Per-frame (%):", np.array2string(pct_no_imu, precision=2))
+            #     print("    Cumulative mean (%):", np.array2string(pct_no_imu_cum, precision=2))
+                
+            total_distance = result["pose_errors_no_imu"][sorted(result["pose_errors_no_imu"])[-1]]["ground_truth_distance"]
+            translation_errors = np.asarray([result["pose_errors_no_imu"][idx]["translation_norm"] for idx in sorted(result["pose_errors_no_imu"])])
+            print(f"Total distance travelled (vision only): {np.sum(translation_errors):.2f} m")
+            print(f"RMSE (vision only): {np.sqrt(np.mean(translation_errors ** 2)):.2f} m")
+            print(f"% RMSE per meter travelled (vision only): {(np.sqrt(np.mean(translation_errors ** 2)) / total_distance) * 100:.2f}")
 
-    plot_feature_tracks(rectified_frames, track_history, tracks)
+    # plot_feature_tracks(rectified_frames, track_history, tracks)
     plot_track_length_histogram(tracks)
-    plot_match_debug(rectified_frames, sequence_results)
+    # plot_match_debug(rectified_frames, sequence_results)
 
     additional_pose_dicts = None
     additional_initial_pose_dicts = None
@@ -2364,6 +2503,7 @@ for sample_idx in range(NUM_SEQUENCE_SAMPLES):
         ba_result["reprojection_after"],
     )
     percentage_plot_series: list[tuple[str, np.ndarray, np.ndarray, np.ndarray]] = []
+    err_xyzs = []
     for result in variant_results:
         dist_pf, pct_pf, pct_cum = distance_percentage_series(result["pose_errors"])
         if dist_pf.size:
@@ -2374,7 +2514,85 @@ for sample_idx in range(NUM_SEQUENCE_SAMPLES):
             dist_no, pct_no, pct_no_cum = distance_percentage_series(pose_errors_no_imu)
             if dist_no.size:
                 percentage_plot_series.append((f"{result['label']} (no IMU)", dist_no, pct_no, pct_no_cum))
+
+        # total_distance = pose_errors_no_imu[sorted(pose_errors_no_imu)[-1]]["ground_truth_distance"]
+        # translation_errors = np.asarray([pose_errors_no_imu[idx]["translation_norm"] for idx in sorted(pose_errors_no_imu)])
+        # print(f"Total distance travelled ({result['label']}): {np.sum(translation_errors):.2f} m")
+        # print(f"RMSE ({result['label']}): {np.sqrt(np.mean(translation_errors ** 2)):.2f} m")
+        # print(f"RMSE per meter travelled ({result['label']}): {(np.sqrt(np.mean(translation_errors ** 2)) / total_distance):.3f}")
+
+        # Pass the ground truth trajectory directly to the evaluation function.
+        est_traj_xyz = np.asarray([result["optimized_pose_dict"][idx].translation() for idx in sorted(result["optimized_pose_dict"])])
+        est_traj_quat = [result["optimized_pose_dict"][idx].rotation().toQuaternion() for idx in sorted(result["optimized_pose_dict"])]
+        est_traj_qxqyqzqw = np.asarray([[quat.w(), quat.x(), quat.y(), quat.z()] for quat in est_traj_quat])
+        est_traj = np.concatenate([est_traj_xyz, est_traj_qxqyqzqw], axis=1)
+
+        gt_traj_xyz = np.asarray([sequence.world_poses[idx].translation() for idx in range(len(sequence.world_poses))])
+        gt_traj_quat = [sequence.world_poses[idx].rotation().toQuaternion() for idx in range(len(sequence.world_poses))]
+        gt_traj_qxqyqzqw = np.asarray([[quat.w(), quat.x(), quat.y(), quat.z()] for quat in gt_traj_quat])
+        gt_traj = np.concatenate([gt_traj_xyz, gt_traj_qxqyqzqw], axis=1)
+
+        ta_results = ta.evaluate_traj(est_traj,
+                                gt_traj = gt_traj,
+                                enforce_length = True,
+                                plot = True,
+                                plot_out_path = f"ta_results_{result['label']}.png",
+                                do_scale = False,
+                                do_align = True)
+        for key, value in ta_results.items():
+            print(f"{key}: {value}")
+        
+        ate = ta_results["ate"]
+        est_traj_aligned = ta_results["est_traj"]
+        est_traj_aligned_xyz = est_traj_aligned[:, :3]
+        gt_traj = ta_results["gt_traj"]
+        gt_traj_xyz = gt_traj[:, :3]
+        gt_traj_xyz_diff = np.diff(gt_traj_xyz, axis=0)
+        gt_traj_xyz_diff_norm = np.linalg.norm(gt_traj_xyz_diff, axis=1)
+        gt_traj_total_distance = np.sum(gt_traj_xyz_diff_norm)
+
+        err_xyz = np.linalg.norm(est_traj_aligned_xyz - gt_traj_xyz, axis=1)
+        err_xyzs.append((result['label'], err_xyz))
+
+        print(f"Result: {result['label']}")
+        print(f"GT total distance: {gt_traj_total_distance:.2f} m")
+        print(f"ATE per meter travelled: {(ate / gt_traj_total_distance) * 100:.2f}%")
+
+        # NEXT ADD/REMOVE IMU NOISE
+        if result['label'] == 'sgbm':
+            rr.init("local_vo_bundle_adjustment")
+            rr.spawn()
+
+            est_poses = []
+            gt_poses = []
+
+            for i in range(len(est_traj_aligned)):
+                rr.set_time("frame", sequence=i)
+
+                est_pose = gtsam.Pose3(
+                    gtsam.Rot3.Quaternion(w=est_traj_aligned[i, 3], x=est_traj_aligned[i, 4], y=est_traj_aligned[i, 5], z=est_traj_aligned[i, 6]),
+                    gtsam.Point3(est_traj_aligned[i, 0:3])
+                )
+                est_poses.append(est_pose)
+                rr_log_pose("est_pose", est_pose, depth_variants[1][1][i] if len(depth_variants) > 1 else depth_variants[0][1][i])
+
+                gt_pose = gtsam.Pose3(
+                    gtsam.Rot3.Quaternion(w=gt_traj[i, 6], x=gt_traj[i, 3], y=gt_traj[i, 4], z=gt_traj[i, 5]),
+                    gtsam.Point3(gt_traj[i, 0:3])
+                )
+                gt_poses.append(gt_pose)
+                # rr_log_pose("gt_pose", gt_pose, rectified_frames[0][1][i])
+
+                rr_log_trajectory("est_trajectory", est_poses, color=(0, 0, 255), radii=0.006)
+                rr_log_trajectory("gt_trajectory", gt_poses, color=(0, 255, 0), radii=0.006)
+
     plot_translation_error_percentages(percentage_plot_series)
+
+    for label, err_xyz in err_xyzs:
+        plt.plot(range(len(err_xyz)), err_xyz, label=label)
+    plt.legend()
+    plt.show()
+
 
     all_tracking_results.append(sequence_results)
     all_ba_results.append(ba_result)
