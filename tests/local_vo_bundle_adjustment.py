@@ -37,17 +37,22 @@ import tests.test_utils as test_utils  # noqa: E402
 # Configuration
 # ----------------------------------------------------------------------
 NUM_SEQUENCE_SAMPLES = 1
-SEQUENCE_LENGTH = 800
-ENVIRONMENT = "Hospital"
-DIFFICULTY = "diff"
-TRAJECTORY = "P1000"
+SEQUENCE_LENGTH = 300
+# ENVIRONMENT = "Hospital"
+# DIFFICULTY = "diff"
+# TRAJECTORY = "P1000"
+ENVIRONMENT = "AbandonedFactory"
+DIFFICULTY = "easy"
+TRAJECTORY = "P001"
 SAMPLING_MODE = "stride"
 MIN_STRIDE = 1
 MAX_STRIDE = 1
 BASE_SEED = 11
 
 USE_IMU_FACTORS = True
-DEPTH_MODE = os.environ.get("LOCAL_VO_DEPTH_MODE", "sgbm").strip().lower()
+DEPTH_MODE = os.environ.get("LOCAL_VO_DEPTH_MODE", "sgbm").strip().lower() # TODO: figure out why on hospital true depth is so much better than sgbm, where does it get messed up?
+# maybe try ML based depth estimation, might be the easiest way to get better perf tbh when true depth is getting 5x better results
+
 if DEPTH_MODE not in {"sgbm", "ground_truth"}:
     raise ValueError("LOCAL_VO_DEPTH_MODE must be either 'sgbm' or 'ground_truth'.")
 USE_GROUND_TRUTH_DEPTH = DEPTH_MODE == "ground_truth"
@@ -67,13 +72,13 @@ LK_CRITERIA = (cv2.TERM_CRITERIA_EPS | cv2.TERM_CRITERIA_COUNT, 40, 0.01)
 LK_MIN_EIG_THRESHOLD = 1e-3
 
 MIN_MATCHES_FOR_PNP = 6
-MAX_DEPTH = 30.0
+MAX_DEPTH = 40.0
 
 # Bundle adjustment
-MIN_OBSERVATIONS_PER_LANDMARK = 12
+MIN_OBSERVATIONS_PER_LANDMARK = 3 # increase this and reproj gate? might be a good trade off?
 MIN_OBSERVATIONS_PER_FRAME = 5
 PROJECTION_NOISE_PX = 1.0
-DISPARITY_NOISE_PX = 2.5 # scale based on distance?
+DISPARITY_NOISE_PX = 1.0 # scale based on distance?
 PROJECTION_NOISE_HUBER = True
 REPROJECTION_GATING_THRESHOLD_PX = 1.0
 USE_INLIER_OBSERVATIONS_ONLY = False
@@ -96,12 +101,12 @@ IMU_GRAVITY_MAGNITUDE = 9.80665
 # IMU_VELOCITY_PRIOR_SIGMA = 0.1
 IMU_BIAS_PRIOR_SIGMAS = np.array(
     [
-        1.5e-3,
-        1.5e-3,
-        1.5e-3,
-        1.0e-5,
-        1.0e-5,
-        1.0e-5,
+        3.0000e-3,
+        3.0000e-3,
+        3.0000e-3,
+        1.9393e-05,
+        1.9393e-05,
+        1.9393e-05,
     ],
     dtype=float,
 )
@@ -422,8 +427,8 @@ def build_ground_truth_depth_frame(
     depth_rect = depth_rect.astype(np.float32, copy=False)
     invalid = (~np.isfinite(depth_rect)) | (depth_rect <= 0.0) | (depth_rect > max_depth)
     depth_rect[invalid] = np.nan
-    # depth_xyz = depth_map_to_xyz(depth_rect, rectified_frame.calibration.K_left_rect)
-    depth_xyz = depth_map_to_xyz(depth_rect, rectified_frame.calibration.K_left)
+    depth_xyz = depth_map_to_xyz(depth_rect, rectified_frame.calibration.K_left_rect)
+    # depth_xyz = depth_map_to_xyz(depth_rect, rectified_frame.calibration.K_left)
     depth_xyz[invalid, :] = np.nan
     return StereoDepthFrame(
         left=rectified_frame.left,
@@ -449,9 +454,9 @@ def build_ground_truth_depth_frames(
     ]
 
 
-def create_preintegration_params() -> gtsam.PreintegrationParams:
+def create_preintegration_params(sequence=None) -> gtsam.PreintegrationParams:
     params = gtsam.PreintegrationCombinedParams.MakeSharedU(IMU_GRAVITY_MAGNITUDE)
-    params.n_gravity = IMU_GRAVITY_VECTOR
+    params.n_gravity = IMU_GRAVITY_VECTOR if sequence is None else test_utils.estimate_world_gravity_from_first_batch(sequence)
     params.setAccelerometerCovariance(np.eye(3) * (IMU_ACCEL_NOISE ** 2))
     params.setGyroscopeCovariance(np.eye(3) * (IMU_GYRO_NOISE ** 2))
     params.setIntegrationCovariance(np.eye(3) * (IMU_INTEGRATION_NOISE ** 2))
@@ -624,7 +629,7 @@ def integrate_inertial_trajectory(
 ) -> list[gtsam.Pose3] | None:
     gt_world_to_first = sequence.world_poses[0]
 
-    params = create_preintegration_params()
+    params = create_preintegration_params(sequence)
     bias = gtsam.imuBias.ConstantBias()
     velocities = estimate_sequence_velocities(sequence)
 
@@ -655,8 +660,8 @@ def integrate_inertial_trajectory(
     for idx in range(1, sequence.length):
         batch = sequence.imu_measurements[idx]
 
-        # nav_state = gtsam.NavState(translation_gt_world_to_first * sequence.world_poses[idx - 1], sequence.imu_measurements[idx - 1].world_velocity)
-        nav_state = nav_states[-1]
+        nav_state = gtsam.NavState(translation_gt_world_to_first * sequence.world_poses[idx - 1], sequence.imu_measurements[idx - 1].world_velocity)
+        # nav_state = nav_states[-1]
 
         # pose = nav_state.pose()
         # pose_trans = pose.translation() + sequence.imu_measurements[idx - 1].world_velocity * 0.1
@@ -665,9 +670,12 @@ def integrate_inertial_trajectory(
 
         pim = gtsam.PreintegratedImuMeasurements(params, bias)
         _integrate_imu_batch(pim, batch)
-        # pim = preintegrate_between_frames(sequence, idx - 1, idx, params, bias)
-        # pim.integrateMeasurement(np.zeros(3), np.zeros(3), 0.1)
         nav_states.append(pim.predict(nav_state, bias))
+        
+        # nav_states.append(nav_state)
+
+         # pim = preintegrate_between_frames(sequence, idx - 1, idx, params, bias)
+        # pim.integrateMeasurement(np.zeros(3), np.zeros(3), 0.1)
 
     inertial_poses = [nav_state.pose() for nav_state in nav_states]
 
@@ -1214,7 +1222,8 @@ def run_bundle_adjustment(
 
     # imu_params = create_preintegration_params() if imu_available else None
     imu_params = gtsam.PreintegrationCombinedParams.MakeSharedU(IMU_GRAVITY_MAGNITUDE)
-    imu_params.n_gravity = IMU_GRAVITY_VECTOR
+    # imu_params.n_gravity = IMU_GRAVITY_VECTOR
+    imu_params.n_gravity = test_utils.estimate_world_gravity_from_first_batch(sequence_sample)
     imu_params.setAccelerometerCovariance(np.eye(3) * (IMU_ACCEL_NOISE**2))     # e.g. 2e-3^2
     imu_params.setGyroscopeCovariance(np.eye(3) * (IMU_GYRO_NOISE**2))      # e.g. 1.7e-4^2
     imu_params.setIntegrationCovariance(np.eye(3) * (IMU_INTEGRATION_NOISE**2))                     # not ~0
@@ -1273,11 +1282,17 @@ def run_bundle_adjustment(
     graph.add(gtsam.PriorFactorPose3(X(0), gt_world_to_first, prior_noise))
 
     if imu_available and imu_params is not None and imu_bias_key is not None:
+        # graph.add(gtsam.PriorFactorConstantBias(
+        # B(frames_for_ba[0]),
+        # gtsam.imuBias.ConstantBias(),
+        # gtsam.noiseModel.Diagonal.Sigmas(
+        #     IMU_BIAS_PRIOR_SIGMAS)))
+
         graph.add(gtsam.PriorFactorConstantBias(
         B(frames_for_ba[0]),
         gtsam.imuBias.ConstantBias(),
         gtsam.noiseModel.Diagonal.Sigmas(
-            IMU_BIAS_PRIOR_SIGMAS)))
+            IMU_BIAS_PRIOR_SIGMAS * 1000000)))
 
         for k in frames_for_ba:
             if not values.exists(B(k)):
@@ -1988,11 +2003,11 @@ def plot_pose_trajectories(
             inertial_xyz = None
 
     plt.figure(figsize=(10, 6))
-    plt.title("Trajectory comparison (XY plane)")
-    plt.plot(initial_xyz[:, 0], initial_xyz[:, 1], "o--", label=initial_label)
-    plt.plot(optimized_xyz[:, 0], optimized_xyz[:, 1], "o-", label=optimized_label)
+    plt.title("Trajectory comparison (XZ plane)")
+    plt.plot(initial_xyz[:, 0], initial_xyz[:, 2], "o--", label=initial_label)
+    plt.plot(optimized_xyz[:, 0], optimized_xyz[:, 2], "o-", label=optimized_label)
     if optimized_xyz_no_imu is not None:
-        plt.plot(optimized_xyz_no_imu[:, 0], optimized_xyz_no_imu[:, 1], "o-", label="BA w/o IMU")
+        plt.plot(optimized_xyz_no_imu[:, 0], optimized_xyz_no_imu[:, 2], "o-", label="BA w/o IMU")
     if additional_initial_pose_dicts:
         for label, pose_dict in additional_initial_pose_dicts.items():
             if base_frame not in pose_dict:
@@ -2009,7 +2024,7 @@ def plot_pose_trajectories(
             if not additional_points:
                 continue
             additional_xyz = np.asarray(additional_points, dtype=np.float64)
-            plt.plot(additional_xyz[:, 0], additional_xyz[:, 1], "o--", label=label)
+            plt.plot(additional_xyz[:, 0], additional_xyz[:, 2], "o--", label=label)
     if additional_pose_dicts:
         for label, pose_dict in additional_pose_dicts.items():
             if base_frame not in pose_dict:
@@ -2024,15 +2039,15 @@ def plot_pose_trajectories(
             if not additional_points:
                 continue
             additional_xyz = np.asarray(additional_points, dtype=np.float64)
-            plt.plot(additional_xyz[:, 0], additional_xyz[:, 1], "o-", label=label)
+            plt.plot(additional_xyz[:, 0], additional_xyz[:, 2], "o-", label=label)
     if inertial_xyz is not None:
         plt.plot(
             inertial_xyz[:, 0],
-            inertial_xyz[:, 1],
+            inertial_xyz[:, 2],
             "s--",
             label="IMU-only (per-frame)",
         )
-    plt.plot(ground_truth_xyz[:, 0], ground_truth_xyz[:, 1], "x-", label="Ground truth")
+    plt.plot(ground_truth_xyz[:, 0], ground_truth_xyz[:, 2], "x-", label="Ground truth")
 
     if initial_landmarks:
         init_landmarks_arr = np.asarray(initial_landmarks, dtype=np.float64)
@@ -2040,7 +2055,7 @@ def plot_pose_trajectories(
             init_landmarks_arr = init_landmarks_arr[::landmark_stride]
         plt.scatter(
             init_landmarks_arr[:, 0],
-            init_landmarks_arr[:, 1],
+            init_landmarks_arr[:, 2],
             s=6,
             c="#66c2a5",
             alpha=0.35,
@@ -2052,7 +2067,7 @@ def plot_pose_trajectories(
             opt_landmarks_arr = opt_landmarks_arr[::landmark_stride]
         plt.scatter(
             opt_landmarks_arr[:, 0],
-            opt_landmarks_arr[:, 1],
+            opt_landmarks_arr[:, 2],
             s=6,
             c="#fc8d62",
             alpha=0.35,
@@ -2242,23 +2257,27 @@ def run_depth_variant(
 
     ba_result_no_imu = None
     if USE_IMU_FACTORS:
-        ba_result_no_imu = run_bundle_adjustment(
-            rectified_frames=rectified_frames,
-            track_history=track_history,
-            tracks=tracks,
-            sequence_results=sequence_results,
-            sequence_sample=sequence_sample,
-            use_imu=False,
-            log_prefix=variant_label,
-        )
-        if rerun_logger is not None and rerun_logger.enabled and ba_result_no_imu is not None:
-            _log_bundle_adjustment_to_rerun(
-                rerun_logger,
-                depth_label,
-                depth_frames,
-                ba_result_no_imu,
-                "vision_only",
+        try:
+            ba_result_no_imu = run_bundle_adjustment(
+                rectified_frames=rectified_frames,
+                track_history=track_history,
+                tracks=tracks,
+                sequence_results=sequence_results,
+                sequence_sample=sequence_sample,
+                use_imu=False,
+                log_prefix=variant_label,
             )
+            if rerun_logger is not None and rerun_logger.enabled and ba_result_no_imu is not None:
+                _log_bundle_adjustment_to_rerun(
+                    rerun_logger,
+                    depth_label,
+                    depth_frames,
+                    ba_result_no_imu,
+                    "vision_only",
+                )
+        except Exception as e:
+            print(f"Error running bundle adjustment without IMU: {e}")
+            ba_result_no_imu = None
 
     pose_errors = compute_pose_errors_against_ground_truth(ba_result["optimized_pose_dict"], sequence_sample)
     pose_errors_no_imu = None
@@ -2315,37 +2334,38 @@ all_ba_results: list[dict[str, Any]] = []
 
 for sample_idx in range(NUM_SEQUENCE_SAMPLES):
     seed = BASE_SEED + sample_idx
-    sequence = test_utils.load_tartanair_sequence_segment(
-        env=ENVIRONMENT,
-        difficulty=DIFFICULTY,
-        traj=TRAJECTORY,
-        sequence_length=SEQUENCE_LENGTH,
-        seed=seed,
-        sampling_mode=SAMPLING_MODE,
-        min_stride=MIN_STRIDE,
-        max_stride=MAX_STRIDE,
-        load_ground_truth_depth=USE_GROUND_TRUTH_DEPTH,
-        add_imu_noise=True
-    )
-    # sequence = test_utils.load_euroc_sequence_segment(
-    #     seq_name="MH_01_easy",
+    # sequence = test_utils.load_tartanair_sequence_segment(
+    #     env=ENVIRONMENT,
+    #     difficulty=DIFFICULTY,
+    #     traj=TRAJECTORY,
     #     sequence_length=SEQUENCE_LENGTH,
     #     seed=seed,
+    #     sampling_mode=SAMPLING_MODE,
+    #     min_stride=MIN_STRIDE,
+    #     max_stride=MAX_STRIDE,
+    #     load_ground_truth_depth=USE_GROUND_TRUTH_DEPTH,
+    #     add_imu_noise=True
     # )
+    sequence = test_utils.load_euroc_sequence_segment(
+        seq_name="MH_01_easy",
+        sequence_length=SEQUENCE_LENGTH,
+        seed=seed,
+    )
     plot_imu_measurements(sequence, title=f"IMU data (sample {sample_idx})")
     inertial_poses = integrate_inertial_trajectory(sequence)
 
+    rectified_frames = sequence.frames
     # rectified_frames = [frame.rectify() for frame in sequence.frames]
-    rectified_frames = [
-        RectifiedStereoFrame(
-            left=frame.left,
-            right=frame.right,
-            left_rect=frame.left,
-            right_rect=frame.right,
-            calibration=frame.calibration,
-        )
-        for frame in sequence.frames
-    ]
+    # rectified_frames = [
+    #     RectifiedStereoFrame(
+    #         left=frame.left,
+    #         right=frame.right,
+    #         left_rect=frame.left,
+    #         right_rect=frame.right,
+    #         calibration=frame.calibration,
+    #     )
+    #     for frame in sequence.frames
+    # ]
     depth_variants: list[tuple[str, list[StereoDepthFrame]]] = []
     if USE_GROUND_TRUTH_DEPTH:
         if sequence.ground_truth_depths is None:

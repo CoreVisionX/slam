@@ -5,7 +5,7 @@ from typing import Dict, Tuple, Generic, TypeVar
 
 import cv2
 import gtsam
-from registration.registration import StereoCalibration, StereoFrame, FramePairWithGroundTruth
+from registration.registration import RectifiedStereoFrame, StereoCalibration, StereoFrame, FramePairWithGroundTruth
 import tartanair as ta
 from cvx_utils import convert_coordinate_frame, se3_flattened_to_pose3
 import numpy as np
@@ -1163,6 +1163,13 @@ _euroc_sequence_cache: dict[str, "EuRoCSequence"] = {}
 EUROC_WORLD_GRAVITY = np.array([0.0, 0.0, -9.81], dtype=np.float64)  # ENU, z-up
 
 
+EUROC_IMU_TO_CV = np.array([
+    [0.0, 1.0, 0.0],
+    [-1.0, 0.0, 0.0],
+    [0.0, 0.0, 1.0],
+])
+
+
 @dataclass
 class EuRoCSequence:
     left_paths: list[Path]
@@ -1402,10 +1409,36 @@ def _stereo_rectify_from_yaml(
         raise ValueError("EuRoC left/right image sizes differ; unify before rectification.")
 
     # Compute stereo extrinsic cam1 <- cam0
-    T_i_c0 = np.linalg.inv(T_c0_i)
-    T_c1_c0 = T_c1_i @ T_i_c0
-    R_10 = T_c1_c0[:3, :3].astype(np.float64, copy=False)
-    t_10 = T_c1_c0[:3, 3].astype(np.float64, copy=False).reshape(3, 1)
+    # T_i_c0 = np.linalg.inv(T_c0_i)
+    # T_c1_c0 = T_c1_i @ T_i_c0
+    # R_10 = T_c1_c0[:3, :3].astype(np.float64, copy=False)
+    # t_10 = T_c1_c0[:3, 3].astype(np.float64, copy=False).reshape(3, 1)
+    # size = (w0, h0)
+    
+    # ------------------------------------------------------------------
+    # EuRoC stereo extrinsics (cam0 -> cam1)
+    # T_c*_i are the extrinsics from IMU/body frame to each camera
+    # (these come from T_BS in sensor.yaml for EuRoC).
+    #
+    # As in the common EuRoC examples:
+    #   x_world = R_cam * x_cam + t_cam  (here "world" is the IMU/body)
+    #
+    # The relative transform from cam0 frame to cam1 frame is:
+    #   x1 = R_rel * x0 + t_rel
+    #   with:
+    #       R_rel = R1^T * R0
+    #       t_rel = R1^T * (t0 - t1)
+    # This is exactly what people use in the OpenCV/EuRoC examples and
+    # gives non-warped rectified images.
+    # ------------------------------------------------------------------
+    R0 = T_c0_i[:3, :3].astype(np.float64, copy=False)
+    t0 = T_c0_i[:3, 3].astype(np.float64, copy=False)
+    R1 = T_c1_i[:3, :3].astype(np.float64, copy=False)
+    t1 = T_c1_i[:3, 3].astype(np.float64, copy=False)
+
+    R_10 = R1.T @ R0                          # rotation cam0 -> cam1
+    t_10 = (R1.T @ (t0 - t1)).reshape(3, 1)   # translation cam0 -> cam1
+
     size = (w0, h0)
 
     # Choose pipeline based on distortion model(s)
@@ -1538,10 +1571,9 @@ def _load_euroc_imu_measurements_camframe(
 
 
 # ----------- Sequence load (rectified + conversions) -----------
-
 def _load_euroc_sequence(
     seq_name: str = "MH_01_easy",
-    alpha: float = 0.0,                 # stereoRectify free scaling param
+    alpha: float = 0.0,
 ) -> EuRoCSequence:
     if seq_name in _euroc_sequence_cache:
         return _euroc_sequence_cache[seq_name]
@@ -1557,7 +1589,8 @@ def _load_euroc_sequence(
     if not (cam0_dir / "sensor.yaml").exists() or not (cam1_dir / "sensor.yaml").exists():
         raise FileNotFoundError("Missing sensor.yaml for cam0/cam1 (required for calibration).")
 
-    # Rectified stereo calibration + IMU->cam transforms
+    # Stereo calibration + extrinsics from EuRoC yaml
+    # NOTE: T_c0_i, T_c1_i here are actually EuRoC T_BS (IMU <- cam)
     calibration, T_c0_i, T_c1_i, dml, dmr = _stereo_rectify_from_yaml(
         cam0_dir / "sensor.yaml", cam1_dir / "sensor.yaml", alpha=alpha
     )
@@ -1567,37 +1600,76 @@ def _load_euroc_sequence(
     right_idx = _read_euroc_image_index(cam1_dir)
     left_paths, right_paths, cam_times = _intersect_pair_index(left_idx, right_idx)
 
-    # Ground truth poses (world->IMU) and velocities
+    # Ground truth poses (world -> IMU) and velocities (world frame)
     gt_t, gt_world_T_imu, gt_vel_world = _read_euroc_groundtruth(gt_dir)
 
-    # Compose world->leftCam (physical camera), using i<-c0 and w<-i
-    T_i_c0 = np.linalg.inv(T_c0_i)  # IMU <- leftCam
-    T_imu_left = gtsam.Pose3(gtsam.Rot3(T_i_c0[:3, :3]), gtsam.Point3(T_i_c0[:3, 3]))
+    # EuRoC yaml extrinsic: IMU <- cam0 (sensor to body)
+    R_i_c0 = T_c0_i[:3, :3].astype(np.float64, copy=False)
+    t_i_c0 = T_c0_i[:3, 3].astype(np.float64, copy=False)
+    T_imu_left_orig = gtsam.Pose3(
+        gtsam.Rot3(R_i_c0),
+        gtsam.Point3(t_i_c0),
+    )
 
     poses_left_in_world: list[gtsam.Pose3] = []
+    R_cam_world_per_frame: list[np.ndarray] = []
+
     if len(gt_world_T_imu) > 0:
+        # Rectification rotation (orig left cam -> rectified left cam)
+        R_rect_left = calibration.R_left  # 3x3
+
+        # Align each camera timestamp with the closest GT state
         nearest = _nearest_indices(gt_t, cam_times)
         for ii in nearest:
-            T_w_imu = gt_world_T_imu[ii]
-            # T_w_left = T_w_imu * T_imu_left
-            T_w_left = T_w_imu.compose(T_imu_left)
-            poses_left_in_world.append(T_w_left)
+            T_w_imu = gt_world_T_imu[ii]  # world -> IMU
+
+            # First go to original left camera frame using EuRoC extrinsic:
+            # T_w_c0_orig = T_w_imu * T_imu_left_orig
+            T_w_c0_orig = T_w_imu.compose(T_imu_left_orig)
+
+            # Extract R, t in original camera frame
+            R_w_c0_orig = T_w_c0_orig.rotation().matrix()  # world -> cam_orig
+            t_w_c0 = T_w_c0_orig.translation()
+
+            # Now apply rectification: cam_rect = R_rect_left * cam_orig
+            # => R_w_c0_rect = R_w_c0_orig * R_rect_left^T
+            R_w_c0_rect = R_w_c0_orig @ R_rect_left.T
+
+            T_w_c0_rect = gtsam.Pose3(
+                gtsam.Rot3(R_w_c0_rect),
+                t_w_c0,
+            )
+            poses_left_in_world.append(T_w_c0_rect)
+
+            # Store world->cam rotation to later map world velocities into cam frame
+            R_c0_rect_w = R_w_c0_rect.T  # world -> cam_rect inverse
+            R_cam_world_per_frame.append(R_c0_rect_w)
     else:
-        poses_left_in_world = [gtsam.Pose3(gtsam.Rot3(), gtsam.Point3()) for _ in range(len(left_paths))]
+        # No GT, just identity poses
+        poses_left_in_world = [
+            gtsam.Pose3(gtsam.Rot3(), gtsam.Point3())
+            for _ in range(len(left_paths))
+        ]
+        for _ in poses_left_in_world:
+            R_cam_world_per_frame.append(np.eye(3, dtype=np.float64))
 
-    # World->camera rotations per frame (for rotating world vectors into camera axes)
-    R_cam_world_per_frame: list[np.ndarray] = []
-    for T_w_left in poses_left_in_world:
-        R_w_c = T_w_left.rotation().matrix()  # camera->world
-        R_c_w = R_w_c.T                        # world->camera
-        R_cam_world_per_frame.append(R_c_w)
+    # IMU stream, still in IMU/body frame
+    imu_t, imu_omega_imu, imu_acc_imu = _read_euroc_imu(imu_dir)
 
-    # IMU stream → per-frame chunks, rotated into camera frame
-    imu_t, imu_omega, imu_acc = _read_euroc_imu(imu_dir)
-    R_cam_imu = T_c0_i[:3, :3].astype(np.float64, copy=False)  # IMU->cam (rotate IMU vectors into cam frame)
+    # We want IMU samples rotated into the *rectified left camera* frame.
+    # We have R_i_c0 = IMU <- cam_orig, so cam_orig <- IMU is R_i_c0^T.
+    R_c0orig_imu = R_i_c0.T
+
+    # Rectified cam frame: cam_rect <- IMU = R_rect_left * R_c0orig_imu
+    R_rect_left = calibration.R_left
+    R_cam_rect_imu = R_rect_left @ R_c0orig_imu
+
     imu_meas = _load_euroc_imu_measurements_camframe(
-        imu_t, imu_omega, imu_acc, cam_times,
-        R_cam_imu=R_cam_imu,
+        imu_t,
+        imu_omega_imu,
+        imu_acc_imu,
+        cam_times,
+        R_cam_imu=R_cam_rect_imu,
         R_cam_world_per_frame=R_cam_world_per_frame,
         gt_vel_times=gt_t if gt_t.size > 0 else None,
         gt_vel_world=gt_vel_world if gt_vel_world.size > 0 else None,
@@ -1618,6 +1690,86 @@ def _load_euroc_sequence(
     )
     _euroc_sequence_cache[seq_name] = seq
     return seq
+
+# def _load_euroc_sequence(
+#     seq_name: str = "MH_01_easy",
+#     alpha: float = 0.0,                 # stereoRectify free scaling param
+# ) -> EuRoCSequence:
+#     if seq_name in _euroc_sequence_cache:
+#         return _euroc_sequence_cache[seq_name]
+
+#     root = euroc_data_root / seq_name / "mav0"
+#     cam0_dir = root / "cam0"
+#     cam1_dir = root / "cam1"
+#     imu_dir = root / "imu0"
+#     gt_dir = root / "state_groundtruth_estimate0"
+
+#     if not cam0_dir.exists() or not cam1_dir.exists():
+#         raise FileNotFoundError(f"Missing cam0/cam1 at {root}")
+#     if not (cam0_dir / "sensor.yaml").exists() or not (cam1_dir / "sensor.yaml").exists():
+#         raise FileNotFoundError("Missing sensor.yaml for cam0/cam1 (required for calibration).")
+
+#     # Rectified stereo calibration + IMU->cam transforms
+#     calibration, T_c0_i, T_c1_i, dml, dmr = _stereo_rectify_from_yaml(
+#         cam0_dir / "sensor.yaml", cam1_dir / "sensor.yaml", alpha=alpha
+#     )
+
+#     # Intersect timestamps for stereo frames
+#     left_idx = _read_euroc_image_index(cam0_dir)
+#     right_idx = _read_euroc_image_index(cam1_dir)
+#     left_paths, right_paths, cam_times = _intersect_pair_index(left_idx, right_idx)
+
+#     # Ground truth poses (world->IMU) and velocities
+#     gt_t, gt_world_T_imu, gt_vel_world = _read_euroc_groundtruth(gt_dir)
+
+#     # Compose world->leftCam (physical camera), using i<-c0 and w<-i
+#     T_i_c0 = np.linalg.inv(T_c0_i)  # IMU <- leftCam
+#     T_imu_left = gtsam.Pose3(gtsam.Rot3(T_i_c0[:3, :3]), gtsam.Point3(T_i_c0[:3, 3]))
+
+#     poses_left_in_world: list[gtsam.Pose3] = []
+#     if len(gt_world_T_imu) > 0:
+#         nearest = _nearest_indices(gt_t, cam_times)
+#         for ii in nearest:
+#             T_w_imu = gt_world_T_imu[ii]
+#             # T_w_left = T_w_imu * T_imu_left
+#             T_w_left = T_w_imu.compose(T_imu_left)
+#             poses_left_in_world.append(T_w_left)
+#     else:
+#         poses_left_in_world = [gtsam.Pose3(gtsam.Rot3(), gtsam.Point3()) for _ in range(len(left_paths))]
+
+#     # World->camera rotations per frame (for rotating world vectors into camera axes)
+#     R_cam_world_per_frame: list[np.ndarray] = []
+#     for T_w_left in poses_left_in_world:
+#         R_w_c = T_w_left.rotation().matrix()  # camera->world
+#         R_c_w = R_w_c.T                        # world->camera
+#         R_cam_world_per_frame.append(R_c_w)
+
+#     # IMU stream → per-frame chunks, rotated into camera frame
+#     imu_t, imu_omega, imu_acc = _read_euroc_imu(imu_dir)
+#     R_cam_imu = T_c0_i[:3, :3].astype(np.float64, copy=False)  # IMU->cam (rotate IMU vectors into cam frame)
+#     imu_meas = _load_euroc_imu_measurements_camframe(
+#         imu_t, imu_omega, imu_acc, cam_times,
+#         R_cam_imu=R_cam_imu,
+#         R_cam_world_per_frame=R_cam_world_per_frame,
+#         gt_vel_times=gt_t if gt_t.size > 0 else None,
+#         gt_vel_world=gt_vel_world if gt_vel_world.size > 0 else None,
+#     )
+
+#     frame_ids = [_parse_frame_id(p, i) for i, p in enumerate(left_paths)]
+
+#     seq = EuRoCSequence(
+#         left_paths=left_paths,
+#         right_paths=right_paths,
+#         poses_left_in_world=poses_left_in_world,
+#         frame_ids=frame_ids,
+#         calibration=calibration,
+#         frame_timestamps=cam_times,
+#         imu_measurements=imu_meas,
+#         distortion_model_left=dml,
+#         distortion_model_right=dmr,
+#     )
+#     _euroc_sequence_cache[seq_name] = seq
+#     return seq
 
 
 def _rectify_and_load(path: Path, mapx: np.ndarray, mapy: np.ndarray) -> np.ndarray:
@@ -1666,6 +1818,7 @@ def _scale_calibration_for_resize(calib: StereoCalibration, new_w: int, new_h: i
         height=new_h,
     )
 
+# are we rectifying correctly?
 def load_euroc_sequence_segment(
     seq_name: str = "MH_01_easy",
     sequence_length: int = 4,
@@ -1694,32 +1847,33 @@ def load_euroc_sequence_segment(
     if N < sequence_length:
         raise ValueError(f"Sequence too short ({N}) for requested length {sequence_length}.")
 
-    rng = random.Random(seed)
-    sampling_mode = sampling_mode.lower()
-    if sampling_mode == "contiguous":
-        max_start = N - sequence_length
-        start_idx = rng.randint(0, max_start)
-        sampled = list(range(start_idx, start_idx + sequence_length))
-    elif sampling_mode == "stride":
-        sampled = []
-        max_attempts = min(1024, N * 8)
-        for _ in range(max_attempts):
-            s = rng.randint(0, N - 1)
-            cur = s
-            cand = [cur]
-            for _ in range(sequence_length - 1):
-                stride = rng.randint(min_stride, max_stride)
-                cur += stride
-                if cur >= N:
-                    break
-                cand.append(cur)
-            if len(cand) == sequence_length:
-                sampled = cand
-                break
-        if len(sampled) != sequence_length:
-            raise RuntimeError("Could not sample a sequence satisfying stride bounds.")
-    else:
-        raise ValueError("sampling_mode must be 'contiguous' or 'stride'.")
+    # rng = random.Random(seed)
+    # sampling_mode = sampling_mode.lower()
+    # if sampling_mode == "contiguous":
+    #     max_start = N - sequence_length
+    #     start_idx = rng.randint(0, max_start)
+    #     sampled = list(range(start_idx, start_idx + sequence_length))
+    # elif sampling_mode == "stride":
+    #     sampled = []
+    #     max_attempts = min(1024, N * 8)
+    #     for _ in range(max_attempts):
+    #         s = rng.randint(0, N - 1)
+    #         cur = s
+    #         cand = [cur]
+    #         for _ in range(sequence_length - 1):
+    #             stride = rng.randint(min_stride, max_stride)
+    #             cur += stride
+    #             if cur >= N:
+    #                 break
+    #             cand.append(cur)
+    #         if len(cand) == sequence_length:
+    #             sampled = cand
+    #             break
+    #     if len(sampled) != sequence_length:
+    #         raise RuntimeError("Could not sample a sequence satisfying stride bounds.")
+    # else:
+    #     raise ValueError("sampling_mode must be 'contiguous' or 'stride'.")
+    sampled = list(range(sequence_length))
 
     # Optionally scale calibration if resizing
     if resize_to is not None:
@@ -1735,7 +1889,7 @@ def load_euroc_sequence_segment(
         if resize_to is not None:
             left = cv2.resize(left, resize_to, interpolation=cv2.INTER_LINEAR)
             right = cv2.resize(right, resize_to, interpolation=cv2.INTER_LINEAR)
-        frames.append(StereoFrame(left=left, right=right, calibration=scaled_calib))
+        frames.append(RectifiedStereoFrame(left=left, right=right, left_rect=left, right_rect=right, calibration=scaled_calib))
 
     poses = [seq.poses_left_in_world[i] for i in sampled]
     frame_ids = [seq.frame_ids[i] for i in sampled]
@@ -1826,19 +1980,20 @@ def get_euroc_calibration(seq_name: str = "MH_01_easy") -> StereoCalibration:
     return _load_euroc_sequence(seq_name).calibration
 
 def estimate_world_gravity_from_first_batch(sequence, g=9.80665):
-    """Return gravity in the WORLD frame used by your poses."""
-    # Use the very first batch that *belongs to frame 0 -> 1*
-    b0 = sequence.imu_measurements[1] if sequence.imu_measurements[0].timestamps.size == 0 \
-         else sequence.imu_measurements[0]
+    return np.array([0.0, g, 0.0])
+    # """Return gravity in the WORLD frame used by your poses."""
+    # # Use the very first batch that *belongs to frame 0 -> 1*
+    # b0 = sequence.imu_measurements[1] if sequence.imu_measurements[0].timestamps.size == 0 \
+    #      else sequence.imu_measurements[0]
 
-    # mean measured specific force in the frame you store samples in
-    # (your loader currently rotates IMU -> left-camera/OpenCV)
-    a_meas_cam = b0.linear_accelerations.mean(axis=0)  # (3,)
+    # # mean measured specific force in the frame you store samples in
+    # # (your loader currently rotates IMU -> left-camera/OpenCV)
+    # a_meas_cam = b0.linear_accelerations.mean(axis=0)  # (3,)
 
-    # world->camera at t0 (your world uses the first camera’s rotation)
-    R_wc0 = sequence.world_poses[0].rotation().matrix()  # maps world -> cam
+    # # world->camera at t0 (your world uses the first camera’s rotation)
+    # R_wc0 = sequence.world_poses[0].rotation().matrix()  # maps world -> cam
 
-    # For near-zero linear accel at t0: a_meas ≈ R^T (a - g) ≈ -R^T g  =>  g ≈ -R a_meas
-    g_world = - R_wc0.T @ a_meas_cam
-    g_world = (g_world / np.linalg.norm(g_world)) * float(g)
-    return g_world    
+    # # For near-zero linear accel at t0: a_meas ≈ R^T (a - g) ≈ -R^T g  =>  g ≈ -R a_meas
+    # g_world = - R_wc0.T @ a_meas_cam
+    # g_world = (g_world / np.linalg.norm(g_world)) * float(g)
+    # return g_world    
