@@ -37,7 +37,7 @@ import tests.test_utils as test_utils  # noqa: E402
 # Configuration
 # ----------------------------------------------------------------------
 NUM_SEQUENCE_SAMPLES = 1
-SEQUENCE_LENGTH = 300
+SEQUENCE_LENGTH = 30
 # ENVIRONMENT = "Hospital"
 # DIFFICULTY = "diff"
 # TRAJECTORY = "P1000"
@@ -49,7 +49,7 @@ MIN_STRIDE = 1
 MAX_STRIDE = 1
 BASE_SEED = 11
 
-USE_IMU_FACTORS = True
+USE_IMU_FACTORS = False
 DEPTH_MODE = os.environ.get("LOCAL_VO_DEPTH_MODE", "sgbm").strip().lower() # TODO: figure out why on hospital true depth is so much better than sgbm, where does it get messed up?
 # maybe try ML based depth estimation, might be the easiest way to get better perf tbh when true depth is getting 5x better results
 
@@ -80,7 +80,7 @@ MIN_OBSERVATIONS_PER_FRAME = 5
 PROJECTION_NOISE_PX = 1.0
 DISPARITY_NOISE_PX = 1.0 # scale based on distance?
 PROJECTION_NOISE_HUBER = True
-REPROJECTION_GATING_THRESHOLD_PX = 1.0
+REPROJECTION_GATING_THRESHOLD_PX = 4.0
 USE_INLIER_OBSERVATIONS_ONLY = False
 POSE_PRIOR_SIGMAS = np.array(
     [
@@ -660,8 +660,12 @@ def integrate_inertial_trajectory(
     for idx in range(1, sequence.length):
         batch = sequence.imu_measurements[idx]
 
-        nav_state = gtsam.NavState(translation_gt_world_to_first * sequence.world_poses[idx - 1], sequence.imu_measurements[idx - 1].world_velocity)
-        # nav_state = nav_states[-1]
+        # nav_state = gtsam.NavState(translation_gt_world_to_first * sequence.world_poses[idx - 1], sequence.imu_measurements[idx - 1].world_velocity)
+        nav_state = nav_states[-1]
+
+        # only reset every few frames
+        if idx % 10 == 0:
+            nav_state = gtsam.NavState(translation_gt_world_to_first * sequence.world_poses[idx - 1], sequence.imu_measurements[idx - 1].world_velocity)
 
         # pose = nav_state.pose()
         # pose_trans = pose.translation() + sequence.imu_measurements[idx - 1].world_velocity * 0.1
@@ -1048,7 +1052,14 @@ def estimate_sequence_poses(
         )
 
         try:
-            relative_pose, inlier_pair = solve_pnp(matched_pair)
+            relative_pose_s0, inlier_pair = solve_pnp(matched_pair)
+
+            # Get body-from-camera extrinsic for this frame
+            T_B_from_S0 = rectified_frames[prev_frame_idx].calibration.T_B_from_S0  # ^B T_S0
+
+            # Convert the relative motion into the body frame:
+            relative_pose = T_B_from_S0 * relative_pose_s0 * T_B_from_S0.inverse()
+
         except Exception as exc:  # noqa: BLE001
             results.append(
                 {
@@ -1160,7 +1171,11 @@ def compute_reprojection_errors(
             continue
         pose = pose_dict[frame_idx]
         point = point3_like_to_numpy(landmark_positions[landmark_idx])
-        camera = gtsam.PinholeCameraCal3_S2(pose, calibration)
+
+        T_B_from_S0 = rectified_frames[frame_idx].calibration.T_B_from_S0  # body_from_cam
+        cam_pose = pose.compose(T_B_from_S0)
+
+        camera = gtsam.PinholeCameraCal3_S2(cam_pose, calibration)
         try:
             projected = camera.project(point)
         except RuntimeError:
@@ -1288,11 +1303,16 @@ def run_bundle_adjustment(
         # gtsam.noiseModel.Diagonal.Sigmas(
         #     IMU_BIAS_PRIOR_SIGMAS)))
 
-        graph.add(gtsam.PriorFactorConstantBias(
-        B(frames_for_ba[0]),
-        gtsam.imuBias.ConstantBias(),
-        gtsam.noiseModel.Diagonal.Sigmas(
-            IMU_BIAS_PRIOR_SIGMAS * 1000000)))
+        bias_prior_noise = IMU_BIAS_PRIOR_SIGMAS.copy()
+        bias_prior_noise[:3] *= 80
+        bias_prior_noise[3:] *= 80
+
+
+        # graph.add(gtsam.PriorFactorConstantBias(
+        # B(frames_for_ba[0]),
+        # gtsam.imuBias.ConstantBias(),
+        # gtsam.noiseModel.Diagonal.Sigmas(
+        #     bias_prior_noise))) # not exactly sure what this should be tbh, it needs to be wide enough to correct the initial bias?
 
         for k in frames_for_ba:
             if not values.exists(B(k)):
@@ -1379,9 +1399,13 @@ def run_bundle_adjustment(
         if track.anchor_frame not in frames_for_ba:
             continue
 
-        anchor_pose = pose_initials[track.anchor_frame]
-        anchor_point = gtsam.Point3(*track.anchor_point3.tolist())
-        world_point = anchor_pose.transformFrom(anchor_point)
+        T_B_from_S0 = rectified_frames[track.anchor_frame].calibration.T_B_from_S0  # body_from_cam
+
+        anchor_pose_B = pose_initials[track.anchor_frame]  # world_from_body
+        anchor_point_S0 = gtsam.Point3(*track.anchor_point3.tolist())
+
+        # world_from_cam = world_from_body * body_from_cam
+        world_point = anchor_pose_B.compose(T_B_from_S0).transformFrom(anchor_point_S0)
         world_point_np = point3_like_to_numpy(world_point)
 
         observation_frames: list[tuple[int, TrackObservation]] = []
@@ -1398,7 +1422,11 @@ def run_bundle_adjustment(
                 continue
 
             pose_initial = pose_initials[frame_idx]
-            camera_initial = gtsam.PinholeCameraCal3_S2(pose_initial, calibration)
+            T_B_from_S0 = rectified_frames[frame_idx].calibration.T_B_from_S0  # body_from_cam
+            cam_pose = pose_initial.compose(T_B_from_S0)
+
+            camera_initial = gtsam.PinholeCameraCal3_S2(cam_pose, calibration)
+
             try:
                 predicted = camera_initial.project(world_point)
             except RuntimeError:
@@ -1407,6 +1435,7 @@ def run_bundle_adjustment(
             measurement_vec = np.asarray(observation.keypoint, dtype=np.float64)
             residual = predicted_vec - measurement_vec
             if np.linalg.norm(residual) > REPROJECTION_GATING_THRESHOLD_PX:
+                # print("Residual too large:", np.linalg.norm(residual))
                 continue
 
             observation_frames.append((frame_idx, observation))
@@ -1450,6 +1479,7 @@ def run_bundle_adjustment(
                         X(frame_idx),
                         L(landmark_key),
                         stereo_calibration,
+                        rectified_frames[frame_idx].calibration.T_B_from_S0,
                     )
                 )
                 stereo_counts[frame_idx] += 1
@@ -1472,6 +1502,7 @@ def run_bundle_adjustment(
                             X(frame_idx),
                             L(landmark_key),
                             stereo_calibration,
+                            rectified_frames[frame_idx].calibration.T_B_from_S0,
                         )
                     )
                     stereo_counts[frame_idx] += 1
@@ -1483,11 +1514,14 @@ def run_bundle_adjustment(
                             X(frame_idx),
                             L(landmark_key),
                             calibration,
+                            rectified_frames[frame_idx].calibration.T_B_from_S0,
                         )
                     )
                     mono_counts[frame_idx] += 1
 
             observations.append((frame_idx, landmark_key, measurement_vec))
+
+    print("Observation frames:", len(observation_frames))
 
     if not observations:
         raise RuntimeError("No landmark observations available for bundle adjustment.")
