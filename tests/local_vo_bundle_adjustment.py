@@ -37,7 +37,7 @@ import tests.test_utils as test_utils  # noqa: E402
 # Configuration
 # ----------------------------------------------------------------------
 NUM_SEQUENCE_SAMPLES = 1
-SEQUENCE_LENGTH = 30
+SEQUENCE_LENGTH = 20
 # ENVIRONMENT = "Hospital"
 # DIFFICULTY = "diff"
 # TRAJECTORY = "P1000"
@@ -49,7 +49,7 @@ MIN_STRIDE = 1
 MAX_STRIDE = 1
 BASE_SEED = 11
 
-USE_IMU_FACTORS = False
+USE_IMU_FACTORS = True
 DEPTH_MODE = os.environ.get("LOCAL_VO_DEPTH_MODE", "sgbm").strip().lower() # TODO: figure out why on hospital true depth is so much better than sgbm, where does it get messed up?
 # maybe try ML based depth estimation, might be the easiest way to get better perf tbh when true depth is getting 5x better results
 
@@ -120,7 +120,7 @@ IMU_GYRO_NOISE = 1.7e-4
 # IMU_ACCEL_NOISE = 1.0e-3
 # IMU_GYRO_NOISE = 8.5e-5
 IMU_INTEGRATION_NOISE = 5e-4
-IMU_VELOCITY_PRIOR_SIGMA = 0.1
+IMU_VELOCITY_PRIOR_SIGMA = 10.0
 # IMU_BIAS_PRIOR_SIGMAS = np.array([0.01, 0.01, 0.01, 0.01, 0.01, 0.01], dtype=float) * 100.0
 
 # IMU_GRAVITY_VECTOR = np.array([0.0, 0.0, IMU_GRAVITY_MAGNITUDE], dtype=float)
@@ -633,6 +633,19 @@ def integrate_inertial_trajectory(
     bias = gtsam.imuBias.ConstantBias()
     velocities = estimate_sequence_velocities(sequence)
 
+    # print imu measurement diagnostics
+    for k, batch in enumerate(sequence.imu_measurements):
+        if len(batch) == 0:
+            print(k, "EMPTY batch")
+            continue
+        print(
+            k,
+            "N =", len(batch),
+            "dt_sum =", batch.dts.sum(),
+            "acc_mean =", np.linalg.norm(batch.linear_accelerations.mean(axis=0)),
+            "omega_mean =", np.linalg.norm(batch.angular_velocities.mean(axis=0)),
+        )
+
     # inertial_poses: list[gtsam.Pose3] = []
 
     # # preintegrate relative to the previous ground truth pose
@@ -664,8 +677,11 @@ def integrate_inertial_trajectory(
         nav_state = nav_states[-1]
 
         # only reset every few frames
-        if idx % 10 == 0:
-            nav_state = gtsam.NavState(translation_gt_world_to_first * sequence.world_poses[idx - 1], sequence.imu_measurements[idx - 1].world_velocity)
+        if idx % 9 == 0 and idx > 1:
+            prev_prev_pose = sequence.world_poses[idx - 2]
+            prev_pose = sequence.world_poses[idx - 1]
+            prev_velocity = (prev_pose.translation() - prev_prev_pose.translation()) / (sequence.frame_timestamps[idx - 1] - sequence.frame_timestamps[idx - 2])
+            nav_state = gtsam.NavState(translation_gt_world_to_first * sequence.world_poses[idx - 1], prev_velocity)
 
         # pose = nav_state.pose()
         # pose_trans = pose.translation() + sequence.imu_measurements[idx - 1].world_velocity * 0.1
@@ -1270,11 +1286,15 @@ def run_bundle_adjustment(
         # graph.add(gtsam.PriorFactorVector(V(frames_for_ba[0]), first_velocity, velocity_prior_noise))
         # graph.add(gtsam.PriorFactorConstantBias(imu_bias_key, imu_bias_initial, bias_prior_noise))
 
-        # only use gt for first velocity
-        first_velocity = sequence_velocities[frames_for_ba[0]]
-        values.insert(V(frames_for_ba[0]), first_velocity)
-        graph.add(gtsam.PriorFactorVector(V(frames_for_ba[0]), first_velocity, velocity_prior_noise))
+        # # only use gt for first velocity
+        # first_velocity = sequence_velocities[frames_for_ba[0]]
+        # values.insert(V(frames_for_ba[0]), first_velocity)
+        # graph.add(gtsam.PriorFactorVector(V(frames_for_ba[0]), first_velocity, velocity_prior_noise))
         # graph.add(gtsam.PriorFactorConstantBias(imu_bias_key, imu_bias_initial, bias_prior_noise))
+
+        # use finite difference for the first velocity
+        first_velocity = (sequence_sample.world_poses[frames_for_ba[1]].translation() - sequence_sample.world_poses[frames_for_ba[0]].translation()) / (sequence_sample.frame_timestamps[frames_for_ba[1]] - sequence_sample.frame_timestamps[frames_for_ba[0]])
+        values.insert(V(frames_for_ba[0]), first_velocity)
 
         # initialize the rest of the velocities by differeniating the poses
         for prev_frame, next_frame in zip(frames_for_ba[:-1], frames_for_ba[1:]):
@@ -1303,16 +1323,14 @@ def run_bundle_adjustment(
         # gtsam.noiseModel.Diagonal.Sigmas(
         #     IMU_BIAS_PRIOR_SIGMAS)))
 
-        bias_prior_noise = IMU_BIAS_PRIOR_SIGMAS.copy()
-        bias_prior_noise[:3] *= 80
-        bias_prior_noise[3:] *= 80
+        bias_prior_noise = np.array([0.008, 0.008, 0.008, 0.0002, 0.0002, 0.0002], dtype=float)
 
 
-        # graph.add(gtsam.PriorFactorConstantBias(
-        # B(frames_for_ba[0]),
-        # gtsam.imuBias.ConstantBias(),
-        # gtsam.noiseModel.Diagonal.Sigmas(
-        #     bias_prior_noise))) # not exactly sure what this should be tbh, it needs to be wide enough to correct the initial bias?
+        graph.add(gtsam.PriorFactorConstantBias(
+        B(frames_for_ba[0]),
+        gtsam.imuBias.ConstantBias(),
+        gtsam.noiseModel.Diagonal.Sigmas(
+            bias_prior_noise))) # not exactly sure what this should be tbh, it needs to be wide enough to correct the initial bias?
 
         for k in frames_for_ba:
             if not values.exists(B(k)):
@@ -1346,7 +1364,7 @@ def run_bundle_adjustment(
                     V(prev_frame),
                     X(next_frame),
                     V(next_frame),
-                    B(prev_frame),
+                    B(prev_frame), # TODO: use constant bias instead to make debugging easier?
                     B(next_frame),
                     pim,
                 )
@@ -2036,12 +2054,12 @@ def plot_pose_trajectories(
             print("IMU trajectory shorter than pose set; skipping inertial overlay.")
             inertial_xyz = None
 
-    plt.figure(figsize=(10, 6))
+    plt.figure(figsize=(15, 9))
     plt.title("Trajectory comparison (XZ plane)")
-    plt.plot(initial_xyz[:, 0], initial_xyz[:, 2], "o--", label=initial_label)
-    plt.plot(optimized_xyz[:, 0], optimized_xyz[:, 2], "o-", label=optimized_label)
-    if optimized_xyz_no_imu is not None:
-        plt.plot(optimized_xyz_no_imu[:, 0], optimized_xyz_no_imu[:, 2], "o-", label="BA w/o IMU")
+    # plt.plot(initial_xyz[:, 0], initial_xyz[:, 2], "o--", label=initial_label)
+    # plt.plot(optimized_xyz[:, 0], optimized_xyz[:, 2], "o-", label=optimized_label)
+    # if optimized_xyz_no_imu is not None:
+        # plt.plot(optimized_xyz_no_imu[:, 0], optimized_xyz_no_imu[:, 2], "o-", label="BA w/o IMU")
     if additional_initial_pose_dicts:
         for label, pose_dict in additional_initial_pose_dicts.items():
             if base_frame not in pose_dict:
@@ -2058,7 +2076,7 @@ def plot_pose_trajectories(
             if not additional_points:
                 continue
             additional_xyz = np.asarray(additional_points, dtype=np.float64)
-            plt.plot(additional_xyz[:, 0], additional_xyz[:, 2], "o--", label=label)
+            # plt.plot(additional_xyz[:, 0], additional_xyz[:, 2], "o--", label=label)
     if additional_pose_dicts:
         for label, pose_dict in additional_pose_dicts.items():
             if base_frame not in pose_dict:
@@ -2073,7 +2091,7 @@ def plot_pose_trajectories(
             if not additional_points:
                 continue
             additional_xyz = np.asarray(additional_points, dtype=np.float64)
-            plt.plot(additional_xyz[:, 0], additional_xyz[:, 2], "o-", label=label)
+            # plt.plot(additional_xyz[:, 0], additional_xyz[:, 2], "o-", label=label)
     if inertial_xyz is not None:
         plt.plot(
             inertial_xyz[:, 0],
@@ -2107,6 +2125,7 @@ def plot_pose_trajectories(
             alpha=0.35,
             label="Landmarks after BA",
         )
+
     plt.xlabel("X (m)")
     plt.ylabel("Y (m)")
     plt.axis("equal")

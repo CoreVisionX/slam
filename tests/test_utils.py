@@ -1405,63 +1405,123 @@ def _stereo_rectify_from_yaml(
 
 # ----------- IMU chunking -----------
 
+# def _load_euroc_imu_measurements_camframe(
+#     imu_t: np.ndarray,
+#     imu_omega_imu: np.ndarray,           # (N,3) IMU frame
+#     imu_acc_imu: np.ndarray,             # (N,3) IMU frame (specific force)
+#     cam_times: np.ndarray,               # (M,) sec
+#     gt_vel_times: np.ndarray | None = None,   # world frame times
+#     gt_vel_world: np.ndarray | None = None,   # (K,3) world frame velocities
+# ) -> list[FrameImuMeasurements]:
+#     """
+#     Output IMU chunks in LEFT-CAMERA (OpenCV) axes with dts aligned 1:1 to samples.
+#     We follow the same convention as your TartanAir loader: each IMU sample k carries
+#     the dt since the previous IMU sample.
+#     """
+#     # Global precomputation with a one-sample shift so dt aligns to the *current* sample.
+#     # After this, indices align: imu_t_s[i] has duration dts_all[i] since the previous raw sample.
+#     dts_all = np.diff(imu_t)                 # (N-1,)
+#     imu_t_s = imu_t[1:]                      # (N-1,)
+#     omega_s = imu_omega_imu[1:, :]           # (N-1,3)
+#     acc_s   = imu_acc_imu[1:, :]             # (N-1,3)
+
+#     out: list[FrameImuMeasurements] = []
+
+#     for k in range(len(cam_times)):
+#         if k == 0:
+#             out.append(FrameImuMeasurements(
+#                 frame_timestamp=float(cam_times[k]),
+#                 timestamps=np.array([], dtype=np.float64),
+#                 dts=np.array([], dtype=np.float64),
+#                 linear_accelerations=np.array([], dtype=np.float64),
+#                 angular_velocities=np.array([], dtype=np.float64),
+#             ))
+#             continue
+
+#         t0, t1 = cam_times[k - 1], cam_times[k]
+
+#         # Use (t0, t1] semantics to mirror your TartanAir behavior.
+#         mask = (imu_t_s > t0) & (imu_t_s <= t1)
+
+#         ts   = imu_t_s[mask]                 # (n,)
+#         dts  = dts_all[mask]                 # (n,)  <-- aligned 1:1 with ts
+#         ome = omega_s[mask]                 # (n,3)
+#         acc = acc_s[mask]                   # (n,3)
+
+#         # TODO: determine if accounting for the translational displacement of the IMU from the camera is necessary
+
+#         # Velocity at frame time (world)
+#         ii = int(_nearest_indices(gt_vel_times, np.array([t1]))[0])
+#         v_world = gt_vel_world[ii]
+
+#         out.append(FrameImuMeasurements(
+#             frame_timestamp=float(t1),
+#             timestamps=ts,
+#             dts=dts,                                # length matches timestamps
+#             linear_accelerations=acc,
+#             angular_velocities=ome,
+#             world_velocity=v_world,
+#             body_velocity=v_world,
+#         ))
+#     return out
+
+
 def _load_euroc_imu_measurements_camframe(
     imu_t: np.ndarray,
-    imu_omega_imu: np.ndarray,           # (N,3) IMU frame
-    imu_acc_imu: np.ndarray,             # (N,3) IMU frame (specific force)
-    cam_times: np.ndarray,               # (M,) sec
-    gt_vel_times: np.ndarray | None = None,   # world frame times
-    gt_vel_world: np.ndarray | None = None,   # (K,3) world frame velocities
+    imu_omega_imu: np.ndarray,
+    imu_acc_imu: np.ndarray,
+    cam_times: np.ndarray,
+    gt_vel_times: np.ndarray | None = None,
+    gt_vel_world: np.ndarray | None = None,
 ) -> list[FrameImuMeasurements]:
-    """
-    Output IMU chunks in LEFT-CAMERA (OpenCV) axes with dts aligned 1:1 to samples.
-    We follow the same convention as your TartanAir loader: each IMU sample k carries
-    the dt since the previous IMU sample.
-    """
-    # Global precomputation with a one-sample shift so dt aligns to the *current* sample.
-    # After this, indices align: imu_t_s[i] has duration dts_all[i] since the previous raw sample.
-    dts_all = np.diff(imu_t)                 # (N-1,)
-    imu_t_s = imu_t[1:]                      # (N-1,)
-    omega_s = imu_omega_imu[1:, :]           # (N-1,3)
-    acc_s   = imu_acc_imu[1:, :]             # (N-1,3)
-
     out: list[FrameImuMeasurements] = []
 
     for k in range(len(cam_times)):
         if k == 0:
             out.append(FrameImuMeasurements(
                 frame_timestamp=float(cam_times[k]),
-                timestamps=np.array([], dtype=np.float64),
-                dts=np.array([], dtype=np.float64),
-                linear_accelerations=np.array([], dtype=np.float64),
-                angular_velocities=np.array([], dtype=np.float64),
+                timestamps=np.array([], float),
+                dts=np.array([], float),
+                linear_accelerations=np.array([], float),
+                angular_velocities=np.array([], float),
             ))
             continue
 
         t0, t1 = cam_times[k - 1], cam_times[k]
 
-        # Use (t0, t1] semantics to mirror your TartanAir behavior.
-        mask = (imu_t_s > t0) & (imu_t_s <= t1)
+        # indices of raw IMU *inside* (t0, t1]
+        idx = np.where((imu_t > t0) & (imu_t <= t1))[0]
+        if idx.size == 0:
+            out.append(FrameImuMeasurements(
+                frame_timestamp=float(t1),
+                timestamps=np.array([], float),
+                dts=np.array([], float),
+                linear_accelerations=np.array([], float),
+                angular_velocities=np.array([], float),
+            ))
+            continue
 
-        ts   = imu_t_s[mask]                 # (n,)
-        dts  = dts_all[mask]                 # (n,)  <-- aligned 1:1 with ts
-        ome = omega_s[mask]                 # (n,3)
-        acc = acc_s[mask]                   # (n,3)
+        ts = imu_t[idx]
 
-        # TODO: determine if accounting for the translational displacement of the IMU from the camera is necessary
+        # dt from previous sample *clipped to the interval start*
+        ts_with_start = np.concatenate([[t0], ts])
+        dts = np.diff(ts_with_start)               # sum(dts) == t1 - t0 (ish)
 
-        # Velocity at frame time (world)
+        ome = imu_omega_imu[idx]
+        acc = imu_acc_imu[idx]
+
+        # nearest GT velocity for the *frame time* t1
         ii = int(_nearest_indices(gt_vel_times, np.array([t1]))[0])
         v_world = gt_vel_world[ii]
 
         out.append(FrameImuMeasurements(
             frame_timestamp=float(t1),
             timestamps=ts,
-            dts=dts,                                # length matches timestamps
+            dts=dts,
             linear_accelerations=acc,
             angular_velocities=ome,
             world_velocity=v_world,
-            body_velocity=v_world,
+            body_velocity=v_world,  # or rotate to body if you actually use it
         ))
     return out
 
@@ -1762,7 +1822,7 @@ def estimate_world_gravity_from_first_batch(sequence, g=9.81, max_batches=50, no
         g: gravity magnitude
         max_batches: max number of non-empty IMU batches to use
     """
-    # return np.array([0.0, 0.0, -g])
+    return np.array([0.0, 0.0, -g])
 
     g_world_estimates = []
     weights = []
