@@ -1337,6 +1337,64 @@ def _nearest_indices(src_times: np.ndarray, ref_times: np.ndarray) -> np.ndarray
     pick_left = (ref_times - src_times[left]) <= (src_times[right] - ref_times)
     return np.where(pick_left, left, right)
 
+def _interpolate_pose3(
+    gt_times: np.ndarray,
+    gt_poses: list[gtsam.Pose3],
+    query_time: float,
+) -> gtsam.Pose3:
+    if gt_times.size == 0:
+        raise ValueError("Cannot interpolate pose without ground-truth poses.")
+    if len(gt_poses) != gt_times.size:
+        raise ValueError("Ground-truth pose times and values must have the same length.")
+    if query_time <= gt_times[0]:
+        return gt_poses[0]
+    if query_time >= gt_times[-1]:
+        return gt_poses[-1]
+
+    idx = int(np.searchsorted(gt_times, query_time))
+    # exact match
+    if gt_times[idx] == query_time:
+        return gt_poses[idx]
+
+    t0 = gt_times[idx - 1]
+    t1 = gt_times[idx]
+    pose0 = gt_poses[idx - 1]
+    pose1 = gt_poses[idx]
+    if not np.isfinite(t1 - t0) or t1 == t0:
+        return pose0
+
+    alpha = float((query_time - t0) / (t1 - t0))
+    delta = pose0.between(pose1)
+    xi = gtsam.Pose3.Logmap(delta)
+    return pose0.compose(gtsam.Pose3.Expmap(alpha * xi))
+
+def _interpolate_vector_sample(
+    gt_times: np.ndarray | None,
+    gt_values: np.ndarray | None,
+    query_time: float,
+) -> np.ndarray | None:
+    if gt_times is None or gt_values is None or gt_times.size == 0 or gt_values.size == 0:
+        return None
+    if gt_times.shape[0] != gt_values.shape[0]:
+        raise ValueError("Ground-truth times and values must have the same length.")
+    if query_time <= gt_times[0]:
+        return gt_values[0]
+    if query_time >= gt_times[-1]:
+        return gt_values[-1]
+
+    idx = int(np.searchsorted(gt_times, query_time))
+    if gt_times[idx] == query_time:
+        return gt_values[idx]
+
+    t0 = gt_times[idx - 1]
+    t1 = gt_times[idx]
+    v0 = gt_values[idx - 1]
+    v1 = gt_values[idx]
+    if not np.isfinite(t1 - t0) or t1 == t0:
+        return v0
+    alpha = float((query_time - t0) / (t1 - t0))
+    return (1.0 - alpha) * v0 + alpha * v1
+
 def _identity_maps(w: int, h: int) -> tuple[np.ndarray, np.ndarray]:
     xs = np.arange(w, dtype=np.float32)
     ys = np.arange(h, dtype=np.float32)
@@ -1510,9 +1568,14 @@ def _load_euroc_imu_measurements_camframe(
         ome = imu_omega_imu[idx]
         acc = imu_acc_imu[idx]
 
-        # nearest GT velocity for the *frame time* t1
-        ii = int(_nearest_indices(gt_vel_times, np.array([t1]))[0])
-        v_world = gt_vel_world[ii]
+        # interpolate GT velocity for the frame time to avoid jumps when GT samples are sparse
+        v_world = _interpolate_vector_sample(
+            gt_vel_times,
+            gt_vel_world,
+            float(t1),
+        )
+        if v_world is None:
+            v_world = np.zeros(3, dtype=np.float64)
 
         out.append(FrameImuMeasurements(
             frame_timestamp=float(t1),
@@ -1569,12 +1632,19 @@ def _load_euroc_sequence(
 
     poses_B_from_world: list[gtsam.Pose3] = []
 
-    # Align each camera timestamp with the closest GT state
-    nearest = _nearest_indices(gt_t, cam_times)
-    for ii in nearest:
-        T_imu_from_world = gt_world_T_imu[ii]  # IMU <- world
+    if gt_t.size == 0 or len(gt_world_T_imu) == 0:
+        raise ValueError("EuRoC sequence is missing ground-truth poses.")
 
-        poses_B_from_world.append(T_imu_from_world)
+    # # Align each camera timestamp with the closest GT state
+    # nearest = _nearest_indices(gt_t, cam_times)
+    # for ii in nearest:
+    #     T_imu_from_world = gt_world_T_imu[ii]  # IMU <- world
+
+    #     poses_B_from_world.append(T_imu_from_world)
+
+    # Align each camera timestamp with an interpolated GT state to avoid jumps when GT is sparse
+    for cam_t in cam_times:
+        poses_B_from_world.append(_interpolate_pose3(gt_t, gt_world_T_imu, float(cam_t)))
 
     # IMU stream, in the body frame
     imu_t, imu_omega_imu, imu_acc_imu = _read_euroc_imu(imu_dir)
@@ -1679,35 +1749,37 @@ def load_euroc_sequence_segment(
     seq = _load_euroc_sequence(seq_name, alpha=alpha)
     N = len(seq.left_paths)
     if N < sequence_length:
-        raise ValueError(f"Sequence too short ({N}) for requested length {sequence_length}.")
+        sequence_length = N
+        print(f"Sequence too short for requested length {sequence_length}, using full sequence length of {N}.")
 
-    # rng = random.Random(seed)
-    # sampling_mode = sampling_mode.lower()
-    # if sampling_mode == "contiguous":
-    #     max_start = N - sequence_length
-    #     start_idx = rng.randint(0, max_start)
-    #     sampled = list(range(start_idx, start_idx + sequence_length))
-    # elif sampling_mode == "stride":
-    #     sampled = []
-    #     max_attempts = min(1024, N * 8)
-    #     for _ in range(max_attempts):
-    #         s = rng.randint(0, N - 1)
-    #         cur = s
-    #         cand = [cur]
-    #         for _ in range(sequence_length - 1):
-    #             stride = rng.randint(min_stride, max_stride)
-    #             cur += stride
-    #             if cur >= N:
-    #                 break
-    #             cand.append(cur)
-    #         if len(cand) == sequence_length:
-    #             sampled = cand
-    #             break
-    #     if len(sampled) != sequence_length:
-    #         raise RuntimeError("Could not sample a sequence satisfying stride bounds.")
-    # else:
-    #     raise ValueError("sampling_mode must be 'contiguous' or 'stride'.")
-    sampled = list(range(sequence_length))
+    rng = random.Random(seed)
+    sampling_mode = sampling_mode.lower()
+    if sampling_mode == "contiguous":
+        max_start = N - sequence_length
+        start_idx = rng.randint(0, max_start)
+        sampled = list(range(start_idx, start_idx + sequence_length))
+    elif sampling_mode == "stride":
+        sampled = []
+        max_attempts = min(1024, N * 8)
+        for _ in range(max_attempts):
+            s = rng.randint(0, N - 1)
+            cur = s
+            cand = [cur]
+            for _ in range(sequence_length - 1):
+                stride = rng.randint(min_stride, max_stride)
+                cur += stride
+                if cur >= N:
+                    break
+                cand.append(cur)
+            if len(cand) == sequence_length:
+                sampled = cand
+                break
+        if len(sampled) != sequence_length:
+            raise RuntimeError("Could not sample a sequence satisfying stride bounds.")
+    else:
+        raise ValueError("sampling_mode must be 'contiguous' or 'stride'.")
+
+    # sampled = list(range(sequence_length))
 
     # Optionally scale calibration if resizing
     if resize_to is not None:

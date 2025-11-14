@@ -38,17 +38,18 @@ import tests.test_utils as test_utils  # noqa: E402
 # Configuration
 # ----------------------------------------------------------------------
 NUM_SEQUENCE_SAMPLES = 1
-SEQUENCE_LENGTH = 3682
+SEQUENCE_LENGTH = 10_000
 # ENVIRONMENT = "Hospital"
 # DIFFICULTY = "diff"
 # TRAJECTORY = "P1000"
+EUROC_SEQUENCE = "VI_02_medium"
 ENVIRONMENT = "AbandonedFactory"
 DIFFICULTY = "easy"
 TRAJECTORY = "P001"
 SAMPLING_MODE = "stride"
 MIN_STRIDE = 1
 MAX_STRIDE = 1
-BASE_SEED = 11
+BASE_SEED = 12
 
 USE_IMU_FACTORS = True
 DEPTH_MODE = os.environ.get("LOCAL_VO_DEPTH_MODE", "sgbm").strip().lower() # TODO: figure out why on hospital true depth is so much better than sgbm, where does it get messed up?
@@ -2474,7 +2475,7 @@ for sample_idx in range(NUM_SEQUENCE_SAMPLES):
     #     add_imu_noise=True
     # )
     sequence = test_utils.load_euroc_sequence_segment(
-        seq_name="MH_01_easy",
+        seq_name=EUROC_SEQUENCE,
         sequence_length=SEQUENCE_LENGTH,
         seed=seed,
     )
@@ -2719,13 +2720,30 @@ for sample_idx in range(NUM_SEQUENCE_SAMPLES):
             est_poses = []
             gt_poses = []
 
+            # log map
+            rr.set_time("frame", sequence=0)
+
+            optimized_landmarks = result["ba_result"].get("optimized_landmarks")
+            if optimized_landmarks:
+                landmarks_arr = np.asarray(optimized_landmarks, dtype=np.float32)
+                if landmarks_arr.size:
+                    rr.log("optimized_landmarks", rr.Points3D(landmarks_arr, radii=0.01))
+
+            # log poses trajectories
             for i in range(len(est_traj_aligned)):
                 rr.set_time("frame", sequence=i)
 
+                # est_pose = gtsam.Pose3(
+                #     gtsam.Rot3.Quaternion(w=est_traj_aligned[i, 3], x=est_traj_aligned[i, 4], y=est_traj_aligned[i, 5], z=est_traj_aligned[i, 6]),
+                #     gtsam.Point3(est_traj_aligned[i, 0:3])
+                # )
+
+                # use the unaligned est_traj for now so the landmarks don't also need to be aligned
                 est_pose = gtsam.Pose3(
-                    gtsam.Rot3.Quaternion(w=est_traj_aligned[i, 3], x=est_traj_aligned[i, 4], y=est_traj_aligned[i, 5], z=est_traj_aligned[i, 6]),
-                    gtsam.Point3(est_traj_aligned[i, 0:3])
+                    gtsam.Rot3.Quaternion(w=est_traj[i, 3], x=est_traj[i, 4], y=est_traj[i, 5], z=est_traj[i, 6]),
+                    gtsam.Point3(est_traj[i, 0:3])
                 )
+
                 est_poses.append(est_pose)
                 rr_log_pose("est_pose", est_pose, depth_variants[1][1][i] if len(depth_variants) > 1 else depth_variants[0][1][i], camera_xyz=rr.ViewCoordinates.RIGHT_HAND_X_UP)
 
