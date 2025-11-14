@@ -42,7 +42,7 @@ SEQUENCE_LENGTH = 10_000
 # ENVIRONMENT = "Hospital"
 # DIFFICULTY = "diff"
 # TRAJECTORY = "P1000"
-EUROC_SEQUENCE = "VI_03_difficult"
+EUROC_SEQUENCE = "MH_01_easy"
 ENVIRONMENT = "AbandonedFactory"
 DIFFICULTY = "easy"
 TRAJECTORY = "P001"
@@ -61,12 +61,13 @@ USE_GROUND_TRUTH_DEPTH = DEPTH_MODE == "ground_truth"
 
 # Feature detection / tracking
 MAX_FEATURE_COUNT = 1024
-REFILL_FEATURE_RATIO = 0.8  # refill when remaining tracks fall below 60% of the budget
+REFILL_FEATURE_RATIO = 0.8  # refill when remaining tracks fall below 60% of the budget # should this apply to to max feature count?
 FEATURE_SUPPRESSION_RADIUS = 8.0
 FAST_THRESHOLD = 25
 FAST_NONMAX = True
 FAST_BORDER = 12
 
+# on euroc I'm only getting like a hundred or so features per frame, maybe I need to adjust the tracking parameters?
 LK_WIN_SIZE = (15, 15)
 # LK_WIN_SIZE = (7, 7)
 LK_MAX_LEVEL = 5
@@ -1393,6 +1394,8 @@ def run_bundle_adjustment(
         # gtsam.noiseModel.Diagonal.Sigmas(
         #     IMU_BIAS_PRIOR_SIGMAS)))
 
+        # could continuous bias without priors on later keys be the reason there's big jumps at the end?
+        # definitely play with these, they might be too tight? not sure needs lots of experiments. also just better IMU calibration in general will help so much
         bias_prior_noise = np.array([0.01, 0.01, 0.01, 0.001, 0.001, 0.001], dtype=float)
 
 
@@ -1407,7 +1410,7 @@ def run_bundle_adjustment(
                 values.insert(B(k), gtsam.imuBias.ConstantBias())
             #     if k != frames_for_ba[0]:
             #         graph.add(gtsam.PriorFactorConstantBias(B(k), gtsam.imuBias.ConstantBias(), gtsam.noiseModel.Diagonal.Sigmas(
-            # IMU_BIAS_PRIOR_SIGMAS)))
+            # bias_prior_noise)))
 
         for prev_frame, next_frame in zip(frames_for_ba[:-1], frames_for_ba[1:]):
             # print(f'Adding imu factor for {prev_frame} and {next_frame}')
