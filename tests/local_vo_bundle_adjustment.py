@@ -3,6 +3,7 @@ import os
 import sys
 from dataclasses import dataclass, field
 from pathlib import Path
+import time
 from typing import Any
 import cv2
 import gtsam
@@ -37,7 +38,7 @@ import tests.test_utils as test_utils  # noqa: E402
 # Configuration
 # ----------------------------------------------------------------------
 NUM_SEQUENCE_SAMPLES = 1
-SEQUENCE_LENGTH = 20
+SEQUENCE_LENGTH = 3682
 # ENVIRONMENT = "Hospital"
 # DIFFICULTY = "diff"
 # TRAJECTORY = "P1000"
@@ -80,7 +81,7 @@ MIN_OBSERVATIONS_PER_FRAME = 5
 PROJECTION_NOISE_PX = 1.0
 DISPARITY_NOISE_PX = 1.0 # scale based on distance?
 PROJECTION_NOISE_HUBER = True
-REPROJECTION_GATING_THRESHOLD_PX = 4.0
+REPROJECTION_GATING_THRESHOLD_PX = 2.0
 USE_INLIER_OBSERVATIONS_ONLY = False
 POSE_PRIOR_SIGMAS = np.array(
     [
@@ -130,6 +131,74 @@ RESULTS_DIR = Path(__file__).parent / "results"
 RESULTS_PATH = RESULTS_DIR / "klt_local_vo_bundle_adjustment.npz"
 
 RESULTS_DIR.mkdir(parents=True, exist_ok=True)
+
+
+def _frame_timestamp(frame_idx: int, timestamps: np.ndarray | None) -> float:
+    if timestamps is None:
+        return float(frame_idx)
+    if 0 <= frame_idx < len(timestamps):
+        return float(timestamps[frame_idx])
+    return float(frame_idx)
+
+
+def _pose_dict_to_tum_array(
+    pose_dict: dict[int, gtsam.Pose3],
+    frame_timestamps: np.ndarray | None,
+) -> np.ndarray:
+    if not pose_dict:
+        return np.empty((0, 8), dtype=np.float64)
+
+    rows: list[list[float]] = []
+    for frame_idx in sorted(pose_dict):
+        timestamp = _frame_timestamp(frame_idx, frame_timestamps)
+        pose = pose_dict[frame_idx]
+        translation = to_numpy_vec3(pose.translation())
+        quat = pose.rotation().toQuaternion()
+        rows.append(
+            [
+                timestamp,
+                float(translation[0]),
+                float(translation[1]),
+                float(translation[2]),
+                float(quat.x()),
+                float(quat.y()),
+                float(quat.z()),
+                float(quat.w()),
+            ]
+        )
+    return np.asarray(rows, dtype=np.float64)
+
+
+def _write_tum_file(path: Path, tum_data: np.ndarray) -> None:
+    if tum_data.size == 0:
+        return
+    np.savetxt(path, tum_data, fmt="%.9f")
+    print(f"Saved TUM trajectory: {path}")
+
+
+def save_variant_tum_files(
+    *,
+    sample_index: int,
+    depth_label: str,
+    estimated_pose_dict: dict[int, gtsam.Pose3],
+    sequence_sample: test_utils.FrameSequenceWithGroundTruth,  # type: ignore[type-arg]
+) -> None:
+    if not estimated_pose_dict:
+        return
+
+    prefix = f"sample{sample_index}_{depth_label}"
+    est_path = RESULTS_DIR / f"{prefix}_estimated.txt"
+    est_tum = _pose_dict_to_tum_array(estimated_pose_dict, sequence_sample.frame_timestamps)
+    _write_tum_file(est_path, est_tum)
+
+    gt_pose_dict = {
+        idx: sequence_sample.world_poses[idx]
+        for idx in estimated_pose_dict
+        if 0 <= idx < len(sequence_sample.world_poses)
+    }
+    gt_path = RESULTS_DIR / f"{prefix}_ground_truth.txt"
+    gt_tum = _pose_dict_to_tum_array(gt_pose_dict, sequence_sample.frame_timestamps)
+    _write_tum_file(gt_path, gt_tum)
 
 device = "cuda" if torch.cuda.is_available() else "cpu"
 print(f"Using device: {device}")
@@ -633,18 +702,18 @@ def integrate_inertial_trajectory(
     bias = gtsam.imuBias.ConstantBias()
     velocities = estimate_sequence_velocities(sequence)
 
-    # print imu measurement diagnostics
-    for k, batch in enumerate(sequence.imu_measurements):
-        if len(batch) == 0:
-            print(k, "EMPTY batch")
-            continue
-        print(
-            k,
-            "N =", len(batch),
-            "dt_sum =", batch.dts.sum(),
-            "acc_mean =", np.linalg.norm(batch.linear_accelerations.mean(axis=0)),
-            "omega_mean =", np.linalg.norm(batch.angular_velocities.mean(axis=0)),
-        )
+    # # print imu measurement diagnostics
+    # for k, batch in enumerate(sequence.imu_measurements):
+    #     if len(batch) == 0:
+    #         print(k, "EMPTY batch")
+    #         continue
+    #     print(
+    #         k,
+    #         "N =", len(batch),
+    #         "dt_sum =", batch.dts.sum(),
+    #         "acc_mean =", np.linalg.norm(batch.linear_accelerations.mean(axis=0)),
+    #         "omega_mean =", np.linalg.norm(batch.angular_velocities.mean(axis=0)),
+    #     )
 
     # inertial_poses: list[gtsam.Pose3] = []
 
@@ -1323,7 +1392,7 @@ def run_bundle_adjustment(
         # gtsam.noiseModel.Diagonal.Sigmas(
         #     IMU_BIAS_PRIOR_SIGMAS)))
 
-        bias_prior_noise = np.array([0.008, 0.008, 0.008, 0.0002, 0.0002, 0.0002], dtype=float)
+        bias_prior_noise = np.array([0.01, 0.01, 0.01, 0.001, 0.001, 0.001], dtype=float)
 
 
         graph.add(gtsam.PriorFactorConstantBias(
@@ -1545,7 +1614,12 @@ def run_bundle_adjustment(
         raise RuntimeError("No landmark observations available for bundle adjustment.")
 
     optimizer = gtsam.LevenbergMarquardtOptimizer(graph, values)
+    
+    print("Performing bundle adjustment...")
+    start_time = time.perf_counter()
     optimized_values = optimizer.optimize()
+    end_time = time.perf_counter()
+    print(f"Bundle adjustment optimized in {end_time - start_time:.2f} seconds")
 
     if USE_IMU_FACTORS:
         def sum_vision_error(graph, values):
@@ -1589,8 +1663,8 @@ def run_bundle_adjustment(
     observation_matrix = [(frame_idx, landmark_idx, measurement) for frame_idx, landmark_idx, measurement in observations]
     # observation_matrix = []
 
-    reprojection_before = compute_reprojection_errors(initial_pose_dict, initial_landmarks, observation_matrix, calibration)
-    reprojection_after = compute_reprojection_errors(optimized_pose_dict, optimized_landmarks, observation_matrix, calibration)
+    # reprojection_before = compute_reprojection_errors(initial_pose_dict, initial_landmarks, observation_matrix, calibration)
+    # reprojection_after = compute_reprojection_errors(optimized_pose_dict, optimized_landmarks, observation_matrix, calibration)
     # reprojection_before = np.zeros(len(frames_for_ba))
     # reprojection_after = np.zeros(len(frames_for_ba))
 
@@ -1607,8 +1681,8 @@ def run_bundle_adjustment(
         "optimized_pose_dict": optimized_pose_dict,
         "initial_landmarks": initial_landmarks,
         "optimized_landmarks": optimized_landmarks,
-        "reprojection_before": reprojection_before,
-        "reprojection_after": reprojection_after,
+        # "reprojection_before": reprojection_before,
+        # "reprojection_after": reprojection_after,
         "stereo_counts": stereo_counts,
         "mono_counts": mono_counts,
         "imu_bias_before": bias_before_vec,
@@ -2354,8 +2428,8 @@ def run_depth_variant(
             np.rad2deg(pose_errors_no_imu[idx]["rotation_norm_rad"]) for idx in sorted(pose_errors_no_imu)
         ]
 
-    rms_before = float(np.sqrt(np.mean(ba_result["reprojection_before"] ** 2)))
-    rms_after = float(np.sqrt(np.mean(ba_result["reprojection_after"] ** 2)))
+    # rms_before = float(np.sqrt(np.mean(ba_result["reprojection_before"] ** 2)))
+    # rms_after = float(np.sqrt(np.mean(ba_result["reprojection_after"] ** 2)))
 
     return {
         "label": depth_label,
@@ -2372,8 +2446,8 @@ def run_depth_variant(
         "optimized_rotation_norms_deg": optimized_rotation_norms_deg,
         "optimized_translation_norms_no_imu": optimized_translation_norms_no_imu,
         "optimized_rotation_norms_deg_no_imu": optimized_rotation_norms_deg_no_imu,
-        "rms_before": rms_before,
-        "rms_after": rms_after,
+        # "rms_before": rms_before,
+        # "rms_after": rms_after,
         "tracks": tracks,
     }
 
@@ -2460,13 +2534,13 @@ for sample_idx in range(NUM_SEQUENCE_SAMPLES):
     optimized_rotation_norms_deg = primary_result["optimized_rotation_norms_deg"]
     optimized_translation_norms_no_imu = primary_result["optimized_translation_norms_no_imu"]
     optimized_rotation_norms_deg_no_imu = primary_result["optimized_rotation_norms_deg_no_imu"]
-    rms_before = primary_result["rms_before"]
-    rms_after = primary_result["rms_after"]
+    # rms_before = primary_result["rms_before"]
+    # rms_after = primary_result["rms_after"]
     track_history = primary_result["track_history"]
     tracks = primary_result["tracks"]
     sequence_results = primary_result["sequence_results"]
 
-    save_results(tracking_summary, ba_result, sequence)
+    # save_results(tracking_summary, ba_result, sequence)
 
     for result in variant_results:
         label = result["label"]
@@ -2477,9 +2551,9 @@ for sample_idx in range(NUM_SEQUENCE_SAMPLES):
         )
         print(f"  Frames optimised: {result_ba['frames_for_ba']}")
         print(f"  Landmarks optimised: {len(result_ba['landmark_original_indices'])}")
-        print(
-            f"  Reprojection RMS: {result['rms_before']:.3f} px -> {result['rms_after']:.3f} px"
-        )
+        # print(
+        #     f"  Reprojection RMS: {result['rms_before']:.3f} px -> {result['rms_after']:.3f} px"
+        # )
         # print(
         #     "  Translation error norms (m):",
         #     np.array2string(np.asarray(result["optimized_translation_norms"]), precision=3),
@@ -2505,12 +2579,12 @@ for sample_idx in range(NUM_SEQUENCE_SAMPLES):
 
         if result["ba_result_no_imu"] is not None:
             result_no_imu = result["ba_result_no_imu"]
-            rms_before_no_imu = float(np.sqrt(np.mean(result_no_imu["reprojection_before"] ** 2)))
-            rms_after_no_imu = float(np.sqrt(np.mean(result_no_imu["reprojection_after"] ** 2)))
+            # rms_before_no_imu = float(np.sqrt(np.mean(result_no_imu["reprojection_before"] ** 2)))
+            # rms_after_no_imu = float(np.sqrt(np.mean(result_no_imu["reprojection_after"] ** 2)))
             print("Bundle adjustment summary (vision only)")
             print(f"  Frames optimised: {result_no_imu['frames_for_ba']}")
             print(f"  Landmarks optimised: {len(result_no_imu['landmark_original_indices'])}")
-            print(f"  Reprojection RMS: {rms_before_no_imu:.3f} px -> {rms_after_no_imu:.3f} px")
+            # print(f"  Reprojection RMS: {rms_before_no_imu:.3f} px -> {rms_after_no_imu:.3f} px")
             # print(
             #     "  Translation error norms (m):",
             #     np.array2string(np.asarray(result["optimized_translation_norms_no_imu"]), precision=3),
@@ -2535,7 +2609,7 @@ for sample_idx in range(NUM_SEQUENCE_SAMPLES):
             print(f"% RMSE per meter travelled (vision only): {(np.sqrt(np.mean(translation_errors ** 2)) / total_distance) * 100:.2f}")
 
     # plot_feature_tracks(rectified_frames, track_history, tracks)
-    plot_track_length_histogram(tracks)
+    # plot_track_length_histogram(tracks)
     # plot_match_debug(rectified_frames, sequence_results)
 
     additional_pose_dicts = None
@@ -2553,28 +2627,28 @@ for sample_idx in range(NUM_SEQUENCE_SAMPLES):
         }
         if additional_initial_entries:
             additional_initial_pose_dicts = additional_initial_entries
-    plot_pose_trajectories(
-        ba_result["initial_pose_dict"],
-        ba_result["optimized_pose_dict"],
-        sequence,
-        landmark_stride=5,
-        inertial_poses=inertial_poses,
-        optimized_pose_dict_no_imu=ba_result_no_imu["optimized_pose_dict"] if ba_result_no_imu else None,
-        initial_label=primary_initial_label,
-        optimized_label=primary_optimized_label,
-        additional_pose_dicts=additional_pose_dicts,
-        additional_initial_pose_dicts=additional_initial_pose_dicts,
-    )
-    plot_pose_error_norms_per_frame(
-        ba_result["initial_pose_dict"],
-        ba_result["optimized_pose_dict"],
-        sequence,
-        comparison_pose_dict=ba_result_no_imu["optimized_pose_dict"] if ba_result_no_imu else None,
-    )
-    plot_reprojection_error_histograms(
-        ba_result["reprojection_before"],
-        ba_result["reprojection_after"],
-    )
+    # plot_pose_trajectories(
+    #     ba_result["initial_pose_dict"],
+    #     ba_result["optimized_pose_dict"],
+    #     sequence,
+    #     landmark_stride=5,
+    #     inertial_poses=inertial_poses,
+    #     optimized_pose_dict_no_imu=ba_result_no_imu["optimized_pose_dict"] if ba_result_no_imu else None,
+    #     initial_label=primary_initial_label,
+    #     optimized_label=primary_optimized_label,
+    #     additional_pose_dicts=additional_pose_dicts,
+    #     additional_initial_pose_dicts=additional_initial_pose_dicts,
+    # )
+    # plot_pose_error_norms_per_frame(
+    #     ba_result["initial_pose_dict"],
+    #     ba_result["optimized_pose_dict"],
+    #     sequence,
+    #     comparison_pose_dict=ba_result_no_imu["optimized_pose_dict"] if ba_result_no_imu else None,
+    # )
+    # plot_reprojection_error_histograms(
+    #     ba_result["reprojection_before"],
+    #     ba_result["reprojection_after"],
+    # )
     percentage_plot_series: list[tuple[str, np.ndarray, np.ndarray, np.ndarray]] = []
     err_xyzs = []
     for result in variant_results:
@@ -2593,6 +2667,13 @@ for sample_idx in range(NUM_SEQUENCE_SAMPLES):
         # print(f"Total distance travelled ({result['label']}): {np.sum(translation_errors):.2f} m")
         # print(f"RMSE ({result['label']}): {np.sqrt(np.mean(translation_errors ** 2)):.2f} m")
         # print(f"RMSE per meter travelled ({result['label']}): {(np.sqrt(np.mean(translation_errors ** 2)) / total_distance):.3f}")
+
+        save_variant_tum_files(
+            sample_index=sample_idx,
+            depth_label=result["label"],
+            estimated_pose_dict=result["optimized_pose_dict"],
+            sequence_sample=sequence,
+        )
 
         # Pass the ground truth trajectory directly to the evaluation function.
         est_traj_xyz = np.asarray([result["optimized_pose_dict"][idx].translation() for idx in sorted(result["optimized_pose_dict"])])
@@ -2631,7 +2712,6 @@ for sample_idx in range(NUM_SEQUENCE_SAMPLES):
         print(f"GT total distance: {gt_traj_total_distance:.2f} m")
         print(f"ATE per meter travelled: {(ate / gt_traj_total_distance) * 100:.2f}%")
 
-        # NEXT ADD/REMOVE IMU NOISE
         if result['label'] == 'sgbm':
             rr.init("local_vo_bundle_adjustment")
             rr.spawn()
@@ -2647,7 +2727,7 @@ for sample_idx in range(NUM_SEQUENCE_SAMPLES):
                     gtsam.Point3(est_traj_aligned[i, 0:3])
                 )
                 est_poses.append(est_pose)
-                rr_log_pose("est_pose", est_pose, depth_variants[1][1][i] if len(depth_variants) > 1 else depth_variants[0][1][i])
+                rr_log_pose("est_pose", est_pose, depth_variants[1][1][i] if len(depth_variants) > 1 else depth_variants[0][1][i], camera_xyz=rr.ViewCoordinates.RIGHT_HAND_X_UP)
 
                 gt_pose = gtsam.Pose3(
                     gtsam.Rot3.Quaternion(w=gt_traj[i, 6], x=gt_traj[i, 3], y=gt_traj[i, 4], z=gt_traj[i, 5]),
