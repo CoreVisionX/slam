@@ -1,7 +1,6 @@
 # %%
 import os
 import sys
-from dataclasses import dataclass, field
 from pathlib import Path
 import time
 from typing import Any
@@ -13,6 +12,9 @@ import numpy as np
 import torch
 import tartanair as ta
 import rerun as rr
+from hydra import compose, initialize
+from hydra.utils import instantiate        
+from hydra import initialize_config_dir
 
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
@@ -20,16 +22,20 @@ from viz import rr_log_pose, rr_log_trajectory
 
 from depth.sgbm import SGBM  # noqa: E402
 from registration.registration import (  # noqa: E402
-    FeatureFrame,
     FramePair,
-    MatchedFramePair,
     RectifiedStereoFrame,
     StereoCalibration,
     StereoDepthFrame,
     StereoFrame
 )
-from registration.utils import draw_matches, solve_pnp  # noqa: E402
+from registration.utils import draw_matches  # noqa: E402
 import tests.test_utils as test_utils  # noqa: E402
+from slam.local_vo import (  # noqa: E402
+    FeatureTrack,
+    KLTFeatureTracker,
+    RelativePnPInitializer,
+    TrackObservation,
+)
 
 # TODO: expressing disparity uncertainty for depth measurements in BA properly might help a ton
 
@@ -38,7 +44,7 @@ import tests.test_utils as test_utils  # noqa: E402
 # Configuration
 # ----------------------------------------------------------------------
 NUM_SEQUENCE_SAMPLES = 1
-SEQUENCE_LENGTH = 10_000
+SEQUENCE_LENGTH = 600
 # ENVIRONMENT = "Hospital"
 # DIFFICULTY = "diff"
 # TRAJECTORY = "P1000"
@@ -58,24 +64,6 @@ DEPTH_MODE = os.environ.get("LOCAL_VO_DEPTH_MODE", "sgbm").strip().lower() # TOD
 if DEPTH_MODE not in {"sgbm", "ground_truth"}:
     raise ValueError("LOCAL_VO_DEPTH_MODE must be either 'sgbm' or 'ground_truth'.")
 USE_GROUND_TRUTH_DEPTH = DEPTH_MODE == "ground_truth"
-
-# Feature detection / tracking
-MAX_FEATURE_COUNT = 1024
-REFILL_FEATURE_RATIO = 0.8  # refill when remaining tracks fall below 60% of the budget # should this apply to to max feature count?
-FEATURE_SUPPRESSION_RADIUS = 8.0
-FAST_THRESHOLD = 25
-FAST_NONMAX = True
-FAST_BORDER = 12
-
-# on euroc I'm only getting like a hundred or so features per frame, maybe I need to adjust the tracking parameters?
-LK_WIN_SIZE = (15, 15)
-# LK_WIN_SIZE = (7, 7)
-LK_MAX_LEVEL = 5
-LK_CRITERIA = (cv2.TERM_CRITERIA_EPS | cv2.TERM_CRITERIA_COUNT, 40, 0.01)
-LK_MIN_EIG_THRESHOLD = 1e-3
-
-MIN_MATCHES_FOR_PNP = 6
-MAX_DEPTH = 40.0
 
 # Bundle adjustment
 MIN_OBSERVATIONS_PER_LANDMARK = 3 # increase this and reproj gate? might be a good trade off?
@@ -133,6 +121,32 @@ RESULTS_DIR = Path(__file__).parent / "results"
 RESULTS_PATH = RESULTS_DIR / "klt_local_vo_bundle_adjustment.npz"
 
 RESULTS_DIR.mkdir(parents=True, exist_ok=True)
+
+
+def _load_local_vo_config() -> Any:
+    config_dir = Path(__file__).parent / "config"
+    if initialize_config_dir is not None:
+        with initialize_config_dir(
+            config_dir=str(config_dir),
+            job_name="local_vo_bundle_adjustment",
+            version_base=None,
+        ):
+            return compose(config_name="local_vo")
+    with initialize(
+        config_path=str(config_dir),
+        job_name="local_vo_bundle_adjustment",
+        version_base=None,
+    ):
+        return compose(config_name="local_vo")
+
+
+LOCAL_VO_CFG = _load_local_vo_config()
+KLT_TRACKER: KLTFeatureTracker = instantiate(LOCAL_VO_CFG.klt_tracker)
+RELATIVE_POSE_INITIALIZER: RelativePnPInitializer = instantiate(LOCAL_VO_CFG.relative_pose_initializer)
+
+TRACKING_MAX_DEPTH = float(getattr(getattr(KLT_TRACKER, "config", None), "max_depth", 40.0))
+PNP_MAX_DEPTH = float(getattr(getattr(RELATIVE_POSE_INITIALIZER, "config", None), "max_depth", 40.0))
+MAX_DEPTH = float(max(TRACKING_MAX_DEPTH, PNP_MAX_DEPTH))
 
 
 def _frame_timestamp(frame_idx: int, timestamps: np.ndarray | None) -> float:
@@ -340,117 +354,6 @@ def _log_bundle_adjustment_to_rerun(
 
 
 
-# %%
-# ----------------------------------------------------------------------
-# Helper utilities
-# ----------------------------------------------------------------------
-@dataclass
-class TrackObservation:
-    keypoint: np.ndarray
-    depth: float
-
-
-@dataclass
-class FeatureTrack:
-    track_id: int
-    anchor_frame: int
-    anchor_keypoint: np.ndarray
-    anchor_depth: float
-    anchor_point3: np.ndarray
-    anchor_color: np.ndarray
-    observations: dict[int, TrackObservation] = field(default_factory=dict)
-    active: bool = True
-
-    def add_observation(self, frame_idx: int, point: np.ndarray, depth: float) -> None:
-        self.observations[frame_idx] = TrackObservation(
-            keypoint=np.asarray(point, dtype=np.float32),
-            depth=float(depth),
-        )
-
-def detect_fast_keypoints(
-    gray_image: np.ndarray,
-    max_features: int,
-    threshold: int,
-    nonmax: bool,
-    border: int,
-) -> np.ndarray:
-    detector = cv2.FastFeatureDetector_create(threshold=threshold, nonmaxSuppression=nonmax)
-    keypoints = detector.detect(gray_image)
-    if not keypoints:
-        raise RuntimeError("FAST detector did not return any keypoints.")
-
-    points = cv2.KeyPoint_convert(keypoints)
-    responses = np.array([kp.response for kp in keypoints], dtype=np.float32)
-
-    if border > 0:
-        h, w = gray_image.shape
-        inside = (
-            (points[:, 0] >= border)
-            & (points[:, 0] < w - border)
-            & (points[:, 1] >= border)
-            & (points[:, 1] < h - border)
-        )
-        points = points[inside]
-        responses = responses[inside]
-
-    if points.size == 0:
-        raise RuntimeError("All FAST keypoints were rejected by the border filter.")
-
-    if points.shape[0] > max_features:
-        order = np.argsort(responses)[::-1][:max_features]
-        points = points[order]
-
-    return points.astype(np.float32)
-
-
-def extract_keypoint_attributes(
-    depth_frame: StereoDepthFrame,
-    keypoints: np.ndarray,
-    max_depth: float,
-) -> dict[str, Any]:
-    h, w = depth_frame.left_depth.shape
-    clipped = np.clip(np.round(keypoints), [0, 0], [w - 1, h - 1]).astype(int)
-    rows = clipped[:, 1]
-    cols = clipped[:, 0]
-
-    depths = depth_frame.left_depth[rows, cols]
-    xyz = depth_frame.left_depth_xyz[rows, cols]
-    colors = depth_frame.left_rect[rows, cols]
-
-    valid = np.isfinite(depths) & (depths > 0.0) & (depths <= max_depth)
-    filtered = {
-        "keypoints": keypoints[valid],
-        "keypoints_depth": depths[valid],
-        "keypoints_3d": xyz[valid],
-        "keypoints_color": colors[valid],
-        "valid_mask": valid,
-    }
-    return filtered
-
-
-def build_feature_frame(
-    depth_frame: StereoDepthFrame,
-    attributes: dict[str, Any],
-) -> FeatureFrame:
-    features: dict[str, Any] = {
-        "keypoints": torch.from_numpy(attributes["keypoints"]).float(),
-        "keypoints_depth": attributes["keypoints_depth"],
-        "keypoints_3d": attributes["keypoints_3d"],
-        "keypoints_color": attributes["keypoints_color"],
-        "image_size": depth_frame.left_rect.shape[:2],
-    }
-    return FeatureFrame(
-        left=None,
-        right=None,
-        left_rect=None,
-        right_rect=None,
-        left_depth=None,
-        left_depth_xyz=None,
-        calibration=depth_frame.calibration,
-        features=features,
-    )
-
-
 def remap_ground_truth_depth(raw_depth: np.ndarray, calibration: StereoCalibration) -> np.ndarray:
     depth = np.asarray(raw_depth, dtype=np.float32)
     expected_shape = (calibration.height, calibration.width)
@@ -499,7 +402,6 @@ def build_ground_truth_depth_frame(
     invalid = (~np.isfinite(depth_rect)) | (depth_rect <= 0.0) | (depth_rect > max_depth)
     depth_rect[invalid] = np.nan
     depth_xyz = depth_map_to_xyz(depth_rect, rectified_frame.calibration.K_left_rect)
-    # depth_xyz = depth_map_to_xyz(depth_rect, rectified_frame.calibration.K_left)
     depth_xyz[invalid, :] = np.nan
     return StereoDepthFrame(
         left=rectified_frame.left,
@@ -541,25 +443,6 @@ def _integrate_imu_batch(
     if batch is None:
         raise ValueError("IMU batch missing while attempting to integrate measurements.")
 
-    # current_time = batch.frame_timestamp
-    # if batch.timestamps.size == 0:
-        # dt = float(next_timestamp - current_time)
-        # if dt > 0.0:
-        #     pim.integrateMeasurement(np.zeros(3), np.zeros(3), dt)
-        # return
-
-    # integrated = 0
-    # for sample_time, accel, gyro in zip(
-    #     batch.timestamps,
-    #     batch.linear_accelerations,
-    #     batch.angular_velocities,
-    # ):
-    #     dt = float(sample_time - current_time)
-    #     if dt > 0.0:
-    #         pim.integrateMeasurement(accel, gyro, dt)
-    #     current_time = float(sample_time)
-    #     integrated += 1
-
     integrated = 0
     # print(f'{len(batch.timestamps)} IMU samples')
     for i in range(len(batch)):
@@ -570,41 +453,6 @@ def _integrate_imu_batch(
         )
         integrated += 1
     assert integrated == 10
-
-# def preintegrate_between_frames(
-#     sequence: test_utils.FrameSequenceWithGroundTruth[StereoFrame],  # type: ignore[type-arg]
-#     start_idx: int,
-#     end_idx: int,
-#     params: gtsam.PreintegrationParams,
-#     bias: gtsam.imuBias.ConstantBias,
-# ) -> gtsam.PreintegratedImuMeasurements:
-#     if sequence.full_imu_measurements is None or sequence.frame_timestamps is None:
-#         raise ValueError("IMU measurements unavailable for this sequence.")
-#     if end_idx <= start_idx:
-#         raise ValueError("end_idx must be greater than start_idx for IMU preintegration.")
-
-#     pim = gtsam.PreintegratedImuMeasurements(params, bias)
-#     imu_batches = sequence.full_imu_measurements
-#     timestamps = sequence.frame_timestamps
-#     frame_indices = sequence.frame_indices
-
-#     assert end_idx == start_idx + 1
-
-#     batch = imu_batches[frame_indices[end_idx]]
-#     _integrate_imu_batch(pim, batch)
-
-#     # raw_start = frame_indices[start_idx + 1]
-#     # raw_end = frame_indices[end_idx + 1]
-
-#     # for raw_idx in range(raw_start, raw_end):
-#     #     if raw_idx >= len(imu_batches):
-#     #         break
-#     #     batch = imu_batches[raw_idx]
-#     #     if raw_idx + 1 >= len(timestamps):
-#     #         break
-#     #     _integrate_imu_batch(pim, batch)
-
-#     return pim
 
 
 def preintegrate_between_frames(sequence, start_idx, end_idx, params, bias, time_offset: float = 0.0):
@@ -773,219 +621,6 @@ def integrate_inertial_trajectory(
     return inertial_poses
 
 
-def _filter_keypoints_by_distance(
-    candidate_points: np.ndarray,
-    existing_points: np.ndarray,
-    min_radius: float,
-) -> np.ndarray:
-    if candidate_points.size == 0:
-        return np.empty((0, 2), dtype=np.float32)
-    if existing_points.size == 0:
-        return candidate_points.astype(np.float32)
-
-    kept: list[np.ndarray] = []
-    current = existing_points.reshape(-1, 2).astype(np.float32)
-    min_radius_sq = float(min_radius * min_radius)
-    for point in candidate_points.astype(np.float32):
-        if current.size:
-            deltas = current - point
-            if np.min(np.sum(deltas * deltas, axis=1)) < min_radius_sq:
-                continue
-        kept.append(point)
-        if current.size:
-            current = np.vstack([current, point.reshape(1, 2)])
-        else:
-            current = point.reshape(1, 2)
-    if not kept:
-        return np.empty((0, 2), dtype=np.float32)
-    return np.asarray(kept, dtype=np.float32)
-
-
-def _sample_depth_at_point(depth_frame: StereoDepthFrame, point: np.ndarray) -> float:
-    depth_map = depth_frame.left_depth
-    if depth_map.size == 0:
-        return float("nan")
-    h, w = depth_map.shape
-    u = float(point[0])
-    v = float(point[1])
-    if not (0 <= u < w and 0 <= v < h):
-        return float("nan")
-    col = int(np.clip(np.round(u), 0, w - 1))
-    row = int(np.clip(np.round(v), 0, h - 1))
-    depth_value = float(depth_map[row, col])
-    if not np.isfinite(depth_value) or depth_value <= 0.0:
-        return float("nan")
-    return depth_value
-
-
-def track_features_with_refill(
-    rectified_frames: list[RectifiedStereoFrame],
-    depth_frames: list[StereoDepthFrame],
-) -> tuple[list[dict[int, TrackObservation]], dict[int, FeatureTrack]]:
-    if len(rectified_frames) != len(depth_frames):
-        raise ValueError("Number of rectified frames and depth frames must match.")
-
-    gray_sequence = [cv2.cvtColor(frame.left_rect, cv2.COLOR_RGB2GRAY) for frame in rectified_frames]
-    frame_observations: list[dict[int, TrackObservation]] = []
-    tracks: dict[int, FeatureTrack] = {}
-    next_track_id = 0
-
-    prev_gray: np.ndarray | None = None
-    prev_points = np.empty((0, 1, 2), dtype=np.float32)
-    prev_ids = np.empty(0, dtype=int)
-
-    lk_params = dict(
-        winSize=LK_WIN_SIZE,
-        maxLevel=LK_MAX_LEVEL,
-        criteria=LK_CRITERIA,
-        minEigThreshold=LK_MIN_EIG_THRESHOLD,
-    )
-    refill_threshold = int(np.floor(REFILL_FEATURE_RATIO * MAX_FEATURE_COUNT))
-
-    for frame_idx, (gray, depth_frame) in enumerate(zip(gray_sequence, depth_frames)):
-        frame_obs: dict[int, TrackObservation] = {}
-        tracked_points: list[np.ndarray] = []
-        tracked_ids: list[int] = []
-
-        if prev_gray is not None and prev_points.size and prev_ids.size:
-            next_points, status, _ = cv2.calcOpticalFlowPyrLK(prev_gray, gray, prev_points, None, **lk_params)
-            if next_points is None or status is None:
-                status_mask = np.zeros(prev_ids.shape[0], dtype=bool)
-                next_points_arr = np.zeros((prev_ids.shape[0], 2), dtype=np.float32)
-            else:
-                status_mask = status.reshape(-1).astype(bool)
-                next_points_arr = next_points.reshape(-1, 2).astype(np.float32)
-
-            for idx, track_id in enumerate(prev_ids):
-                if idx >= status_mask.size or not status_mask[idx]:
-                    tracks[track_id].active = False
-                    continue
-                point = next_points_arr[idx]
-                depth_value = _sample_depth_at_point(depth_frame, point)
-                tracked_points.append(point)
-                tracked_ids.append(track_id)
-                tracks[track_id].add_observation(frame_idx, point, depth_value)
-                frame_obs[track_id] = tracks[track_id].observations[frame_idx]
-        elif frame_idx != 0:
-            # No previous tracks to propagate.
-            prev_ids = np.empty(0, dtype=int)
-            prev_points = np.empty((0, 1, 2), dtype=np.float32)
-
-        existing_points = np.asarray(tracked_points, dtype=np.float32) if tracked_points else np.empty((0, 2), dtype=np.float32)
-
-        def add_new_tracks(budget: int) -> tuple[list[int], np.ndarray]:
-            nonlocal next_track_id, existing_points
-            if budget <= 0:
-                return [], np.empty((0, 2), dtype=np.float32)
-            detection_quota = max(MAX_FEATURE_COUNT, budget * 2)
-            try:
-                candidate_points = detect_fast_keypoints(
-                    gray,
-                    max_features=detection_quota,
-                    threshold=FAST_THRESHOLD,
-                    nonmax=FAST_NONMAX,
-                    border=FAST_BORDER,
-                )
-            except RuntimeError:
-                if frame_idx == 0:
-                    raise
-                return [], np.empty((0, 2), dtype=np.float32)
-
-            filtered_candidates = _filter_keypoints_by_distance(
-                candidate_points,
-                existing_points,
-                FEATURE_SUPPRESSION_RADIUS,
-            )
-            if filtered_candidates.size == 0:
-                return [], np.empty((0, 2), dtype=np.float32)
-
-            attributes = extract_keypoint_attributes(depth_frame, filtered_candidates, max_depth=MAX_DEPTH)
-            new_keypoints = attributes["keypoints"]
-            if new_keypoints.size == 0:
-                return [], np.empty((0, 2), dtype=np.float32)
-
-            depths = attributes["keypoints_depth"]
-            xyz = attributes["keypoints_3d"]
-            colors = attributes["keypoints_color"]
-
-            take = min(budget, new_keypoints.shape[0])
-            new_ids: list[int] = []
-            new_points_list: list[np.ndarray] = []
-            for idx_new in range(take):
-                keypoint = new_keypoints[idx_new]
-                depth_value = float(depths[idx_new])
-                point3 = np.asarray(xyz[idx_new], dtype=np.float64)
-                color = np.asarray(colors[idx_new])
-
-                track = FeatureTrack(
-                    track_id=next_track_id,
-                    anchor_frame=frame_idx,
-                    anchor_keypoint=keypoint.astype(np.float32),
-                    anchor_depth=depth_value,
-                    anchor_point3=point3,
-                    anchor_color=color,
-                )
-                track.add_observation(frame_idx, keypoint, depth_value)
-                tracks[next_track_id] = track
-                new_ids.append(next_track_id)
-                new_points_list.append(keypoint.astype(np.float32))
-                frame_obs[next_track_id] = track.observations[frame_idx]
-                next_track_id += 1
-
-            if new_points_list:
-                new_points_arr = np.asarray(new_points_list, dtype=np.float32)
-                existing_points = (
-                    np.vstack([existing_points, new_points_arr]) if existing_points.size else new_points_arr
-                )
-            else:
-                new_points_arr = np.empty((0, 2), dtype=np.float32)
-            return new_ids, new_points_arr
-
-        need_refill = len(tracked_ids) <= refill_threshold
-        budget = MAX_FEATURE_COUNT - len(tracked_ids) if need_refill else 0
-        new_ids, new_points = add_new_tracks(budget)
-        if new_ids:
-            tracked_ids.extend(new_ids)
-            if new_points.size:
-                tracked_points.extend(new_points.reshape(-1, 2))
-
-        active_ids = np.asarray(tracked_ids, dtype=int)
-        if tracked_points:
-            stacked_points = np.asarray(tracked_points, dtype=np.float32).reshape(-1, 1, 2)
-        else:
-            stacked_points = np.empty((0, 1, 2), dtype=np.float32)
-
-        for track_id in active_ids:
-            tracks[track_id].active = True
-
-        frame_observations.append(frame_obs)
-        prev_gray = gray
-        prev_points = stacked_points
-        prev_ids = active_ids
-
-    return frame_observations, tracks
-
-
-def make_feature_frame_for_view(
-    rectified_frame: RectifiedStereoFrame,
-    keypoints: np.ndarray,
-) -> FeatureFrame:
-    features: dict[str, Any] = {
-        "keypoints": torch.from_numpy(keypoints.astype(np.float32)),
-        "image_size": rectified_frame.left_rect.shape[:2],
-    }
-    return FeatureFrame(
-        left=None,
-        right=None,
-        left_rect=None,
-        right_rect=None,
-        left_depth=None,
-        left_depth_xyz=None,
-        calibration=rectified_frame.calibration,
-        features=features,
-    )
-
-
 def to_numpy_vec3(vec: Any) -> np.ndarray:
     arr = np.asarray(vec, dtype=np.float64)
     if arr.ndim > 1:
@@ -1063,127 +698,6 @@ def summarise_tracking_results(
     print("------------------------------------------------------------")
 
     return summary
-
-
-def estimate_sequence_poses(
-    rectified_frames: list[RectifiedStereoFrame],
-    depth_frames: list[StereoDepthFrame],
-    track_history: list[dict[int, TrackObservation]],
-    sequence_sample: test_utils.FrameSequenceWithGroundTruth,  # type: ignore[type-arg]
-) -> list[dict[str, Any]]:
-    results: list[dict[str, Any]] = []
-    first_gt_pose = gtsam.Pose3(sequence_sample.world_poses[0].rotation(), np.zeros(3))
-    world_pose = gtsam.Pose3(sequence_sample.world_poses[0].rotation(), np.zeros(3))
-
-    for frame_idx in range(1, len(rectified_frames)):
-        prev_frame_idx = frame_idx - 1
-        prev_world_pose = world_pose
-        prev_obs = track_history[frame_idx - 1]
-        curr_obs = track_history[frame_idx]
-        common_track_ids = sorted(set(prev_obs.keys()) & set(curr_obs.keys()))
-        if not common_track_ids:
-            results.append(
-                {
-                    "frame_index": frame_idx,
-                    "frame_id": sequence_sample.frame_ids[frame_idx],
-                    "status": "no_tracks",
-                    "active_track_count": 0,
-                }
-            )
-            continue
-
-        prev_points = np.asarray(
-            [prev_obs[track_id].keypoint for track_id in common_track_ids],
-            dtype=np.float32,
-        )
-        curr_points = np.asarray(
-            [curr_obs[track_id].keypoint for track_id in common_track_ids],
-            dtype=np.float32,
-        )
-
-        attributes = extract_keypoint_attributes(depth_frames[frame_idx - 1], prev_points, max_depth=MAX_DEPTH)
-        valid_mask = attributes["valid_mask"]
-        if not np.any(valid_mask):
-            results.append(
-                {
-                    "frame_index": frame_idx,
-                    "frame_id": sequence_sample.frame_ids[frame_idx],
-                    "status": "no_valid_depth",
-                    "active_track_count": len(common_track_ids),
-                }
-            )
-            continue
-
-        prev_valid = attributes["keypoints"]
-        curr_valid = curr_points[valid_mask]
-        valid_track_ids = np.asarray(common_track_ids, dtype=int)[valid_mask]
-        if prev_valid.shape[0] < MIN_MATCHES_FOR_PNP:
-            results.append(
-                {
-                    "frame_index": frame_idx,
-                    "frame_id": sequence_sample.frame_ids[frame_idx],
-                    "status": "insufficient_tracks",
-                    "active_track_count": prev_valid.shape[0],
-                }
-            )
-            continue
-
-        first_frame = build_feature_frame(depth_frames[prev_frame_idx], attributes)
-        second_frame = make_feature_frame_for_view(rectified_frames[frame_idx], curr_valid)
-        match_indices = np.arange(prev_valid.shape[0], dtype=int)
-        matches = np.stack([match_indices, match_indices], axis=1)
-        matched_pair = MatchedFramePair(
-            first=first_frame,
-            second=second_frame,
-            matches=matches,
-        )
-
-        try:
-            relative_pose_s0, inlier_pair = solve_pnp(matched_pair)
-
-            # Get body-from-camera extrinsic for this frame
-            T_B_from_S0 = rectified_frames[prev_frame_idx].calibration.T_B_from_S0  # ^B T_S0
-
-            # Convert the relative motion into the body frame:
-            relative_pose = T_B_from_S0 * relative_pose_s0 * T_B_from_S0.inverse()
-
-        except Exception as exc:  # noqa: BLE001
-            results.append(
-                {
-                    "frame_index": frame_idx,
-                    "frame_id": sequence_sample.frame_ids[frame_idx],
-                    "status": "pnp_failed",
-                    "active_track_count": prev_valid.shape[0],
-                    "error": str(exc),
-                }
-            )
-            continue
-
-        estimated_pose = prev_world_pose.compose(relative_pose)
-        world_pose = estimated_pose
-        # ground_truth_pose = sequence_sample.relative_pose(0, frame_idx)
-        ground_truth_pose = first_gt_pose.inverse() * sequence_sample.world_poses[frame_idx]
-        pose_error = ground_truth_pose.between(estimated_pose)
-
-        results.append(
-            {
-                "frame_index": frame_idx,
-                "frame_id": sequence_sample.frame_ids[frame_idx],
-                "status": "success",
-                "active_track_count": prev_valid.shape[0],
-                "matches_before_filter": len(common_track_ids),
-                "matches_after_filter": inlier_pair.matches.shape[0],
-                "estimated_pose": estimated_pose,
-                "ground_truth_pose": ground_truth_pose,
-                "pose_error": pose_error,
-                "matched_pair": inlier_pair,
-                "track_ids": valid_track_ids,
-                "relative_pose": relative_pose,
-                "anchor_frame_index": prev_frame_idx,
-            }
-        )
-
-    return results
 
 
 def compute_pose_initializations(
@@ -1442,21 +956,6 @@ def run_bundle_adjustment(
                     pim,
                 )
             )
-
-    # candidate_offsets = np.linspace(-0.02, 0.02, 41)  # -20 ms .. +20 ms
-    # best_tau, best_err = 0.0, float("inf")
-
-    # for tau in candidate_offsets:
-    #     total = 0.0
-    #     for i, j in zip(frames_for_ba[:-1], frames_for_ba[1:]):
-    #         pim = preintegrate_between_frames(sequence_sample, i, j, imu_params, imu_bias_initial, time_offset=tau)
-    #         f = gtsam.ImuFactor(X(i), V(i), X(j), V(j), B(0), pim)
-    #         total += float(f.error(values))
-    #     print(f"tau={tau*1e3:+5.1f} ms  IMU-chain error={total:.6f}")
-    #     if total < best_err:
-    #         best_err, best_tau = total, tau
-
-    # print("Best τ:", best_tau, "s  (IMU-chain error:", best_err, ")")
 
     if imu_available and imu_bias_key is not None and values.exists(imu_bias_key):
         bias_before_vec = imu_bias_to_numpy(values.atConstantBias(imu_bias_key))
@@ -1732,38 +1231,6 @@ def compute_pose_errors_against_ground_truth(
     return errors
 
 
-# def distance_percentage_series(
-#     pose_errors: dict[int, dict[str, np.ndarray]],
-# ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
-#     distances: list[float] = []
-#     translations: list[np.ndarray] = []
-#     percentages: list[float] = []
-#     for frame_idx in sorted(pose_errors):
-#         info = pose_errors[frame_idx]
-#         trans = info.get("translation", np.nan)
-#         pct = float(info.get("translation_error_pct", np.nan))
-#         dist = float(info.get("ground_truth_distance", np.nan))
-#         if not np.isfinite(pct) or not np.isfinite(dist):
-#             continue
-#         distances.append(dist)
-#         translations.append(trans)
-#         percentages.append(pct)
-
-#     if not distances:
-#         empty = np.asarray([], dtype=np.float64)
-#         return empty, empty, empty
-
-#     distances_arr = np.asarray(distances, dtype=np.float64)
-#     percentages_arr = np.asarray(percentages, dtype=np.float64)
-#     translations_arr = np.asarray(translations, dtype=np.float64)
-#     order = np.argsort(distances_arr)
-#     distances_sorted = distances_arr[order]
-#     percentages_sorted = percentages_arr[order]
-#     translations_sorted = translations_arr[order]
-#     cumulative_mean = np.cumsum(percentages_sorted) / np.arange(1, percentages_sorted.size + 1, dtype=np.float64)
-
-#     return distances_sorted, percentages_sorted, cumulative_mean
-
 def distance_percentage_series(
     pose_errors: dict[int, dict[str, np.ndarray]],
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
@@ -1811,46 +1278,6 @@ def distance_percentage_series(
     cumulative_mean[valid] = (rmse[valid] / distances_sorted[valid]) * 100.0
 
     return distances_sorted, percentages_sorted, cumulative_mean
-
-
-def save_results(
-    tracking_summary: dict[str, Any],
-    ba_result: dict[str, Any],
-    sequence_sample: test_utils.FrameSequenceWithGroundTruth,  # type: ignore[type-arg]
-) -> None:
-    frame_ids = np.array(sequence_sample.frame_ids, dtype=int)
-    frame_indices = np.array(sequence_sample.frame_indices, dtype=int)
-
-    optimized_pose_dict = ba_result["optimized_pose_dict"]
-    pose_errors = compute_pose_errors_against_ground_truth(optimized_pose_dict, sequence_sample)
-
-    pose_error_frames = sorted(pose_errors.keys())
-    optimized_translation_errors = np.array(
-        [pose_errors[idx]["translation"] for idx in pose_error_frames],
-        dtype=np.float64,
-    )
-    optimized_rotation_errors = np.array(
-        [pose_errors[idx]["rotation"] for idx in pose_error_frames],
-        dtype=np.float64,
-    )
-
-    np.savez(
-        RESULTS_PATH,
-        frame_ids=frame_ids,
-        frame_indices=frame_indices,
-        tracking_summary=tracking_summary,
-        frames_for_ba=np.array(ba_result["frames_for_ba"], dtype=int),
-        landmark_original_indices=np.array(ba_result["landmark_original_indices"], dtype=int),
-        reprojection_before=ba_result["reprojection_before"],
-        reprojection_after=ba_result["reprojection_after"],
-        optimized_translation_errors=optimized_translation_errors,
-        optimized_rotation_errors=optimized_rotation_errors,
-        optimized_translation_norms=np.linalg.norm(optimized_translation_errors, axis=1),
-        optimized_rotation_norms_deg=np.rad2deg(np.linalg.norm(optimized_rotation_errors, axis=1)),
-        stereo_counts=np.array([ba_result["stereo_counts"][idx] for idx in ba_result["frames_for_ba"]], dtype=int),
-        mono_counts=np.array([ba_result["mono_counts"][idx] for idx in ba_result["frames_for_ba"]], dtype=int),
-    )
-    print(f"Saved bundle adjustment results to {RESULTS_PATH}")
 
 
 def plot_feature_tracks(
@@ -2355,14 +1782,27 @@ def run_depth_variant(
     depth_frames: list[StereoDepthFrame],
     sequence_sample: test_utils.FrameSequenceWithGroundTruth,  # type: ignore[type-arg]
 ) -> dict[str, Any]:
-    track_history, tracks = track_features_with_refill(rectified_frames, depth_frames)
+    if len(rectified_frames) != len(depth_frames):
+        raise ValueError("Number of rectified frames and depth frames must match.")
 
-    sequence_results = estimate_sequence_poses(
-        rectified_frames=rectified_frames,
-        depth_frames=depth_frames,
-        track_history=track_history,
-        sequence_sample=sequence_sample,
-    )
+    KLT_TRACKER.reset()
+    RELATIVE_POSE_INITIALIZER.reset(sequence_sample)
+    track_history: list[dict[int, TrackObservation]] = []
+    sequence_results: list[dict[str, Any]] = []
+
+    for frame_idx, (rect_frame, depth_frame) in enumerate(zip(rectified_frames, depth_frames)):
+        frame_observations = KLT_TRACKER.track_frame(rect_frame, depth_frame)
+        track_history.append(frame_observations)
+        result = RELATIVE_POSE_INITIALIZER.process_frame(
+            frame_index=frame_idx,
+            rectified_frame=rect_frame,
+            depth_frame=depth_frame,
+            track_observations=frame_observations,
+        )
+        if result is not None:
+            sequence_results.append(result)
+
+    tracks = dict(KLT_TRACKER.tracks)
 
     tracking_summary = summarise_tracking_results(sequence_sample, track_history, sequence_results)
     if rerun_logger is not None and rerun_logger.enabled:
@@ -2543,8 +1983,6 @@ for sample_idx in range(NUM_SEQUENCE_SAMPLES):
     track_history = primary_result["track_history"]
     tracks = primary_result["tracks"]
     sequence_results = primary_result["sequence_results"]
-
-    # save_results(tracking_summary, ba_result, sequence)
 
     for result in variant_results:
         label = result["label"]
