@@ -1749,8 +1749,8 @@ def load_euroc_sequence_segment(
     seq = _load_euroc_sequence(seq_name, alpha=alpha)
     N = len(seq.left_paths)
     if N < sequence_length:
-        sequence_length = N
         print(f"Sequence too short for requested length {sequence_length}, using full sequence length of {N}.")
+        sequence_length = N
 
     rng = random.Random(seed)
     sampling_mode = sampling_mode.lower()
