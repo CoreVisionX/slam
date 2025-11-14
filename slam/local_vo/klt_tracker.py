@@ -26,6 +26,7 @@ class FeatureTrack:
     anchor_point3: np.ndarray
     anchor_color: np.ndarray
     observations: dict[int, TrackObservation] = field(default_factory=dict)
+    observation_frames: list[int] = field(default_factory=list)
     active: bool = True
 
     def add_observation(self, frame_idx: int, point: np.ndarray, depth: float) -> None:
@@ -33,6 +34,8 @@ class FeatureTrack:
             keypoint=np.asarray(point, dtype=np.float32),
             depth=float(depth),
         )
+        if not self.observation_frames or self.observation_frames[-1] != frame_idx:
+            self.observation_frames.append(frame_idx)
 
 
 @dataclass

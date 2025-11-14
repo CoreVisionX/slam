@@ -2,11 +2,9 @@
 import os
 import sys
 from pathlib import Path
-import time
 from typing import Any
 import cv2
 import gtsam
-from gtsam.symbol_shorthand import L, X, V, B
 import matplotlib.pyplot as plt
 import numpy as np
 import torch
@@ -32,6 +30,7 @@ from registration.utils import draw_matches  # noqa: E402
 import tests.test_utils as test_utils  # noqa: E402
 from slam.local_vo import (  # noqa: E402
     FeatureTrack,
+    IncrementalBundleAdjuster,
     KLTFeatureTracker,
     RelativePnPInitializer,
     TrackObservation,
@@ -44,7 +43,7 @@ from slam.local_vo import (  # noqa: E402
 # Configuration
 # ----------------------------------------------------------------------
 NUM_SEQUENCE_SAMPLES = 1
-SEQUENCE_LENGTH = 600
+SEQUENCE_LENGTH = 1000
 # ENVIRONMENT = "Hospital"
 # DIFFICULTY = "diff"
 # TRAJECTORY = "P1000"
@@ -65,26 +64,6 @@ if DEPTH_MODE not in {"sgbm", "ground_truth"}:
     raise ValueError("LOCAL_VO_DEPTH_MODE must be either 'sgbm' or 'ground_truth'.")
 USE_GROUND_TRUTH_DEPTH = DEPTH_MODE == "ground_truth"
 
-# Bundle adjustment
-MIN_OBSERVATIONS_PER_LANDMARK = 3 # increase this and reproj gate? might be a good trade off?
-MIN_OBSERVATIONS_PER_FRAME = 5
-PROJECTION_NOISE_PX = 1.0
-DISPARITY_NOISE_PX = 1.0 # scale based on distance?
-PROJECTION_NOISE_HUBER = True
-REPROJECTION_GATING_THRESHOLD_PX = 2.0
-USE_INLIER_OBSERVATIONS_ONLY = False
-POSE_PRIOR_SIGMAS = np.array(
-    [
-        np.deg2rad(1.0),
-        np.deg2rad(1.0),
-        np.deg2rad(1.0),
-        0.10,
-        0.10,
-        0.10,
-    ],
-    dtype=float,
-) * 0.001
-
 IMU_GRAVITY_MAGNITUDE = 9.80665
 # IMU_ACCEL_NOISE = 0.8e-3
 # IMU_GYRO_NOISE = np.deg2rad(0.0006)
@@ -101,6 +80,7 @@ IMU_BIAS_PRIOR_SIGMAS = np.array(
     ],
     dtype=float,
 )
+
 # * 0.001 # imu should be perfect
 # IMU_BIAS_PRIOR_SIGMAS = np.array([0.02, 0.02, 0.02, 0.001, 0.001, 0.001], dtype=float)
 # IMU_ACCEL_NOISE = 0.04
@@ -143,6 +123,7 @@ def _load_local_vo_config() -> Any:
 LOCAL_VO_CFG = _load_local_vo_config()
 KLT_TRACKER: KLTFeatureTracker = instantiate(LOCAL_VO_CFG.klt_tracker)
 RELATIVE_POSE_INITIALIZER: RelativePnPInitializer = instantiate(LOCAL_VO_CFG.relative_pose_initializer)
+BUNDLE_ADJUSTER: IncrementalBundleAdjuster = instantiate(LOCAL_VO_CFG.bundle_adjuster)
 
 TRACKING_MAX_DEPTH = float(getattr(getattr(KLT_TRACKER, "config", None), "max_depth", 40.0))
 PNP_MAX_DEPTH = float(getattr(getattr(RELATIVE_POSE_INITIALIZER, "config", None), "max_depth", 40.0))
@@ -221,137 +202,6 @@ print(f"Using device: {device}")
 print(f"Depth source: {'ground_truth' if USE_GROUND_TRUTH_DEPTH else 'sgbm'}")
 
 sgbm = SGBM(num_disparities=16 * 4, block_size=5, image_color="RGB")
-
-_FALSE_ENV_VALUES = {"0", "false", "f", "no"}
-
-
-def _env_flag(key: str, default: bool) -> bool:
-    raw = os.environ.get(key)
-    if raw is None:
-        return default
-    return raw.strip().lower() not in _FALSE_ENV_VALUES
-
-
-ENABLE_RERUN = _env_flag("LOCAL_VO_RERUN", False)
-RERUN_APP_ID = os.environ.get("LOCAL_VO_RERUN_APP_ID", "local_vo_bundle_adjustment")
-RERUN_TCP_ADDRESS = os.environ.get("LOCAL_VO_RERUN_TCP")
-RERUN_SPAWN_VIEWER = _env_flag("LOCAL_VO_RERUN_SPAWN", True)
-RERUN_ROOT_PATH = os.environ.get("LOCAL_VO_RERUN_PATH", "local_vo_bundle_adjustment")
-
-
-class LocalVoRerunLogger:
-    def __init__(self, *, enabled: bool, app_id: str, spawn_viewer: bool, tcp_address: str | None):
-        self._enabled = False
-        self._trajectories: dict[str, list[gtsam.Pose3]] = {}
-        if not enabled or rr is None or rr_log_pose is None or rr_log_trajectory is None:
-            return
-
-        self._enabled = True
-        rr.init(app_id, spawn=spawn_viewer)
-        if tcp_address:
-            rr.connect_grpc(tcp_address)
-        rr.log("/", rr.ViewCoordinates.RDF)
-
-    @property
-    def enabled(self) -> bool:
-        return self._enabled
-
-    def log_pose_with_trajectory(
-        self,
-        path: str,
-        frame_index: int,
-        pose: gtsam.Pose3,
-        frame: RectifiedStereoFrame | StereoDepthFrame,
-    ) -> None:
-        if not self._enabled:
-            return
-        assert rr is not None
-        rr.set_time("frame", sequence=frame_index)
-        rr_log_pose(path, pose, frame)
-        trajectory = self._trajectories.setdefault(path, [])
-        trajectory.append(pose)
-        rr_log_trajectory(f"{path}/trajectory", trajectory)
-
-    def log_pnp_sequence(
-        self,
-        path: str,
-        depth_frames: list[StereoDepthFrame],
-        sequence_results: list[dict[str, Any]],
-    ) -> None:
-        if not self._enabled or not depth_frames:
-            return
-
-        self.log_pose_with_trajectory(path, 0, gtsam.Pose3.Identity(), depth_frames[0])
-        for result in sequence_results:
-            if result.get("status") != "success":
-                continue
-            frame_index = result.get("frame_index")
-            if not isinstance(frame_index, int) or frame_index >= len(depth_frames) or frame_index < 0:
-                continue
-            estimated_pose = result.get("estimated_pose")
-            if estimated_pose is None:
-                continue
-            self.log_pose_with_trajectory(path, frame_index, estimated_pose, depth_frames[frame_index])
-
-    def log_bundle_adjustment(
-        self,
-        path: str,
-        depth_frames: list[StereoDepthFrame],
-        ba_result: dict[str, Any],
-    ) -> None:
-        if not self._enabled or not depth_frames:
-            return
-
-        for stage_label, pose_dict_key in (("initial", "initial_pose_dict"), ("optimized", "optimized_pose_dict")):
-            pose_dict = ba_result.get(pose_dict_key)
-            if not pose_dict:
-                continue
-            stage_path = f"{path}/{stage_label}"
-            for frame_index in sorted(pose_dict):
-                if frame_index < 0 or frame_index >= len(depth_frames):
-                    continue
-                pose = pose_dict[frame_index]
-                self.log_pose_with_trajectory(stage_path, frame_index, pose, depth_frames[frame_index])
-
-
-def create_local_vo_rerun_logger() -> LocalVoRerunLogger | None:
-    if not ENABLE_RERUN:
-        return None
-    return LocalVoRerunLogger(
-        enabled=True,
-        app_id=RERUN_APP_ID,
-        spawn_viewer=RERUN_SPAWN_VIEWER,
-        tcp_address=RERUN_TCP_ADDRESS,
-    )
-
-
-rerun_logger = create_local_vo_rerun_logger()
-
-
-def _log_sequence_results_to_rerun(
-    logger: LocalVoRerunLogger,
-    variant_label: str,
-    depth_frames: list[StereoDepthFrame],
-    sequence_results: list[dict[str, Any]],
-) -> None:
-    if not logger.enabled:
-        return
-    base_path = f"{RERUN_ROOT_PATH}/{variant_label}/pnp"
-    logger.log_pnp_sequence(base_path, depth_frames, sequence_results)
-
-
-def _log_bundle_adjustment_to_rerun(
-    logger: LocalVoRerunLogger,
-    variant_label: str,
-    depth_frames: list[StereoDepthFrame],
-    ba_result: dict[str, Any],
-    stage_suffix: str,
-) -> None:
-    if not logger.enabled:
-        return
-    base_path = f"{RERUN_ROOT_PATH}/{variant_label}/ba/{stage_suffix}"
-    logger.log_bundle_adjustment(base_path, depth_frames, ba_result)
-
 
 
 def remap_ground_truth_depth(raw_depth: np.ndarray, calibration: StereoCalibration) -> np.ndarray:
@@ -550,49 +400,14 @@ def integrate_inertial_trajectory(
 
     params = create_preintegration_params(sequence)
     bias = gtsam.imuBias.ConstantBias()
-    velocities = estimate_sequence_velocities(sequence)
-
-    # # print imu measurement diagnostics
-    # for k, batch in enumerate(sequence.imu_measurements):
-    #     if len(batch) == 0:
-    #         print(k, "EMPTY batch")
-    #         continue
-    #     print(
-    #         k,
-    #         "N =", len(batch),
-    #         "dt_sum =", batch.dts.sum(),
-    #         "acc_mean =", np.linalg.norm(batch.linear_accelerations.mean(axis=0)),
-    #         "omega_mean =", np.linalg.norm(batch.angular_velocities.mean(axis=0)),
-    #     )
-
-    # inertial_poses: list[gtsam.Pose3] = []
-
-    # # preintegrate relative to the previous ground truth pose
-    # for idx in range(1, sequence.length):
-    #     gt_first_to_prev = gt_world_to_first.inverse() * sequence.world_poses[idx - 1]
-    #     initial_velocity = R_world_to_first @ velocities[idx - 1]
-
-    #     nav_state = gtsam.NavState(gt_first_to_prev, initial_velocity)
-
-    #     pim = preintegrate_between_frames(sequence, idx - 1, idx, params, bias)
-    #     nav_state = pim.predict(nav_state, bias)
-    #     inertial_poses.append(nav_state.pose())
 
     nav_states = [gtsam.NavState(gtsam.Pose3(gt_world_to_first.rotation(), np.zeros(3)), sequence.imu_measurements[0].world_velocity)]
     translation_gt_world_to_first = gtsam.Pose3(gtsam.Rot3.Identity(), gt_world_to_first.translation()).inverse()
-    # next_nav_states = [
-        # gtsam.NavState(translation_gt_world_to_first * sequence.world_poses[i], sequence.imu_measurements[i].world_velocity) for i in range(1, sequence.length)
-    # ]
-    # nav_states += next_nav_states
-
-    # imu_params = create_preintegration_params()
-    # bias = gtsam.imuBias.ConstantBias()
-
+   
     # # preintegrate relative to the previous preintegrated pose
     for idx in range(1, sequence.length):
         batch = sequence.imu_measurements[idx]
 
-        # nav_state = gtsam.NavState(translation_gt_world_to_first * sequence.world_poses[idx - 1], sequence.imu_measurements[idx - 1].world_velocity)
         nav_state = nav_states[-1]
 
         # only reset every few frames
@@ -602,20 +417,10 @@ def integrate_inertial_trajectory(
             prev_velocity = (prev_pose.translation() - prev_prev_pose.translation()) / (sequence.frame_timestamps[idx - 1] - sequence.frame_timestamps[idx - 2])
             nav_state = gtsam.NavState(translation_gt_world_to_first * sequence.world_poses[idx - 1], prev_velocity)
 
-        # pose = nav_state.pose()
-        # pose_trans = pose.translation() + sequence.imu_measurements[idx - 1].world_velocity * 0.1
-        # nav_state = gtsam.NavState(gtsam.Pose3(pose.rotation(), pose_trans), sequence.imu_measurements[idx - 1].world_velocity)
-        # nav_states.append(nav_state)
-
         pim = gtsam.PreintegratedImuMeasurements(params, bias)
         _integrate_imu_batch(pim, batch)
         nav_states.append(pim.predict(nav_state, bias))
         
-        # nav_states.append(nav_state)
-
-         # pim = preintegrate_between_frames(sequence, idx - 1, idx, params, bias)
-        # pim.integrateMeasurement(np.zeros(3), np.zeros(3), 0.1)
-
     inertial_poses = [nav_state.pose() for nav_state in nav_states]
 
     return inertial_poses
@@ -698,499 +503,6 @@ def summarise_tracking_results(
     print("------------------------------------------------------------")
 
     return summary
-
-
-def compute_pose_initializations(
-    rotate_world_to_first: gtsam.Pose3,
-    sequence_results: list[dict[str, Any]],
-    sequence_length: int,
-) -> list[gtsam.Pose3]:
-    initializations: list[gtsam.Pose3] = [rotate_world_to_first]
-    result_by_frame = {result["frame_index"]: result for result in sequence_results if result["status"] == "success"}
-    current_pose = rotate_world_to_first
-
-    for frame_idx in range(1, sequence_length):
-        if frame_idx in result_by_frame:
-            current_pose = result_by_frame[frame_idx]["estimated_pose"]
-        initializations.append(current_pose)
-
-    return initializations
-
-
-def select_frames_for_ba(
-    track_history: list[dict[int, TrackObservation]],
-) -> list[int]:
-    selected = []
-    for idx, observations in enumerate(track_history):
-        visible = len(observations)
-        if visible >= MIN_OBSERVATIONS_PER_FRAME or idx == 0:
-            selected.append(idx)
-    if 0 not in selected:
-        selected.insert(0, 0)
-    return selected
-
-
-def build_calibration(frame: RectifiedStereoFrame) -> gtsam.Cal3_S2:
-    K = frame.calibration.K_left_rect
-    # K = frame.calibration.K_left
-    fx = float(K[0, 0])
-    fy = float(K[1, 1])
-    skew = float(K[0, 1])
-    cx = float(K[0, 2])
-    cy = float(K[1, 2])
-    return gtsam.Cal3_S2(fx, fy, skew, cx, cy)
-
-
-def build_stereo_calibration(frame: RectifiedStereoFrame) -> gtsam.Cal3_S2Stereo:
-    calib = frame.calibration
-    K = calib.K_left_rect
-    # K = calib.K_left
-    fx = float(K[0, 0])
-    fy = float(K[1, 1])
-    skew = float(K[0, 1])
-    cx = float(K[0, 2])
-    cy = float(K[1, 2])
-    baseline = float(np.abs(calib.P_right[0, 3] / calib.P_right[0, 0]))
-    if baseline <= 0.0:
-        baseline = float(np.linalg.norm(calib.T.reshape(-1)))
-    return gtsam.Cal3_S2Stereo(fx, fy, skew, cx, cy, baseline)
-
-
-def point3_like_to_numpy(point: Any) -> np.ndarray:
-    return to_numpy_vec3(point)
-
-
-def compute_reprojection_errors(
-    pose_dict: dict[int, gtsam.Pose3],
-    landmark_positions: list[np.ndarray],
-    observations: list[tuple[int, int, np.ndarray]],
-    calibration: gtsam.Cal3_S2,
-) -> np.ndarray:
-    errors: list[float] = []
-    for frame_idx, landmark_idx, measurement in observations:
-        if frame_idx not in pose_dict:
-            continue
-        pose = pose_dict[frame_idx]
-        point = point3_like_to_numpy(landmark_positions[landmark_idx])
-
-        T_B_from_S0 = rectified_frames[frame_idx].calibration.T_B_from_S0  # body_from_cam
-        cam_pose = pose.compose(T_B_from_S0)
-
-        camera = gtsam.PinholeCameraCal3_S2(cam_pose, calibration)
-        try:
-            projected = camera.project(point)
-        except RuntimeError:
-            continue
-        if hasattr(projected, "vector"):
-            proj_vec = projected.vector()
-        else:
-            proj_vec = np.asarray(projected, dtype=np.float64)
-        residual = proj_vec - measurement
-        errors.append(float(np.linalg.norm(residual)))
-    return np.asarray(errors, dtype=np.float64)
-
-
-def run_bundle_adjustment(
-    rectified_frames: list[RectifiedStereoFrame],
-    track_history: list[dict[int, TrackObservation]],
-    tracks: dict[int, FeatureTrack],
-    sequence_results: list[dict[str, Any]],
-    sequence_sample: test_utils.FrameSequenceWithGroundTruth,  # type: ignore[type-arg]
-    use_imu: bool = True,
-    log_prefix: str | None = None,
-) -> dict[str, Any]:
-    frames_for_ba = select_frames_for_ba(track_history)
-    calibration = build_calibration(rectified_frames[0])
-    stereo_calibration = build_stereo_calibration(rectified_frames[0])
-
-    if PROJECTION_NOISE_HUBER:
-        measurement_noise = gtsam.noiseModel.Robust.Create(
-            gtsam.noiseModel.mEstimator.Huber(1.345),
-            gtsam.noiseModel.Isotropic.Sigma(2, PROJECTION_NOISE_PX),
-        )
-        stereo_noise = gtsam.noiseModel.Robust.Create(
-            gtsam.noiseModel.mEstimator.Huber(1.345),
-            gtsam.noiseModel.Diagonal.Sigmas(
-                np.array([PROJECTION_NOISE_PX, PROJECTION_NOISE_PX, DISPARITY_NOISE_PX], dtype=float)
-            ),
-        )
-    else:
-        measurement_noise = gtsam.noiseModel.Isotropic.Sigma(2, PROJECTION_NOISE_PX)
-        stereo_noise = gtsam.noiseModel.Diagonal.Sigmas(
-            np.array([PROJECTION_NOISE_PX, PROJECTION_NOISE_PX, PROJECTION_NOISE_PX], dtype=float)
-        )
-        
-    prior_noise = gtsam.noiseModel.Diagonal.Sigmas(POSE_PRIOR_SIGMAS)
-
-    graph = gtsam.NonlinearFactorGraph()
-    values = gtsam.Values()
-
-    gt_world_to_first = gtsam.Pose3(sequence_sample.world_poses[0].rotation(), np.zeros(3))
-    pose_initials = compute_pose_initializations(gt_world_to_first, sequence_results, len(rectified_frames))
-    # sequence_velocities = estimate_sequence_velocities(sequence_sample)
-    sequence_velocities = [sequence_sample.imu_measurements[i].world_velocity for i in range(sequence_sample.length)]
-
-    for frame_idx in frames_for_ba:
-        initial_pose = clone_pose(pose_initials[frame_idx])
-        values.insert(X(frame_idx), initial_pose)
-
-    imu_available = use_imu and sequence_sample.imu_measurements is not None
-
-    # imu_params = create_preintegration_params() if imu_available else None
-    imu_params = gtsam.PreintegrationCombinedParams.MakeSharedU(IMU_GRAVITY_MAGNITUDE)
-    # imu_params.n_gravity = IMU_GRAVITY_VECTOR
-    imu_params.n_gravity = test_utils.estimate_world_gravity_from_first_batch(sequence_sample)
-    imu_params.setAccelerometerCovariance(np.eye(3) * (IMU_ACCEL_NOISE**2))     # e.g. 2e-3^2
-    imu_params.setGyroscopeCovariance(np.eye(3) * (IMU_GYRO_NOISE**2))      # e.g. 1.7e-4^2
-    imu_params.setIntegrationCovariance(np.eye(3) * (IMU_INTEGRATION_NOISE**2))                     # not ~0
-    imu_params.setBiasAccCovariance(np.eye(3) * (IMU_BIAS_PRIOR_SIGMAS[0]**2))                # RW densities
-    imu_params.setBiasOmegaCovariance(np.eye(3) * (IMU_BIAS_PRIOR_SIGMAS[3]**2))
-
-
-    imu_bias_key = None
-    imu_bias_initial = gtsam.imuBias.ConstantBias()
-    bias_before_vec: np.ndarray | None = None
-    bias_after_vec: np.ndarray | None = None
-
-    if imu_available:
-        velocity_prior_noise = gtsam.noiseModel.Isotropic.Sigma(3, IMU_VELOCITY_PRIOR_SIGMA)
-        bias_prior_noise = gtsam.noiseModel.Diagonal.Sigmas(IMU_BIAS_PRIOR_SIGMAS)
-        imu_bias_key = B(0)
-        if not values.exists(imu_bias_key):
-            values.insert(imu_bias_key, imu_bias_initial)
-
-        # # TODO: don't use gt velocities for initialization
-        # for frame_idx in frames_for_ba:
-        #     vel = (
-        #         sequence_velocities[frame_idx]
-        #     )
-        #     values.insert(V(frame_idx), vel)
-        # first_velocity = (
-        #     sequence_velocities[frames_for_ba[0]]
-        # )
-        # graph.add(gtsam.PriorFactorVector(V(frames_for_ba[0]), first_velocity, velocity_prior_noise))
-        # graph.add(gtsam.PriorFactorConstantBias(imu_bias_key, imu_bias_initial, bias_prior_noise))
-
-        # # only use gt for first velocity
-        # first_velocity = sequence_velocities[frames_for_ba[0]]
-        # values.insert(V(frames_for_ba[0]), first_velocity)
-        # graph.add(gtsam.PriorFactorVector(V(frames_for_ba[0]), first_velocity, velocity_prior_noise))
-        # graph.add(gtsam.PriorFactorConstantBias(imu_bias_key, imu_bias_initial, bias_prior_noise))
-
-        # use finite difference for the first velocity
-        first_velocity = (sequence_sample.world_poses[frames_for_ba[1]].translation() - sequence_sample.world_poses[frames_for_ba[0]].translation()) / (sequence_sample.frame_timestamps[frames_for_ba[1]] - sequence_sample.frame_timestamps[frames_for_ba[0]])
-        values.insert(V(frames_for_ba[0]), first_velocity)
-
-        # initialize the rest of the velocities by differeniating the poses
-        for prev_frame, next_frame in zip(frames_for_ba[:-1], frames_for_ba[1:]):
-            assert next_frame > prev_frame
-
-            prev_pose = values.atPose3(X(prev_frame))
-            next_pose = values.atPose3(X(next_frame))
-
-            prev_ts = sequence_sample.frame_timestamps[prev_frame]
-            next_ts = sequence_sample.frame_timestamps[next_frame]
-            dt = next_ts - prev_ts
-            assert dt > 0.0 and np.isfinite(dt)
-
-            velocity = (next_pose.translation() - prev_pose.translation()) / dt
-            values.insert(V(next_frame), velocity)
-        
-        # # add a prior for the bias
-        # graph.add(gtsam.PriorFactorConstantBias(imu_bias_key, imu_bias_initial, bias_prior_noise))
-
-    graph.add(gtsam.PriorFactorPose3(X(0), gt_world_to_first, prior_noise))
-
-    if imu_available and imu_params is not None and imu_bias_key is not None:
-        # graph.add(gtsam.PriorFactorConstantBias(
-        # B(frames_for_ba[0]),
-        # gtsam.imuBias.ConstantBias(),
-        # gtsam.noiseModel.Diagonal.Sigmas(
-        #     IMU_BIAS_PRIOR_SIGMAS)))
-
-        # could continuous bias without priors on later keys be the reason there's big jumps at the end?
-        # definitely play with these, they might be too tight? not sure needs lots of experiments. also just better IMU calibration in general will help so much
-        bias_prior_noise = np.array([0.01, 0.01, 0.01, 0.001, 0.001, 0.001], dtype=float)
-
-
-        graph.add(gtsam.PriorFactorConstantBias(
-        B(frames_for_ba[0]),
-        gtsam.imuBias.ConstantBias(),
-        gtsam.noiseModel.Diagonal.Sigmas(
-            bias_prior_noise))) # not exactly sure what this should be tbh, it needs to be wide enough to correct the initial bias?
-
-        for k in frames_for_ba:
-            if not values.exists(B(k)):
-                values.insert(B(k), gtsam.imuBias.ConstantBias())
-            #     if k != frames_for_ba[0]:
-            #         graph.add(gtsam.PriorFactorConstantBias(B(k), gtsam.imuBias.ConstantBias(), gtsam.noiseModel.Diagonal.Sigmas(
-            # bias_prior_noise)))
-
-        for prev_frame, next_frame in zip(frames_for_ba[:-1], frames_for_ba[1:]):
-            # print(f'Adding imu factor for {prev_frame} and {next_frame}')
-            assert next_frame == prev_frame + 1
-
-            # pim = gtsam.PreintegratedImuMeasurements(imu_params, imu_bias_initial)
-            pim = gtsam.PreintegratedCombinedMeasurements(imu_params, values.atConstantBias(B(prev_frame)))
-            batch = sequence_sample.imu_measurements[next_frame]
-            _integrate_imu_batch(pim, batch)
-            # pim.integrateMeasurement(np.zeros(3), np.zeros(3), 0.1) # constant velocity
-
-            assert abs(pim.deltaTij() - (sequence_sample.frame_timestamps[next_frame] - sequence_sample.frame_timestamps[prev_frame])) <= 1e-4, f"IMU Δt {pim.deltaTij():.6f} vs expected {sequence_sample.frame_timestamps[next_frame] - sequence_sample.frame_timestamps[prev_frame]:.6f}"
-
-            # pim = preintegrate_between_frames(
-            #     sequence_sample,
-            #     prev_frame,
-            #     next_frame,
-            #     imu_params,
-            #     imu_bias_initial,
-            # )
-            graph.add(
-                gtsam.CombinedImuFactor(
-                    X(prev_frame),
-                    V(prev_frame),
-                    X(next_frame),
-                    V(next_frame),
-                    B(prev_frame), # TODO: use constant bias instead to make debugging easier?
-                    B(next_frame),
-                    pim,
-                )
-            )
-
-    if imu_available and imu_bias_key is not None and values.exists(imu_bias_key):
-        bias_before_vec = imu_bias_to_numpy(values.atConstantBias(imu_bias_key))
-
-    landmark_keys: list[int] = []
-    landmark_index_lookup: list[int] = []
-    initial_landmarks: list[np.ndarray] = []
-    observations: list[tuple[int, int, np.ndarray]] = []
-    stereo_counts = {frame_idx: 0 for frame_idx in frames_for_ba}
-    mono_counts = {frame_idx: 0 for frame_idx in frames_for_ba}
-
-    inlier_lookup: dict[int, set[int]] = {}
-    for result in sequence_results:
-        if result.get("status") != "success":
-            continue
-        frame_idx = result["frame_index"]
-        track_ids = result.get("track_ids")
-        if track_ids is None:
-            continue
-        matches = result["matched_pair"].matches
-        if matches.size == 0:
-            continue
-        matched_track_ids = np.asarray(track_ids, dtype=int)
-        valid_ids = matched_track_ids[matches[:, 0]]
-        inlier_lookup.setdefault(frame_idx, set()).update(valid_ids.tolist())
-
-    for track_id in sorted(tracks.keys()):
-        track = tracks[track_id]
-        if not np.isfinite(track.anchor_depth) or track.anchor_depth <= 0.0:
-            continue
-        if track.anchor_frame not in frames_for_ba:
-            continue
-
-        T_B_from_S0 = rectified_frames[track.anchor_frame].calibration.T_B_from_S0  # body_from_cam
-
-        anchor_pose_B = pose_initials[track.anchor_frame]  # world_from_body
-        anchor_point_S0 = gtsam.Point3(*track.anchor_point3.tolist())
-
-        # world_from_cam = world_from_body * body_from_cam
-        world_point = anchor_pose_B.compose(T_B_from_S0).transformFrom(anchor_point_S0)
-        world_point_np = point3_like_to_numpy(world_point)
-
-        observation_frames: list[tuple[int, TrackObservation]] = []
-        for frame_idx in frames_for_ba:
-            observation = track_history[frame_idx].get(track_id)
-            if observation is None:
-                continue
-            if (
-                USE_INLIER_OBSERVATIONS_ONLY
-                and frame_idx != track.anchor_frame
-                and frame_idx in inlier_lookup
-                and track_id not in inlier_lookup[frame_idx]
-            ):
-                continue
-
-            pose_initial = pose_initials[frame_idx]
-            T_B_from_S0 = rectified_frames[frame_idx].calibration.T_B_from_S0  # body_from_cam
-            cam_pose = pose_initial.compose(T_B_from_S0)
-
-            camera_initial = gtsam.PinholeCameraCal3_S2(cam_pose, calibration)
-
-            try:
-                predicted = camera_initial.project(world_point)
-            except RuntimeError:
-                continue
-            predicted_vec = predicted.vector() if hasattr(predicted, "vector") else np.asarray(predicted)
-            measurement_vec = np.asarray(observation.keypoint, dtype=np.float64)
-            residual = predicted_vec - measurement_vec
-            if np.linalg.norm(residual) > REPROJECTION_GATING_THRESHOLD_PX:
-                # print("Residual too large:", np.linalg.norm(residual))
-                continue
-
-            observation_frames.append((frame_idx, observation))
-
-        if len(observation_frames) < MIN_OBSERVATIONS_PER_LANDMARK:
-            continue
-
-        landmark_key = len(landmark_keys)
-        landmark_keys.append(landmark_key)
-        landmark_index_lookup.append(track_id)
-
-        values.insert(L(landmark_key), world_point)
-        initial_landmarks.append(world_point_np)
-
-        # # add prior to enforce pseduo motion only BA
-        # ma_factor = gtsam.PriorFactorPoint3(
-        #     L(landmark_key),
-        #     world_point,
-        #     gtsam.noiseModel.Diagonal.Sigmas(np.array([1.0, 1.0, 1.0], dtype=float) * 0.00001),
-        # )
-        # graph.add(ma_factor)
-
-        for frame_idx, observation in observation_frames:
-            measurement_vec = np.asarray(observation.keypoint, dtype=np.float64)
-            if frame_idx == track.anchor_frame:
-                depth_value = float(track.anchor_depth)
-                if not np.isfinite(depth_value) or depth_value <= 0.0:
-                    continue
-                fx = stereo_calibration.fx()
-                baseline = stereo_calibration.baseline()
-                disparity = (fx * baseline) / depth_value
-                stereo_measurement = gtsam.StereoPoint2(
-                    float(track.anchor_keypoint[0]),
-                    float(track.anchor_keypoint[0] - disparity),
-                    float(track.anchor_keypoint[1]),
-                )
-                graph.add(
-                    gtsam.GenericStereoFactor3D(
-                        stereo_measurement,
-                        stereo_noise,
-                        X(frame_idx),
-                        L(landmark_key),
-                        stereo_calibration,
-                        rectified_frames[frame_idx].calibration.T_B_from_S0,
-                    )
-                )
-                stereo_counts[frame_idx] += 1
-            else:
-                depth_value = float(observation.depth)
-                # if False:
-                if np.isfinite(depth_value) and depth_value > 0.0:
-                    fx = stereo_calibration.fx()
-                    baseline = stereo_calibration.baseline()
-                    disparity = (fx * baseline) / depth_value
-                    stereo_measurement = gtsam.StereoPoint2(
-                        float(observation.keypoint[0]),
-                        float(observation.keypoint[0] - disparity),
-                        float(observation.keypoint[1]),
-                    )
-                    graph.add(
-                        gtsam.GenericStereoFactor3D(
-                            stereo_measurement,
-                            stereo_noise,
-                            X(frame_idx),
-                            L(landmark_key),
-                            stereo_calibration,
-                            rectified_frames[frame_idx].calibration.T_B_from_S0,
-                        )
-                    )
-                    stereo_counts[frame_idx] += 1
-                else:
-                    graph.add(
-                        gtsam.GenericProjectionFactorCal3_S2(
-                            gtsam.Point2(float(measurement_vec[0]), float(measurement_vec[1])),
-                            measurement_noise,
-                            X(frame_idx),
-                            L(landmark_key),
-                            calibration,
-                            rectified_frames[frame_idx].calibration.T_B_from_S0,
-                        )
-                    )
-                    mono_counts[frame_idx] += 1
-
-            observations.append((frame_idx, landmark_key, measurement_vec))
-
-    print("Observation frames:", len(observation_frames))
-
-    if not observations:
-        raise RuntimeError("No landmark observations available for bundle adjustment.")
-
-    optimizer = gtsam.LevenbergMarquardtOptimizer(graph, values)
-    
-    print("Performing bundle adjustment...")
-    start_time = time.perf_counter()
-    optimized_values = optimizer.optimize()
-    end_time = time.perf_counter()
-    print(f"Bundle adjustment optimized in {end_time - start_time:.2f} seconds")
-
-    if USE_IMU_FACTORS:
-        def sum_vision_error(graph, values):
-            total = 0.0
-            for idx in range(graph.size()):
-                f = graph.at(idx)
-                name = type(f).__name__
-                if "ProjectionFactor" in name or "StereoFactor" in name:
-                    total += float(f.error(values))
-            return total
-
-        def sum_imu_error(graph, values):
-            total = 0.0
-            for idx in range(graph.size()):
-                f = graph.at(idx)
-                name = type(f).__name__
-                if "ImuFactor" in name:
-                    total += float(f.error(values))
-            return total
-
-        vision_err = sum_vision_error(graph, values)
-        imu_err = sum_imu_error(graph, values)
-
-        print(f"[diag] Vision error evaluated on IMU-only poses: {vision_err:.6f}")
-        print(f"[diag] IMU error evaluated on IMU-only poses: {imu_err:.6f}")
-
-    optimized_pose_dict: dict[int, gtsam.Pose3] = {}
-    for frame_idx in frames_for_ba:
-        optimized_pose_dict[frame_idx] = optimized_values.atPose3(X(frame_idx))
-
-    optimized_landmarks: list[np.ndarray] = []
-    for key in range(len(landmark_keys)):
-        if hasattr(optimized_values, "atPoint3"):
-            point = optimized_values.atPoint3(L(key))
-        else:
-            point = optimized_values.atVector(L(key))
-        optimized_landmarks.append(point3_like_to_numpy(point))
-
-    initial_pose_dict = {idx: values.atPose3(X(idx)) for idx in frames_for_ba}
-
-    observation_matrix = [(frame_idx, landmark_idx, measurement) for frame_idx, landmark_idx, measurement in observations]
-    # observation_matrix = []
-
-    # reprojection_before = compute_reprojection_errors(initial_pose_dict, initial_landmarks, observation_matrix, calibration)
-    # reprojection_after = compute_reprojection_errors(optimized_pose_dict, optimized_landmarks, observation_matrix, calibration)
-    # reprojection_before = np.zeros(len(frames_for_ba))
-    # reprojection_after = np.zeros(len(frames_for_ba))
-
-    if imu_available and imu_bias_key is not None and optimized_values.exists(imu_bias_key):
-        bias_after_vec = imu_bias_to_numpy(optimized_values.atConstantBias(imu_bias_key))
-        if bias_before_vec is not None:
-            log_imu_bias_values(bias_before_vec, bias_after_vec, label=log_prefix)
-            plot_imu_bias_values(bias_before_vec, bias_after_vec, label=log_prefix)
-
-    return {
-        "frames_for_ba": frames_for_ba,
-        "landmark_original_indices": landmark_index_lookup,
-        "initial_pose_dict": initial_pose_dict,
-        "optimized_pose_dict": optimized_pose_dict,
-        "initial_landmarks": initial_landmarks,
-        "optimized_landmarks": optimized_landmarks,
-        # "reprojection_before": reprojection_before,
-        # "reprojection_after": reprojection_after,
-        "stereo_counts": stereo_counts,
-        "mono_counts": mono_counts,
-        "imu_bias_before": bias_before_vec,
-        "imu_bias_after": bias_after_vec,
-    }
 
 
 # is this right?? I just want percent error over WHOLE trajectory, not average cummulative error? maybe that means I should just look at the end of the graph or at the dots? idk
@@ -1491,6 +803,18 @@ def plot_imu_bias_values(
     ax.legend()
     plt.tight_layout()
     plt.show()
+
+
+def _log_bundle_adjuster_bias_diagnostics(result: dict[str, Any], label: str | None) -> None:
+    if not result:
+        return
+    bias_before = result.get("imu_bias_before")
+    bias_after = result.get("imu_bias_after")
+    if bias_before is None or bias_after is None:
+        return
+    log_label = label or "bundle_adjustment"
+    log_imu_bias_values(bias_before, bias_after, label=log_label)
+    plot_imu_bias_values(bias_before, bias_after, label=log_label)
 
 
 def plot_pose_trajectories(
@@ -1805,47 +1129,33 @@ def run_depth_variant(
     tracks = dict(KLT_TRACKER.tracks)
 
     tracking_summary = summarise_tracking_results(sequence_sample, track_history, sequence_results)
-    if rerun_logger is not None and rerun_logger.enabled:
-        _log_sequence_results_to_rerun(rerun_logger, depth_label, depth_frames, sequence_results)
 
-    ba_result = run_bundle_adjustment(
+    gravity_vector = test_utils.estimate_world_gravity_from_first_batch(sequence_sample)
+    ba_result = BUNDLE_ADJUSTER.optimize(
         rectified_frames=rectified_frames,
         track_history=track_history,
         tracks=tracks,
         sequence_results=sequence_results,
         sequence_sample=sequence_sample,
         use_imu=USE_IMU_FACTORS,
-        log_prefix=variant_label,
+        gravity_vector=gravity_vector,
+        log_prefix=depth_label,
     )
-    if rerun_logger is not None and rerun_logger.enabled:
-        _log_bundle_adjustment_to_rerun(
-            rerun_logger,
-            depth_label,
-            depth_frames,
-            ba_result,
-            "with_imu" if USE_IMU_FACTORS else "vision_only",
-        )
+    _log_bundle_adjuster_bias_diagnostics(ba_result, depth_label)
 
     ba_result_no_imu = None
     if USE_IMU_FACTORS:
         try:
-            ba_result_no_imu = run_bundle_adjustment(
+            ba_result_no_imu = BUNDLE_ADJUSTER.optimize(
                 rectified_frames=rectified_frames,
                 track_history=track_history,
                 tracks=tracks,
                 sequence_results=sequence_results,
                 sequence_sample=sequence_sample,
                 use_imu=False,
-                log_prefix=variant_label,
+                gravity_vector=gravity_vector,
+                log_prefix=depth_label,
             )
-            if rerun_logger is not None and rerun_logger.enabled and ba_result_no_imu is not None:
-                _log_bundle_adjustment_to_rerun(
-                    rerun_logger,
-                    depth_label,
-                    depth_frames,
-                    ba_result_no_imu,
-                    "vision_only",
-                )
         except Exception as e:
             print(f"Error running bundle adjustment without IMU: {e}")
             ba_result_no_imu = None
@@ -1925,6 +1235,7 @@ for sample_idx in range(NUM_SEQUENCE_SAMPLES):
     plot_imu_measurements(sequence, title=f"IMU data (sample {sample_idx})")
     inertial_poses = integrate_inertial_trajectory(sequence)
 
+    # only to do this if you know the frames are already rectified
     rectified_frames = sequence.frames
     # rectified_frames = [frame.rectify() for frame in sequence.frames]
     # rectified_frames = [
@@ -2137,7 +1448,7 @@ for sample_idx in range(NUM_SEQUENCE_SAMPLES):
                                 do_align = True)
         for key, value in ta_results.items():
             print(f"{key}: {value}")
-        
+
         ate = ta_results["ate"]
         est_traj_aligned = ta_results["est_traj"]
         est_traj_aligned_xyz = est_traj_aligned[:, :3]
@@ -2148,7 +1459,7 @@ for sample_idx in range(NUM_SEQUENCE_SAMPLES):
         gt_traj_total_distance = np.sum(gt_traj_xyz_diff_norm)
 
         err_xyz = np.linalg.norm(est_traj_aligned_xyz - gt_traj_xyz, axis=1)
-        err_xyzs.append((result['label'], err_xyz))
+        err_xyzs.append((result["label"], err_xyz))
 
         print(f"Result: {result['label']}")
         print(f"GT total distance: {gt_traj_total_distance:.2f} m")
@@ -2173,11 +1484,6 @@ for sample_idx in range(NUM_SEQUENCE_SAMPLES):
             # log poses trajectories
             for i in range(len(est_traj_aligned)):
                 rr.set_time("frame", sequence=i)
-
-                # est_pose = gtsam.Pose3(
-                #     gtsam.Rot3.Quaternion(w=est_traj_aligned[i, 3], x=est_traj_aligned[i, 4], y=est_traj_aligned[i, 5], z=est_traj_aligned[i, 6]),
-                #     gtsam.Point3(est_traj_aligned[i, 0:3])
-                # )
 
                 # use the unaligned est_traj for now so the landmarks don't also need to be aligned
                 est_pose = gtsam.Pose3(
