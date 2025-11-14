@@ -187,7 +187,7 @@ def save_variant_tum_files(
     if not estimated_pose_dict:
         return
 
-    prefix = f"sample{sample_index}_{depth_label}"
+    prefix = f"{EUROC_SEQUENCE}"
     est_path = RESULTS_DIR / f"{prefix}_estimated.txt"
     est_tum = _pose_dict_to_tum_array(estimated_pose_dict, sequence_sample.frame_timestamps)
     _write_tum_file(est_path, est_tum)
