@@ -10,6 +10,7 @@ import numpy as np
 import torch
 import tartanair as ta
 import rerun as rr
+from tqdm import tqdm
 from hydra import compose, initialize
 from hydra.utils import instantiate        
 from hydra import initialize_config_dir
@@ -43,7 +44,7 @@ from slam.local_vo import (  # noqa: E402
 # Configuration
 # ----------------------------------------------------------------------
 NUM_SEQUENCE_SAMPLES = 1
-SEQUENCE_LENGTH = 1000
+SEQUENCE_LENGTH = 5000
 # ENVIRONMENT = "Hospital"
 # DIFFICULTY = "diff"
 # TRAJECTORY = "P1000"
@@ -1111,99 +1112,101 @@ def run_depth_variant(
 
     KLT_TRACKER.reset()
     RELATIVE_POSE_INITIALIZER.reset(sequence_sample)
+    BUNDLE_ADJUSTER.reset(sequence_sample=sequence_sample)
     track_history: list[dict[int, TrackObservation]] = []
     sequence_results: list[dict[str, Any]] = []
 
-    for frame_idx, (rect_frame, depth_frame) in enumerate(zip(rectified_frames, depth_frames)):
-        frame_observations = KLT_TRACKER.track_frame(rect_frame, depth_frame)
-        track_history.append(frame_observations)
-        result = RELATIVE_POSE_INITIALIZER.process_frame(
-            frame_index=frame_idx,
-            rectified_frame=rect_frame,
-            depth_frame=depth_frame,
-            track_observations=frame_observations,
-        )
-        if result is not None:
-            sequence_results.append(result)
-
-    tracks = dict(KLT_TRACKER.tracks)
-
-    tracking_summary = summarise_tracking_results(sequence_sample, track_history, sequence_results)
-
-    gravity_vector = test_utils.estimate_world_gravity_from_first_batch(sequence_sample)
-    ba_result = BUNDLE_ADJUSTER.optimize(
-        rectified_frames=rectified_frames,
-        track_history=track_history,
-        tracks=tracks,
-        sequence_results=sequence_results,
-        sequence_sample=sequence_sample,
-        use_imu=USE_IMU_FACTORS,
-        gravity_vector=gravity_vector,
-        log_prefix=depth_label,
-    )
-    _log_bundle_adjuster_bias_diagnostics(ba_result, depth_label)
-
-    ba_result_no_imu = None
-    if USE_IMU_FACTORS:
-        try:
-            ba_result_no_imu = BUNDLE_ADJUSTER.optimize(
-                rectified_frames=rectified_frames,
-                track_history=track_history,
-                tracks=tracks,
-                sequence_results=sequence_results,
-                sequence_sample=sequence_sample,
-                use_imu=False,
-                gravity_vector=gravity_vector,
-                log_prefix=depth_label,
+    try:
+        for frame_idx, (rect_frame, depth_frame) in tqdm(enumerate(zip(rectified_frames, depth_frames)), total=len(rectified_frames)):
+            frame_observations = KLT_TRACKER.track_frame(rect_frame, depth_frame)
+            track_history.append(frame_observations)
+            result = RELATIVE_POSE_INITIALIZER.process_frame(
+                frame_index=frame_idx,
+                rectified_frame=rect_frame,
+                depth_frame=depth_frame,
+                track_observations=frame_observations,
             )
-        except Exception as e:
-            print(f"Error running bundle adjustment without IMU: {e}")
-            ba_result_no_imu = None
+            BUNDLE_ADJUSTER.add_frame(
+                rectified_frame=rect_frame,
+                track_observations=frame_observations,
+                tracks=KLT_TRACKER.tracks,
+                sequence_result=result,
+            )
+            if result is not None:
+                sequence_results.append(result)
 
-    pose_errors = compute_pose_errors_against_ground_truth(ba_result["optimized_pose_dict"], sequence_sample)
-    pose_errors_no_imu = None
-    if ba_result_no_imu is not None:
-        pose_errors_no_imu = compute_pose_errors_against_ground_truth(
-            ba_result_no_imu["optimized_pose_dict"],
-            sequence_sample,
+        tracks = dict(KLT_TRACKER.tracks)
+
+        tracking_summary = summarise_tracking_results(sequence_sample, track_history, sequence_results)
+
+        gravity_vector = test_utils.estimate_world_gravity_from_first_batch(sequence_sample)
+        ba_result = BUNDLE_ADJUSTER.optimize(
+            sequence_sample=sequence_sample,
+            use_imu=USE_IMU_FACTORS,
+            gravity_vector=gravity_vector,
+            log_prefix=depth_label,
         )
+        _log_bundle_adjuster_bias_diagnostics(ba_result, depth_label)
 
-    optimized_translation_norms = [pose_errors[idx]["translation_norm"] for idx in sorted(pose_errors)]
-    optimized_rotation_norms_deg = [
-        np.rad2deg(pose_errors[idx]["rotation_norm_rad"]) for idx in sorted(pose_errors)
-    ]
-    optimized_translation_norms_no_imu: list[float] = []
-    optimized_rotation_norms_deg_no_imu: list[float] = []
-    if pose_errors_no_imu is not None:
-        optimized_translation_norms_no_imu = [
-            pose_errors_no_imu[idx]["translation_norm"] for idx in sorted(pose_errors_no_imu)
+        ba_result_no_imu = None
+        if USE_IMU_FACTORS:
+            try:
+                ba_result_no_imu = BUNDLE_ADJUSTER.optimize(
+                    sequence_sample=sequence_sample,
+                    use_imu=False,
+                    gravity_vector=gravity_vector,
+                    log_prefix=depth_label,
+                )
+            except Exception as e:
+                print(f"Error running bundle adjustment without IMU: {e}")
+                ba_result_no_imu = None
+
+        pose_errors = compute_pose_errors_against_ground_truth(ba_result["optimized_pose_dict"], sequence_sample)
+        pose_errors_no_imu = None
+        if ba_result_no_imu is not None:
+            pose_errors_no_imu = compute_pose_errors_against_ground_truth(
+                ba_result_no_imu["optimized_pose_dict"],
+                sequence_sample,
+            )
+
+        optimized_translation_norms = [pose_errors[idx]["translation_norm"] for idx in sorted(pose_errors)]
+        optimized_rotation_norms_deg = [
+            np.rad2deg(pose_errors[idx]["rotation_norm_rad"]) for idx in sorted(pose_errors)
         ]
-        optimized_rotation_norms_deg_no_imu = [
-            np.rad2deg(pose_errors_no_imu[idx]["rotation_norm_rad"]) for idx in sorted(pose_errors_no_imu)
-        ]
+        optimized_translation_norms_no_imu: list[float] = []
+        optimized_rotation_norms_deg_no_imu: list[float] = []
+        if pose_errors_no_imu is not None:
+            optimized_translation_norms_no_imu = [
+                pose_errors_no_imu[idx]["translation_norm"] for idx in sorted(pose_errors_no_imu)
+            ]
+            optimized_rotation_norms_deg_no_imu = [
+                np.rad2deg(pose_errors_no_imu[idx]["rotation_norm_rad"]) for idx in sorted(pose_errors_no_imu)
+            ]
 
-    # rms_before = float(np.sqrt(np.mean(ba_result["reprojection_before"] ** 2)))
-    # rms_after = float(np.sqrt(np.mean(ba_result["reprojection_after"] ** 2)))
+        # rms_before = float(np.sqrt(np.mean(ba_result["reprojection_before"] ** 2)))
+        # rms_after = float(np.sqrt(np.mean(ba_result["reprojection_after"] ** 2)))
 
-    return {
-        "label": depth_label,
-        "track_history": track_history,
-        "sequence_results": sequence_results,
-        "tracking_summary": tracking_summary,
-        "ba_result": ba_result,
-        "ba_result_no_imu": ba_result_no_imu,
-        "initial_pose_dict": ba_result["initial_pose_dict"],
-        "optimized_pose_dict": ba_result["optimized_pose_dict"],
-        "pose_errors": pose_errors,
-        "pose_errors_no_imu": pose_errors_no_imu,
-        "optimized_translation_norms": optimized_translation_norms,
-        "optimized_rotation_norms_deg": optimized_rotation_norms_deg,
-        "optimized_translation_norms_no_imu": optimized_translation_norms_no_imu,
-        "optimized_rotation_norms_deg_no_imu": optimized_rotation_norms_deg_no_imu,
-        # "rms_before": rms_before,
-        # "rms_after": rms_after,
-        "tracks": tracks,
-    }
+        return {
+            "label": depth_label,
+            "track_history": track_history,
+            "sequence_results": sequence_results,
+            "tracking_summary": tracking_summary,
+            "ba_result": ba_result,
+            "ba_result_no_imu": ba_result_no_imu,
+            "initial_pose_dict": ba_result["initial_pose_dict"],
+            "optimized_pose_dict": ba_result["optimized_pose_dict"],
+            "pose_errors": pose_errors,
+            "pose_errors_no_imu": pose_errors_no_imu,
+            "optimized_translation_norms": optimized_translation_norms,
+            "optimized_rotation_norms_deg": optimized_rotation_norms_deg,
+            "optimized_translation_norms_no_imu": optimized_translation_norms_no_imu,
+            "optimized_rotation_norms_deg_no_imu": optimized_rotation_norms_deg_no_imu,
+            # "rms_before": rms_before,
+            # "rms_after": rms_after,
+            "tracks": tracks,
+        }
+    finally:
+        BUNDLE_ADJUSTER.reset()
 
 
 # %%

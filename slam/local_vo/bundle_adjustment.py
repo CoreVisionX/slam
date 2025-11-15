@@ -3,9 +3,9 @@
 from __future__ import annotations
 
 import time
-from contextlib import contextmanager, nullcontext
+from contextlib import contextmanager
 from dataclasses import dataclass, field
-from typing import Any, Mapping, Sequence
+from typing import Any, Iterable, Mapping, Sequence
 
 import gtsam
 import numpy as np
@@ -67,7 +67,7 @@ class _SectionProfiler:
     """Lightweight profiler that aggregates timing for named sections."""
 
     def __init__(self, log_prefix: str | None) -> None:
-        self._label = f" ({log_prefix})" if log_prefix else ""
+        self._log_prefix = log_prefix
         self._times: dict[str, float] = {}
 
     @contextmanager
@@ -79,13 +79,28 @@ class _SectionProfiler:
             duration = time.perf_counter() - start
             self._times[name] = self._times.get(name, 0.0) + duration
 
-    def report(self) -> None:
+    def _format_label(self, override: str | None) -> str:
+        label = override if override is not None else self._log_prefix
+        return f" ({label})" if label else ""
+
+    def report(self, log_prefix: str | None = None) -> None:
         if not self._times:
             return
-        print(f"Bundle adjustment timing breakdown{self._label}:")
+        label = self._format_label(log_prefix)
+        print(f"Bundle adjustment timing breakdown{label}:")
         longest = max(len(name) for name in self._times)
         for name, duration in sorted(self._times.items(), key=lambda item: item[1], reverse=True):
             print(f"  {name.ljust(longest)} : {duration:6.3f} s")
+
+    def report_average(self, call_count: int, log_prefix: str | None = None) -> None:
+        if not self._times or call_count <= 0:
+            return
+        label = self._format_label(log_prefix)
+        print(f"Average add_frame section times over {call_count} calls{label}:")
+        longest = max(len(name) for name in self._times)
+        for name, total_duration in sorted(self._times.items(), key=lambda item: item[1], reverse=True):
+            avg_duration = total_duration / float(call_count)
+            print(f"  {name.ljust(longest)} : {avg_duration:6.6f} s ({1/avg_duration:.2f} Hz)")
 
 
 @dataclass(frozen=True)
@@ -101,57 +116,112 @@ class IncrementalBundleAdjuster:
         if config is not None and kwargs:
             raise TypeError("Provide either a config object or keyword overrides, not both.")
         self.config = config or BundleAdjustmentConfig(**kwargs)
+        self.reset()
+
+    def reset(self, sequence_sample: Any | None = None) -> None:
+        """Reset the incremental solver and optionally set the sequence context."""
+        self._sequence_sample = sequence_sample
+        self._gt_world_to_first: gtsam.Pose3 | None = None
+        if sequence_sample is not None:
+            first_pose = sequence_sample.world_poses[0]
+            self._gt_world_to_first = gtsam.Pose3(first_pose.rotation(), np.zeros(3))
+        self._frame_profiler = _SectionProfiler(None)
+        self._add_frame_calls = 0
+        self._vision_graph = gtsam.NonlinearFactorGraph()
+        self._vision_values = gtsam.Values()
+        self._frames_for_ba: list[int] = []
+        self._frames_for_ba_set: set[int] = set()
+        self._rectified_frame_buffer: list[RectifiedStereoFrame] = []
+        self._track_history: list[Mapping[int, TrackObservation]] = []
+        self._sequence_results: list[dict[str, Any]] = []
+        self._inlier_lookup: dict[int, set[int]] = {}
+        self._track_to_landmark: dict[int, int] = {}
+        self._landmark_observed_frames: dict[int, set[int]] = {}
+        self._landmark_index_lookup: list[int] = []
+        self._initial_landmarks: list[np.ndarray] = []
+        self._observation_matrix: list[tuple[int, int, np.ndarray]] = []
+        self._stereo_counts: dict[int, int] = {}
+        self._mono_counts: dict[int, int] = {}
+        self._initial_pose_dict: dict[int, gtsam.Pose3] = {}
+        self._last_pose_initial: gtsam.Pose3 | None = None
+        self._camera_cache: _CachedCameraBatch | None = None
+        self._calibration: gtsam.Cal3_S2 | None = None
+        self._stereo_calibration: gtsam.Cal3_S2Stereo | None = None
+        self._intrinsics: tuple[float, float, float, float] | None = None
+        self._measurement_noise, self._stereo_noise = self._build_measurement_noises()
+        self._prior_noise = gtsam.noiseModel.Diagonal.Sigmas(self._as_array(self.config.pose_prior_sigmas))
+        self._gating_threshold_sq = float(self.config.reprojection_gating_threshold_px) ** 2
+        self._track_landmark_progress: dict[int, int] = {}
+        self._pending_landmark_observations: dict[int, list[tuple[int, TrackObservation]]] = {}
+
+    def add_frame(
+        self,
+        *,
+        rectified_frame: RectifiedStereoFrame,
+        track_observations: Mapping[int, TrackObservation],
+        tracks: Mapping[int, FeatureTrack],
+        sequence_result: Mapping[str, Any] | None = None,
+    ) -> None:
+        """Incrementally add pose and landmark factors for each processed frame."""
+        if self._sequence_sample is None:
+            raise RuntimeError(
+                "IncrementalBundleAdjuster.reset(sequence_sample=...) must be called before add_frame()."
+            )
+        if tracks is None:
+            raise ValueError("tracks must be provided to add_frame for incremental updates.")
+
+        frame_idx = len(self._rectified_frame_buffer)
+        self._rectified_frame_buffer.append(rectified_frame)
+        self._track_history.append(dict(track_observations))
+        if sequence_result is not None:
+            self._sequence_results.append(sequence_result)
+            self._update_inlier_lookup(sequence_result)
+
+        pose_initial = self._update_pose_initial(frame_idx, sequence_result)
+        include_frame = self._should_include_frame(frame_idx, track_observations)
+
+        if include_frame:
+            with self._frame_profiler.section("pose initialization"):
+                self._ensure_calibrations(rectified_frame)
+                self._insert_pose_initial(frame_idx, pose_initial)
+
+        with self._frame_profiler.section("landmark update"):
+            if self._frames_for_ba:
+                track_ids_for_update: Iterable[int] | None = None
+                if track_observations:
+                    track_ids_for_update = track_observations.keys()
+                self._update_landmarks(tracks, track_ids_for_update)
+
+        self._add_frame_calls += 1
 
     def optimize(
         self,
         *,
-        rectified_frames: Sequence[RectifiedStereoFrame],
-        track_history: Sequence[Mapping[int, TrackObservation]],
-        tracks: Mapping[int, FeatureTrack],
-        sequence_results: Sequence[dict[str, Any]],
         sequence_sample: Any,
+        tracks: Mapping[int, FeatureTrack] | None = None,  # retained for API compatibility
         use_imu: bool = True,
         gravity_vector: Sequence[float] | np.ndarray | None = None,
         log_prefix: str | None = None,
     ) -> dict[str, Any]:
-        if not rectified_frames:
-            raise ValueError("No frames provided for bundle adjustment.")
+        if self._sequence_sample is None:
+            self._sequence_sample = sequence_sample
+        elif sequence_sample is not self._sequence_sample:
+            self._sequence_sample = sequence_sample
 
+        if not self._frames_for_ba:
+            raise ValueError("No frames have been added to the bundle adjuster.")
+        if not self._track_to_landmark:
+            raise RuntimeError("No landmark observations available for bundle adjustment.")
+
+        self._frame_profiler.report_average(self._add_frame_calls, log_prefix)
         profiler = _SectionProfiler(log_prefix)
+        frames_for_ba = list(self._frames_for_ba)
+        graph = gtsam.NonlinearFactorGraph(self._vision_graph)
+        values = gtsam.Values(self._vision_values)
 
-        with profiler.section("select frames"):
-            frames_for_ba = self._select_frames_for_ba(track_history)
-        if not frames_for_ba:
-            raise ValueError("No frames satisfy the observation thresholds for bundle adjustment.")
-
-        with profiler.section("build calibrations"):
-            calibration = self._build_calibration(rectified_frames[0])
-            stereo_calibration = self._build_stereo_calibration(rectified_frames[0])
-
-        with profiler.section("noise model setup"):
-            measurement_noise, stereo_noise = self._build_measurement_noises()
-            prior_noise = gtsam.noiseModel.Diagonal.Sigmas(
-                self._as_array(self.config.pose_prior_sigmas)
-            )
-
-        graph = gtsam.NonlinearFactorGraph()
-        values = gtsam.Values()
-
-        with profiler.section("pose initialization"):
-            first_pose = sequence_sample.world_poses[0]
-            gt_world_to_first = gtsam.Pose3(first_pose.rotation(), np.zeros(3))
-            pose_initials = self._compute_pose_initializations(
-                gt_world_to_first,
-                sequence_results,
-                len(rectified_frames),
-            )
-
-            for frame_idx in frames_for_ba:
-                values.insert(X(frame_idx), self._clone_pose(pose_initials[frame_idx]))
-
+        sequence_sample = self._sequence_sample
         imu_available = bool(use_imu and getattr(sequence_sample, "imu_measurements", None))
         imu_bias_key = None
-        imu_bias_initial = gtsam.imuBias.ConstantBias()
         bias_before_vec: np.ndarray | None = None
         bias_after_vec: np.ndarray | None = None
         imu_params = None
@@ -161,9 +231,8 @@ class IncrementalBundleAdjuster:
                 imu_bias_key = B(frames_for_ba[0])
                 imu_params = self._create_preintegration_params(gravity_vector)
                 if not values.exists(imu_bias_key):
-                    values.insert(imu_bias_key, imu_bias_initial)
+                    values.insert(imu_bias_key, gtsam.imuBias.ConstantBias())
 
-                # Initialize velocities by differentiating consecutive poses.
                 if len(frames_for_ba) >= 2:
                     first_velocity = self._finite_difference_velocity(
                         frames_for_ba[0],
@@ -188,7 +257,7 @@ class IncrementalBundleAdjuster:
                 graph.add(
                     gtsam.PriorFactorConstantBias(
                         B(frames_for_ba[0]),
-                        imu_bias_initial,
+                        gtsam.imuBias.ConstantBias(),
                         bias_prior,
                     )
                 )
@@ -206,35 +275,8 @@ class IncrementalBundleAdjuster:
                     frames_for_ba,
                 )
 
-        graph.add(gtsam.PriorFactorPose3(X(frames_for_ba[0]), gt_world_to_first, prior_noise))
-
         if imu_available and imu_bias_key is not None and values.exists(imu_bias_key):
             bias_before_vec = self._imu_bias_to_numpy(values.atConstantBias(imu_bias_key))
-
-        with profiler.section("build landmark factors"):
-            (
-                landmark_keys,
-                landmark_index_lookup,
-                initial_landmarks,
-                observations,
-                stereo_counts,
-                mono_counts,
-            ) = self._build_landmark_factors(
-                graph,
-                values,
-                rectified_frames,
-                tracks,
-                sequence_results,
-                frames_for_ba,
-                calibration,
-                stereo_calibration,
-                measurement_noise,
-                stereo_noise,
-                profiler,
-            )
-
-        if not observations:
-            raise RuntimeError("No landmark observations available for bundle adjustment.")
 
         label = f" ({log_prefix})" if log_prefix else ""
         print(f"Performing bundle adjustment{label}...")
@@ -254,46 +296,24 @@ class IncrementalBundleAdjuster:
             optimized_pose_dict = {idx: optimized_values.atPose3(X(idx)) for idx in frames_for_ba}
             optimized_landmarks = [
                 self._point3_like_to_numpy(optimized_values.atPoint3(L(key)))
-                for key in range(len(landmark_keys))
-            ]
-            initial_pose_dict = {idx: values.atPose3(X(idx)) for idx in frames_for_ba}
-
-            observation_matrix = [
-                (frame_idx, landmark_idx, measurement)
-                for frame_idx, landmark_idx, measurement in observations
+                for key in range(len(self._landmark_index_lookup))
             ]
 
         profiler.report()
 
         return {
             "frames_for_ba": frames_for_ba,
-            "landmark_original_indices": landmark_index_lookup,
-            "initial_pose_dict": initial_pose_dict,
+            "landmark_original_indices": list(self._landmark_index_lookup),
+            "initial_pose_dict": dict(self._initial_pose_dict),
             "optimized_pose_dict": optimized_pose_dict,
-            "initial_landmarks": initial_landmarks,
+            "initial_landmarks": list(self._initial_landmarks),
             "optimized_landmarks": optimized_landmarks,
-            "observation_matrix": observation_matrix,
-            "stereo_counts": stereo_counts,
-            "mono_counts": mono_counts,
+            "observation_matrix": list(self._observation_matrix),
+            "stereo_counts": dict(self._stereo_counts),
+            "mono_counts": dict(self._mono_counts),
             "imu_bias_before": bias_before_vec,
             "imu_bias_after": bias_after_vec,
         }
-
-    # ------------------------------------------------------------------
-    # Helper methods
-    # ------------------------------------------------------------------
-
-    def _select_frames_for_ba(
-        self,
-        track_history: Sequence[Mapping[int, TrackObservation]],
-    ) -> list[int]:
-        selected: list[int] = []
-        for idx, observations in enumerate(track_history):
-            if len(observations) >= self.config.min_observations_per_frame or idx == 0:
-                selected.append(idx)
-        if 0 not in selected:
-            selected.insert(0, 0)
-        return selected
 
     @staticmethod
     def _build_calibration(frame: RectifiedStereoFrame) -> gtsam.Cal3_S2:
@@ -480,145 +500,295 @@ class IncrementalBundleAdjuster:
             raise ValueError("Invalid timestamp delta for velocity initialization.")
         return (next_pose.translation() - prev_pose.translation()) / dt
 
-    def _build_landmark_factors(
+    def _should_include_frame(
         self,
-        graph: gtsam.NonlinearFactorGraph,
-        values: gtsam.Values,
-        rectified_frames: Sequence[RectifiedStereoFrame],
+        frame_idx: int,
+        track_observations: Mapping[int, TrackObservation],
+    ) -> bool:
+        return frame_idx == 0 or len(track_observations) >= self.config.min_observations_per_frame
+
+    def _ensure_calibrations(self, frame: RectifiedStereoFrame) -> None:
+        if self._calibration is None:
+            self._calibration = self._build_calibration(frame)
+            self._stereo_calibration = self._build_stereo_calibration(frame)
+            self._intrinsics = (
+                float(self._calibration.fx()),
+                float(self._calibration.fy()),
+                float(self._calibration.px()),
+                float(self._calibration.py()),
+            )
+
+    def _update_pose_initial(
+        self,
+        frame_idx: int,
+        sequence_result: Mapping[str, Any] | None,
+    ) -> gtsam.Pose3:
+        if frame_idx == 0:
+            if self._gt_world_to_first is None:
+                if self._sequence_sample is None:
+                    raise RuntimeError("Sequence sample missing for pose initialization.")
+                first_pose = self._sequence_sample.world_poses[0]
+                self._gt_world_to_first = gtsam.Pose3(first_pose.rotation(), np.zeros(3))
+            pose_guess = self._gt_world_to_first
+        else:
+            pose_guess = self._last_pose_initial or self._gt_world_to_first
+            if pose_guess is None:
+                raise RuntimeError("Initial pose unavailable; ensure reset() was called with a sequence sample.")
+        if sequence_result and sequence_result.get("status") == "success":
+            pose_guess = sequence_result["estimated_pose"]
+        self._last_pose_initial = pose_guess
+        return pose_guess
+
+    def _insert_pose_initial(self, frame_idx: int, pose_initial: gtsam.Pose3) -> None:
+        if frame_idx in self._initial_pose_dict:
+            return
+        if self._calibration is None or self._stereo_calibration is None:
+            raise RuntimeError("Camera calibration must be initialized before inserting poses.")
+        if not self._frames_for_ba:
+            if self._gt_world_to_first is None:
+                raise RuntimeError("Ground truth orientation for first frame missing.")
+            self._vision_graph.add(
+                gtsam.PriorFactorPose3(X(frame_idx), self._gt_world_to_first, self._prior_noise)
+            )
+
+        self._vision_values.insert(X(frame_idx), self._clone_pose(pose_initial))
+        self._initial_pose_dict[frame_idx] = self._clone_pose(pose_initial)
+        self._frames_for_ba.append(frame_idx)
+        self._frames_for_ba_set.add(frame_idx)
+        self._stereo_counts.setdefault(frame_idx, 0)
+        self._mono_counts.setdefault(frame_idx, 0)
+        self._camera_cache = None
+
+    def _update_inlier_lookup(self, sequence_result: Mapping[str, Any]) -> None:
+        if sequence_result.get("status") != "success":
+            return
+        track_ids = sequence_result.get("track_ids")
+        matched_pair = sequence_result.get("matched_pair")
+        if track_ids is None or matched_pair is None:
+            return
+        matches = matched_pair.matches
+        if hasattr(matches, "cpu"):
+            matches = matches.cpu().numpy()
+        if matches.size == 0:
+            return
+        matched_track_ids = np.asarray(track_ids, dtype=int)
+        valid_ids = matched_track_ids[matches[:, 0]]
+        frame_idx = sequence_result["frame_index"]
+        lookup = self._inlier_lookup.setdefault(frame_idx, set())
+        lookup.update(valid_ids.tolist())
+
+    def _get_camera_cache(self) -> _CachedCameraBatch:
+        if self._camera_cache is None:
+            self._camera_cache = self._build_camera_cache(
+                self._frames_for_ba,
+                self._vision_values,
+                self._rectified_frame_buffer,
+            )
+        return self._camera_cache
+
+    def _landmark_limit_reached(self) -> bool:
+        limit = int(self.config.max_landmarks)
+        return limit > 0 and len(self._landmark_index_lookup) >= limit
+
+    def _update_landmarks(
+        self,
         tracks: Mapping[int, FeatureTrack],
-        sequence_results: Sequence[dict[str, Any]],
-        frames_for_ba: Sequence[int],
-        calibration: gtsam.Cal3_S2,
-        stereo_calibration: gtsam.Cal3_S2Stereo,
-        measurement_noise: gtsam.noiseModel.Base,
-        stereo_noise: gtsam.noiseModel.Base,
-        profiler: _SectionProfiler | None = None,
-    ) -> tuple[list[int], list[int], list[np.ndarray], list[tuple[int, int, np.ndarray]], dict[int, int], dict[int, int]]:
-        landmark_keys: list[int] = []
-        landmark_index_lookup: list[int] = []
-        initial_landmarks: list[np.ndarray] = []
-        observations: list[tuple[int, int, np.ndarray]] = []
-        stereo_counts = {frame_idx: 0 for frame_idx in frames_for_ba}
-        mono_counts = {frame_idx: 0 for frame_idx in frames_for_ba}
-        landmark_limit = int(self.config.max_landmarks)
-        if landmark_limit < 0:
-            landmark_limit = 0
-        frames_for_ba_set = set(frames_for_ba)
-        camera_cache = self._build_camera_cache(frames_for_ba, values, rectified_frames)
-        intrinsics = (
-            float(calibration.fx()),
-            float(calibration.fy()),
-            float(calibration.px()),
-            float(calibration.py()),
-        )
-        gating_threshold_sq = float(self.config.reprojection_gating_threshold_px) ** 2
+        track_ids_to_update: Iterable[int] | None = None,
+    ) -> None:
+        if not tracks or not self._frames_for_ba:
+            return
+        if self._calibration is None or self._stereo_calibration is None or self._intrinsics is None:
+            return
+        profiler = self._frame_profiler
+        with profiler.section("landmark track selection"):
+            if track_ids_to_update is not None:
+                unique_ids: list[int] = []
+                seen: set[int] = set()
+                for track_id in track_ids_to_update:
+                    if track_id in seen:
+                        continue
+                    if track_id not in tracks:
+                        continue
+                    unique_ids.append(track_id)
+                    seen.add(track_id)
+                if not unique_ids:
+                    return
+                track_iter: Iterable[FeatureTrack] = (tracks[track_id] for track_id in unique_ids)
+            else:
+                track_iter = tracks.values()
+        with profiler.section("landmark camera cache"):
+            frames_for_ba_set = self._frames_for_ba_set
+            camera_cache = self._get_camera_cache()
+            intrinsics = self._intrinsics
+        min_obs = int(self.config.min_observations_per_landmark)
+        max_obs = int(self.config.max_observations_per_landmark)
+        if max_obs > 0:
+            max_obs = max(max_obs, min_obs)
 
-        inlier_lookup = self._build_inlier_lookup(sequence_results)
-
-        for track_id in sorted(tracks.keys()):
-            if landmark_limit > 0 and len(landmark_keys) >= landmark_limit:
-                break
-            track = tracks[track_id]
-            if not np.isfinite(track.anchor_depth) or track.anchor_depth <= 0.0:
+        for track in track_iter:
+            track_id = track.track_id
+            has_landmark = track_id in self._track_to_landmark
+            if not has_landmark and self._landmark_limit_reached():
                 continue
             if track.anchor_frame not in frames_for_ba_set:
                 continue
+            if not np.isfinite(track.anchor_depth) or track.anchor_depth <= 0.0:
+                continue
+            if track.anchor_frame >= len(self._rectified_frame_buffer):
+                continue
 
-            with (profiler.section("world point init") if profiler else nullcontext()):
-                T_B_from_S0 = rectified_frames[track.anchor_frame].calibration.T_B_from_S0
-                anchor_pose = values.atPose3(X(track.anchor_frame))
+            with profiler.section("landmark world point"):
+                anchor_pose = self._vision_values.atPose3(X(track.anchor_frame))
+                T_B_from_S0 = self._rectified_frame_buffer[track.anchor_frame].calibration.T_B_from_S0
                 anchor_point_S0 = gtsam.Point3(*track.anchor_point3.tolist())
                 world_point = anchor_pose.compose(T_B_from_S0).transformFrom(anchor_point_S0)
                 world_point_np = self._point3_like_to_numpy(world_point)
 
-            with (profiler.section("collect track observations") if profiler else nullcontext()):
+            observations_list = track.observation_frames
+            processed_count = self._track_landmark_progress.get(track_id, 0)
+            if processed_count >= len(observations_list):
+                continue
+            candidate_frames = observations_list[processed_count:]
+            candidate_pairs: list[tuple[int, TrackObservation]] = []
+            for frame_idx in candidate_frames:
+                observation = track.observations.get(frame_idx)
+                if observation is None:
+                    continue
+                candidate_pairs.append((frame_idx, observation))
+            if not candidate_pairs:
+                self._track_landmark_progress[track_id] = len(observations_list)
+                continue
+            candidate_frames = [item[0] for item in candidate_pairs]
+            candidate_observations = [item[1] for item in candidate_pairs]
+            self._track_landmark_progress[track_id] = len(observations_list)
+
+            with profiler.section("landmark collect observations"):
                 observation_frames = self._collect_track_observations(
-                    track,
+                    track_id,
+                    candidate_frames,
+                    candidate_observations,
                     frames_for_ba_set,
                     camera_cache,
                     world_point_np,
                     track.anchor_frame,
-                    inlier_lookup,
+                    self._inlier_lookup,
                     intrinsics,
-                    gating_threshold_sq,
+                    self._gating_threshold_sq,
                 )
-
-            if len(observation_frames) < self.config.min_observations_per_landmark:
+            if has_landmark:
+                if not observation_frames:
+                    continue
+                if max_obs > 0:
+                    observed_frames = self._landmark_observed_frames.get(track_id, set())
+                    remaining = max(max_obs - len(observed_frames), 0)
+                    if remaining <= 0:
+                        continue
+                    if len(observation_frames) > remaining:
+                        observation_frames = self._limit_observation_frames(
+                            observation_frames, track.anchor_frame, remaining
+                        )
+                        if not observation_frames:
+                            continue
+                with profiler.section("landmark add observations"):
+                    self._add_landmark_observations(track, world_point, world_point_np, observation_frames)
                 continue
 
-            with (profiler.section("factor creation") if profiler else nullcontext()):
-                landmark_key = len(landmark_keys)
-                landmark_keys.append(landmark_key)
-                landmark_index_lookup.append(track_id)
-                values.insert(L(landmark_key), world_point)
-                initial_landmarks.append(world_point_np)
+            pending = self._pending_landmark_observations.setdefault(track_id, [])
+            if observation_frames:
+                pending.extend(observation_frames)
+            if len(pending) < min_obs:
+                continue
+            pending.sort(key=lambda item: item[0])
+            candidate = pending
+            if max_obs > 0 and len(candidate) > max_obs:
+                candidate = self._limit_observation_frames(candidate, track.anchor_frame, max_obs)
+            with profiler.section("landmark add observations"):
+                self._add_landmark_observations(track, world_point, world_point_np, candidate)
+            self._pending_landmark_observations.pop(track_id, None)
 
-                for frame_idx, observation in observation_frames:
-                    measurement_vec = np.asarray(observation.keypoint, dtype=np.float64)
-                    if frame_idx == track.anchor_frame:
-                        depth_value = float(track.anchor_depth)
-                        if not np.isfinite(depth_value) or depth_value <= 0.0:
-                            continue
-                        disparity = (stereo_calibration.fx() * stereo_calibration.baseline()) / depth_value
-                        stereo_measurement = gtsam.StereoPoint2(
-                            float(track.anchor_keypoint[0]),
-                            float(track.anchor_keypoint[0] - disparity),
-                            float(track.anchor_keypoint[1]),
+    def _add_landmark_observations(
+        self,
+        track: FeatureTrack,
+        world_point: gtsam.Point3,
+        world_point_np: np.ndarray,
+        observation_frames: list[tuple[int, TrackObservation]],
+    ) -> None:
+        stereo_calibration = self._stereo_calibration
+        calibration = self._calibration
+        if stereo_calibration is None or calibration is None:
+            raise RuntimeError("Calibrations must be initialized before adding landmarks.")
+
+        track_id = track.track_id
+        if track_id not in self._track_to_landmark:
+            landmark_key = len(self._track_to_landmark)
+            self._track_to_landmark[track_id] = landmark_key
+            self._landmark_index_lookup.append(track_id)
+            self._vision_values.insert(L(landmark_key), world_point)
+            self._initial_landmarks.append(world_point_np)
+            self._landmark_observed_frames[track_id] = set()
+        else:
+            landmark_key = self._track_to_landmark[track_id]
+
+        observed_frames = self._landmark_observed_frames[track_id]
+        for frame_idx, observation in observation_frames:
+            if frame_idx in observed_frames:
+                continue
+            measurement_vec = np.asarray(observation.keypoint, dtype=np.float64)
+            if frame_idx == track.anchor_frame:
+                depth_value = float(track.anchor_depth)
+                if not np.isfinite(depth_value) or depth_value <= 0.0:
+                    continue
+                disparity = (stereo_calibration.fx() * stereo_calibration.baseline()) / depth_value
+                stereo_measurement = gtsam.StereoPoint2(
+                    float(track.anchor_keypoint[0]),
+                    float(track.anchor_keypoint[0] - disparity),
+                    float(track.anchor_keypoint[1]),
+                )
+                self._vision_graph.add(
+                    gtsam.GenericStereoFactor3D(
+                        stereo_measurement,
+                        self._stereo_noise,
+                        X(frame_idx),
+                        L(landmark_key),
+                        stereo_calibration,
+                        self._rectified_frame_buffer[frame_idx].calibration.T_B_from_S0,
+                    )
+                )
+                self._stereo_counts[frame_idx] += 1
+            else:
+                depth_value = float(observation.depth)
+                if np.isfinite(depth_value) and depth_value > 0.0:
+                    disparity = (stereo_calibration.fx() * stereo_calibration.baseline()) / depth_value
+                    stereo_measurement = gtsam.StereoPoint2(
+                        float(observation.keypoint[0]),
+                        float(observation.keypoint[0] - disparity),
+                        float(observation.keypoint[1]),
+                    )
+                    self._vision_graph.add(
+                        gtsam.GenericStereoFactor3D(
+                            stereo_measurement,
+                            self._stereo_noise,
+                            X(frame_idx),
+                            L(landmark_key),
+                            stereo_calibration,
+                            self._rectified_frame_buffer[frame_idx].calibration.T_B_from_S0,
                         )
-                        graph.add(
-                            gtsam.GenericStereoFactor3D(
-                                stereo_measurement,
-                                stereo_noise,
-                                X(frame_idx),
-                                L(landmark_key),
-                                stereo_calibration,
-                                rectified_frames[frame_idx].calibration.T_B_from_S0,
-                            )
+                    )
+                    self._stereo_counts[frame_idx] += 1
+                else:
+                    self._vision_graph.add(
+                        gtsam.GenericProjectionFactorCal3_S2(
+                            gtsam.Point2(float(measurement_vec[0]), float(measurement_vec[1])),
+                            self._measurement_noise,
+                            X(frame_idx),
+                            L(landmark_key),
+                            calibration,
+                            self._rectified_frame_buffer[frame_idx].calibration.T_B_from_S0,
                         )
-                        stereo_counts[frame_idx] += 1
-                    else:
-                        depth_value = float(observation.depth)
-                        if np.isfinite(depth_value) and depth_value > 0.0:
-                            disparity = (stereo_calibration.fx() * stereo_calibration.baseline()) / depth_value
-                            stereo_measurement = gtsam.StereoPoint2(
-                                float(observation.keypoint[0]),
-                                float(observation.keypoint[0] - disparity),
-                                float(observation.keypoint[1]),
-                            )
-                            graph.add(
-                                gtsam.GenericStereoFactor3D(
-                                    stereo_measurement,
-                                    stereo_noise,
-                                    X(frame_idx),
-                                    L(landmark_key),
-                                    stereo_calibration,
-                                    rectified_frames[frame_idx].calibration.T_B_from_S0,
-                                )
-                            )
-                            stereo_counts[frame_idx] += 1
-                        else:
-                            graph.add(
-                                gtsam.GenericProjectionFactorCal3_S2(
-                                    gtsam.Point2(float(measurement_vec[0]), float(measurement_vec[1])),
-                                    measurement_noise,
-                                    X(frame_idx),
-                                    L(landmark_key),
-                                    calibration,
-                                    rectified_frames[frame_idx].calibration.T_B_from_S0,
-                                )
-                            )
-                            mono_counts[frame_idx] += 1
-
-                    observations.append((frame_idx, landmark_key, measurement_vec))
-
-        return (
-            landmark_keys,
-            landmark_index_lookup,
-            initial_landmarks,
-            observations,
-            stereo_counts,
-            mono_counts,
-        )
+                    )
+                    self._mono_counts[frame_idx] += 1
+            observed_frames.add(frame_idx)
+            self._observation_matrix.append((frame_idx, landmark_key, measurement_vec))
 
     def _build_camera_cache(
         self,
@@ -667,7 +837,9 @@ class IncrementalBundleAdjuster:
 
     def _collect_track_observations(
         self,
-        track: FeatureTrack,
+        track_id: int,
+        candidate_frames: Sequence[int],
+        candidate_observations: Sequence[TrackObservation],
         frames_for_ba_set: set[int],
         camera_cache: _CachedCameraBatch,
         world_point: np.ndarray,
@@ -677,15 +849,11 @@ class IncrementalBundleAdjuster:
         gating_threshold_sq: float,
     ) -> list[tuple[int, TrackObservation]]:
         observation_frames: list[tuple[int, TrackObservation]] = []
-        track_id = track.track_id
         eligible_frames: list[int] = []
         eligible_observations: list[TrackObservation] = []
         use_inliers = self.config.use_inlier_observations_only
-        for frame_idx in track.observation_frames:
+        for frame_idx, observation in zip(candidate_frames, candidate_observations):
             if frame_idx not in frames_for_ba_set:
-                continue
-            observation = track.observations.get(frame_idx)
-            if observation is None:
                 continue
             if (
                 use_inliers
@@ -737,55 +905,41 @@ class IncrementalBundleAdjuster:
         for idx, keep in enumerate(passing):
             if keep:
                 observation_frames.append((eligible_frames[idx], eligible_observations[idx]))
-        max_observations = self.config.max_observations_per_landmark
-        if max_observations > 0:
-            max_observations = max(max_observations, self.config.min_observations_per_landmark)
-        if max_observations > 0 and len(observation_frames) > max_observations:
-            anchor_idx = None
-            for idx, (frame_idx, _) in enumerate(observation_frames):
-                if frame_idx == anchor_frame:
-                    anchor_idx = idx
-                    break
-            if anchor_idx is None:
-                anchor_idx = 0
-            selected = [observation_frames[anchor_idx]]
-            remaining = max_observations - 1
-            if remaining > 0:
-                indices = [i for i in range(len(observation_frames)) if i != anchor_idx]
-                if remaining >= len(indices):
-                    selected.extend(observation_frames[i] for i in indices)
-                else:
-                    step = len(indices) / remaining
-                    idx_float = 0.0
-                    for _ in range(remaining):
-                        chosen = indices[int(idx_float)]
-                        selected.append(observation_frames[chosen])
-                        idx_float += step
-            observation_frames = selected[:max_observations]
-
         observation_frames.sort(key=lambda item: item[0])
 
         return observation_frames
 
     @staticmethod
-    def _build_inlier_lookup(sequence_results: Sequence[dict[str, Any]]) -> dict[int, set[int]]:
-        lookup: dict[int, set[int]] = {}
-        for result in sequence_results:
-            if result.get("status") != "success":
-                continue
-            frame_idx = result["frame_index"]
-            track_ids = result.get("track_ids")
-            if track_ids is None:
-                continue
-            matches = result["matched_pair"].matches
-            if hasattr(matches, "cpu"):
-                matches = matches.cpu().numpy()
-            if matches.size == 0:
-                continue
-            matched_track_ids = np.asarray(track_ids, dtype=int)
-            valid_ids = matched_track_ids[matches[:, 0]]
-            lookup.setdefault(frame_idx, set()).update(valid_ids.tolist())
-        return lookup
+    def _limit_observation_frames(
+        observation_frames: Sequence[tuple[int, TrackObservation]],
+        anchor_frame: int,
+        max_observations: int,
+    ) -> list[tuple[int, TrackObservation]]:
+        if max_observations <= 0 or len(observation_frames) <= max_observations:
+            return list(observation_frames)
+        anchor_entry: tuple[int, TrackObservation] | None = None
+        remaining_entries: list[tuple[int, TrackObservation]] = []
+        for frame_idx, obs in observation_frames:
+            if frame_idx == anchor_frame and anchor_entry is None:
+                anchor_entry = (frame_idx, obs)
+            else:
+                remaining_entries.append((frame_idx, obs))
+        selected: list[tuple[int, TrackObservation]] = []
+        if anchor_entry is not None:
+            selected.append(anchor_entry)
+        available = max_observations - len(selected)
+        if available <= 0:
+            return selected
+        if available >= len(remaining_entries):
+            selected.extend(remaining_entries[:available])
+            return selected[:max_observations]
+        step = len(remaining_entries) / available
+        idx_float = 0.0
+        for _ in range(available):
+            chosen_idx = int(idx_float)
+            selected.append(remaining_entries[chosen_idx])
+            idx_float += step
+        return selected[:max_observations]
 
     @staticmethod
     def _print_imu_diagnostics(
