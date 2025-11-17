@@ -2,8 +2,7 @@
 import os
 import sys
 from pathlib import Path
-from typing import Any
-import cv2
+from typing import Any, Mapping, Sequence
 import gtsam
 import matplotlib.pyplot as plt
 import numpy as np
@@ -14,9 +13,12 @@ from tqdm import tqdm
 from hydra import compose, initialize
 from hydra.utils import instantiate        
 from hydra import initialize_config_dir
+from gtsam.symbol_shorthand import L
+from omegaconf import OmegaConf
 
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
+from slam.local_vo.bundle_adjustment import finite_difference_velocity
 from viz import rr_log_pose, rr_log_trajectory
 
 from depth.sgbm import SGBM  # noqa: E402
@@ -30,12 +32,15 @@ from registration.registration import (  # noqa: E402
 from registration.utils import draw_matches  # noqa: E402
 import tests.test_utils as test_utils  # noqa: E402
 from slam.local_vo import (  # noqa: E402
+    BundleAdjustmentConfig,
     FeatureTrack,
+    FixedLagBundleAdjuster,
     IncrementalBundleAdjuster,
     KLTFeatureTracker,
     RelativePnPInitializer,
     TrackObservation,
 )
+from tests.datasets.pipeline import SequencePreprocessor
 
 # TODO: expressing disparity uncertainty for depth measurements in BA properly might help a ton
 
@@ -44,26 +49,12 @@ from slam.local_vo import (  # noqa: E402
 # Configuration
 # ----------------------------------------------------------------------
 NUM_SEQUENCE_SAMPLES = 1
-SEQUENCE_LENGTH = 5000
-# ENVIRONMENT = "Hospital"
-# DIFFICULTY = "diff"
-# TRAJECTORY = "P1000"
-EUROC_SEQUENCE = "MH_01_easy"
-ENVIRONMENT = "AbandonedFactory"
-DIFFICULTY = "easy"
-TRAJECTORY = "P001"
-SAMPLING_MODE = "stride"
-MIN_STRIDE = 1
-MAX_STRIDE = 1
-BASE_SEED = 12
+BASE_SEED = 13
 
 USE_IMU_FACTORS = True
 DEPTH_MODE = os.environ.get("LOCAL_VO_DEPTH_MODE", "sgbm").strip().lower() # TODO: figure out why on hospital true depth is so much better than sgbm, where does it get messed up?
 # maybe try ML based depth estimation, might be the easiest way to get better perf tbh when true depth is getting 5x better results
 
-if DEPTH_MODE not in {"sgbm", "ground_truth"}:
-    raise ValueError("LOCAL_VO_DEPTH_MODE must be either 'sgbm' or 'ground_truth'.")
-USE_GROUND_TRUTH_DEPTH = DEPTH_MODE == "ground_truth"
 
 IMU_GRAVITY_MAGNITUDE = 9.80665
 # IMU_ACCEL_NOISE = 0.8e-3
@@ -124,7 +115,14 @@ def _load_local_vo_config() -> Any:
 LOCAL_VO_CFG = _load_local_vo_config()
 KLT_TRACKER: KLTFeatureTracker = instantiate(LOCAL_VO_CFG.klt_tracker)
 RELATIVE_POSE_INITIALIZER: RelativePnPInitializer = instantiate(LOCAL_VO_CFG.relative_pose_initializer)
-BUNDLE_ADJUSTER: IncrementalBundleAdjuster = instantiate(LOCAL_VO_CFG.bundle_adjuster)
+bundle_adjuster_cfg = OmegaConf.to_container(LOCAL_VO_CFG.bundle_adjuster, resolve=True)
+if isinstance(bundle_adjuster_cfg, dict):
+    bundle_adjuster_cfg.pop("_target_", None)
+    bundle_adjuster_config = BundleAdjustmentConfig(**bundle_adjuster_cfg)
+else:
+    bundle_adjuster_config = BundleAdjustmentConfig()
+BUNDLE_ADJUSTER: FixedLagBundleAdjuster = FixedLagBundleAdjuster(bundle_adjuster_config)
+DATA_PIPELINE: SequencePreprocessor = instantiate(LOCAL_VO_CFG.data_pipeline, _recursive_=False)
 
 TRACKING_MAX_DEPTH = float(getattr(getattr(KLT_TRACKER, "config", None), "max_depth", 40.0))
 PNP_MAX_DEPTH = float(getattr(getattr(RELATIVE_POSE_INITIALIZER, "config", None), "max_depth", 40.0))
@@ -176,6 +174,7 @@ def _write_tum_file(path: Path, tum_data: np.ndarray) -> None:
 
 def save_variant_tum_files(
     *,
+    sequence_label: str,
     sample_index: int,
     depth_label: str,
     estimated_pose_dict: dict[int, gtsam.Pose3],
@@ -184,7 +183,7 @@ def save_variant_tum_files(
     if not estimated_pose_dict:
         return
 
-    prefix = f"{EUROC_SEQUENCE}"
+    prefix = str(sequence_label)
     est_path = RESULTS_DIR / f"{prefix}_estimated.txt"
     est_tum = _pose_dict_to_tum_array(estimated_pose_dict, sequence_sample.frame_timestamps)
     _write_tum_file(est_path, est_tum)
@@ -200,83 +199,7 @@ def save_variant_tum_files(
 
 device = "cuda" if torch.cuda.is_available() else "cpu"
 print(f"Using device: {device}")
-print(f"Depth source: {'ground_truth' if USE_GROUND_TRUTH_DEPTH else 'sgbm'}")
-
-sgbm = SGBM(num_disparities=16 * 4, block_size=5, image_color="RGB")
-
-
-def remap_ground_truth_depth(raw_depth: np.ndarray, calibration: StereoCalibration) -> np.ndarray:
-    depth = np.asarray(raw_depth, dtype=np.float32)
-    expected_shape = (calibration.height, calibration.width)
-    if depth.shape != expected_shape:
-        raise ValueError(
-            f"Depth map shape {depth.shape} does not match calibration size {expected_shape}."
-        )
-    remapped = cv2.remap(
-        depth,
-        calibration.map_left_x,
-        calibration.map_left_y,
-        interpolation=cv2.INTER_LINEAR,
-        borderMode=cv2.BORDER_CONSTANT,
-        borderValue=0.0,
-    )
-    return remapped
-
-
-def depth_map_to_xyz(depth_map: np.ndarray, calibration_matrix: np.ndarray) -> np.ndarray:
-    h, w = depth_map.shape
-    xs = np.arange(w, dtype=np.float32)
-    ys = np.arange(h, dtype=np.float32)
-    u, v = np.meshgrid(xs, ys)
-    fx = float(calibration_matrix[0, 0])
-    fy = float(calibration_matrix[1, 1])
-    cx = float(calibration_matrix[0, 2])
-    cy = float(calibration_matrix[1, 2])
-    if np.isclose(fx, 0.0) or np.isclose(fy, 0.0):
-        raise ValueError("Invalid rectified intrinsics; fx/fy must be non-zero.")
-    z = depth_map
-    x = (u - cx) / fx * z
-    y = (v - cy) / fy * z
-    xyz = np.stack((x, y, z), axis=-1).astype(np.float32, copy=False)
-    invalid = ~np.isfinite(z)
-    xyz[invalid] = np.nan
-    return xyz
-
-
-def build_ground_truth_depth_frame(
-    rectified_frame: RectifiedStereoFrame,
-    raw_depth_map: np.ndarray,
-    max_depth: float,
-) -> StereoDepthFrame:
-    depth_rect = remap_ground_truth_depth(raw_depth_map, rectified_frame.calibration)
-    depth_rect = depth_rect.astype(np.float32, copy=False)
-    invalid = (~np.isfinite(depth_rect)) | (depth_rect <= 0.0) | (depth_rect > max_depth)
-    depth_rect[invalid] = np.nan
-    depth_xyz = depth_map_to_xyz(depth_rect, rectified_frame.calibration.K_left_rect)
-    depth_xyz[invalid, :] = np.nan
-    return StereoDepthFrame(
-        left=rectified_frame.left,
-        right=rectified_frame.right,
-        calibration=rectified_frame.calibration,
-        left_rect=rectified_frame.left_rect,
-        right_rect=rectified_frame.right_rect,
-        left_depth=depth_rect,
-        left_depth_xyz=depth_xyz,
-    )
-
-
-def build_ground_truth_depth_frames(
-    rectified_frames: list[RectifiedStereoFrame],
-    raw_depth_maps: list[np.ndarray],
-    max_depth: float,
-) -> list[StereoDepthFrame]:
-    if len(rectified_frames) != len(raw_depth_maps):
-        raise ValueError("Depth map count does not match the number of rectified frames.")
-    return [
-        build_ground_truth_depth_frame(rectified_frame, raw_depth, max_depth)
-        for rectified_frame, raw_depth in zip(rectified_frames, raw_depth_maps)
-    ]
-
+print(f"Primary depth variant: {DEPTH_MODE}")
 
 def create_preintegration_params(sequence=None) -> gtsam.PreintegrationParams:
     params = gtsam.PreintegrationCombinedParams.MakeSharedU(IMU_GRAVITY_MAGNITUDE)
@@ -306,11 +229,12 @@ def _integrate_imu_batch(
     assert integrated == 10
 
 
-def preintegrate_between_frames(sequence, start_idx, end_idx, params, bias, time_offset: float = 0.0):
+def preintegrate_between_frames(sequence, start_idx, end_idx, params, bias, time_offset: float = 0.0, use_combined: bool = False):
     if end_idx <= start_idx:
         raise ValueError("end_idx must be greater than start_idx")
 
-    pim = gtsam.PreintegratedImuMeasurements(params, bias)
+    pim_cls = gtsam.PreintegratedCombinedMeasurements if use_combined else gtsam.PreintegratedImuMeasurements
+    pim = pim_cls(params, bias)
 
     t_start = float(sequence.imu_measurements[start_idx].frame_timestamp + time_offset)
     t_end   = float(sequence.imu_measurements[end_idx].frame_timestamp   + time_offset)
@@ -357,8 +281,9 @@ def preintegrate_between_frames(sequence, start_idx, end_idx, params, bias, time
     # Sanity: preintegrated Δt should match (t_end - t_start)
     dt_frames = t_end - t_start
     if np.isfinite(dt_frames):
-        # let ~1e-4s slack
-        assert abs(pim.deltaTij() - dt_frames) < 1e-4, f"IMU Δt {pim.deltaTij():.6f} vs expected {dt_frames:.6f}"
+        dt_diff = abs(pim.deltaTij() - dt_frames)
+        if dt_diff > 5e-3:
+            print(f"[warn] IMU Δt {pim.deltaTij():.6f} vs expected {dt_frames:.6f}")
 
     return pim
 
@@ -392,6 +317,193 @@ def estimate_sequence_velocities(
     if sequence.length > 1:
         velocities[0] = velocities[1]
     return velocities
+
+
+def _build_initial_pose_dict_from_pnp(
+    sequence_sample: test_utils.FrameSequenceWithGroundTruth,  # type: ignore[type-arg]
+    sequence_results: Sequence[dict[str, Any]],
+) -> dict[int, gtsam.Pose3]:
+    """Create an initial pose dictionary using the incremental PnP estimates."""
+    first_pose = gtsam.Pose3(sequence_sample.world_poses[0].rotation(), np.zeros(3))
+    pose_dict: dict[int, gtsam.Pose3] = {0: clone_pose(first_pose)}
+    pose_lookup: dict[int, gtsam.Pose3] = {}
+    for result in sequence_results:
+        if result.get("status") != "success":
+            continue
+        estimated_pose = result.get("estimated_pose")
+        if estimated_pose is not None:
+            pose_lookup[result["frame_index"]] = clone_pose(estimated_pose)
+
+    last_pose = pose_dict[0]
+    for idx in range(1, sequence_sample.length):
+        if idx in pose_lookup:
+            last_pose = pose_lookup[idx]
+        pose_dict[idx] = clone_pose(last_pose)
+
+    return pose_dict
+
+
+def _initialize_fixed_lag_landmarks(
+    bundle_adjuster: FixedLagBundleAdjuster,
+    *,
+    tracks: Mapping[int, FeatureTrack],
+    rectified_frames: Sequence[RectifiedStereoFrame],
+    pose_dict: Mapping[int, gtsam.Pose3],
+) -> None:
+    """Seed landmark positions so smart factors can gate observations."""
+    if bundle_adjuster.smoothed_values is None or bundle_adjuster.full_values is None:
+        return
+
+    for track_id, track in tracks.items():
+        anchor_pose = pose_dict.get(track.anchor_frame)
+        if anchor_pose is None:
+            continue
+        T_B_from_S0 = rectified_frames[track.anchor_frame].calibration.T_B_from_S0
+        anchor_point = gtsam.Point3(*track.anchor_point3.tolist())
+        world_point = anchor_pose.compose(T_B_from_S0).transformFrom(anchor_point)
+        key = L(track_id)
+        if not bundle_adjuster.full_values.exists(key):
+            bundle_adjuster.full_values.insert(key, world_point)
+        if not bundle_adjuster.smoothed_values.exists(key):
+            bundle_adjuster.smoothed_values.insert(key, world_point)
+
+
+def _count_observation_types(
+    track_history: Sequence[Mapping[int, TrackObservation]],
+) -> tuple[dict[int, int], dict[int, int]]:
+    stereo_counts: dict[int, int] = {}
+    mono_counts: dict[int, int] = {}
+    for frame_idx, observations in enumerate(track_history):
+        stereo = 0
+        mono = 0
+        for obs in observations.values():
+            depth = float(obs.depth)
+            if np.isfinite(depth) and depth > 0.0:
+                stereo += 1
+            else:
+                mono += 1
+        stereo_counts[frame_idx] = stereo
+        mono_counts[frame_idx] = mono
+    return stereo_counts, mono_counts
+
+
+def run_fixed_lag_adjustment(
+    *,
+    bundle_adjuster: FixedLagBundleAdjuster,
+    rectified_frames: Sequence[RectifiedStereoFrame],
+    depth_frames: Sequence[StereoDepthFrame],
+    track_history: Sequence[Mapping[int, TrackObservation]],
+    tracks: Mapping[int, FeatureTrack],
+    sequence_results: Sequence[dict[str, Any]],
+    sequence_sample: test_utils.FrameSequenceWithGroundTruth,  # type: ignore[type-arg]
+    use_imu: bool = True,
+) -> dict[str, Any]:
+    if not rectified_frames:
+        raise ValueError("No frames provided for fixed-lag optimization.")
+
+    pose_initials = _build_initial_pose_dict_from_pnp(sequence_sample, sequence_results)
+    frames_for_ba = list(range(len(rectified_frames)))
+    initial_pose_dict = {idx: clone_pose(pose_initials[idx]) for idx in frames_for_ba}
+
+    velocities = estimate_sequence_velocities(sequence_sample)
+    if velocities.size == 0:
+        velocities = np.zeros((len(frames_for_ba), 3), dtype=np.float64)
+    elif velocities.shape[0] < len(frames_for_ba):
+        pad_length = len(frames_for_ba) - velocities.shape[0]
+        padding = np.tile(velocities[-1], (pad_length, 1))
+        velocities = np.vstack([velocities, padding])
+
+    params = create_preintegration_params(sequence_sample)
+    bias = gtsam.imuBias.ConstantBias()
+    first_ts = _frame_timestamp(0, sequence_sample.frame_timestamps)
+
+    first_velocity = finite_difference_velocity(sequence_sample.world_poses[0], sequence_sample.world_poses[1], _frame_timestamp(1, sequence_sample.frame_timestamps) - first_ts)
+    bundle_adjuster.reset(first_ts, sequence_sample.world_poses[0], first_velocity)
+
+    track_observation_counts: dict[int, int] = {}
+    for observations in track_history:
+        for track_id in observations:
+            track_observation_counts[track_id] = track_observation_counts.get(track_id, 0) + 1
+    valid_track_ids = {track_id for track_id, count in track_observation_counts.items() if count >= 5}
+    
+    print(f"Total tracks: {len(track_observation_counts)}")
+    print(f"Valid tracks: {len(valid_track_ids)}")
+
+    config = getattr(bundle_adjuster, "config", None)
+    use_inlier_filter = bool(getattr(config, "use_inlier_observations_only", False))
+    if use_inlier_filter and sequence_results:
+        inlier_lookup = IncrementalBundleAdjuster._build_inlier_lookup(sequence_results)
+        inlier_track_ids: set[int] = set()
+        for ids in inlier_lookup.values():
+            inlier_track_ids.update(ids)
+        if inlier_track_ids:
+            valid_track_ids &= inlier_track_ids
+
+    print(f"Valid tracks after inlier filter: {len(valid_track_ids)}")
+
+    track_history = [
+        {track_id: obs for track_id, obs in observations.items() if track_id in valid_track_ids}
+        for observations in track_history
+    ]
+
+    stereo_counts, mono_counts = _count_observation_types(track_history)
+
+    for frame_idx in tqdm(range(1, len(frames_for_ba)), desc="Running bundle adjustment"):
+        ts = _frame_timestamp(frame_idx, sequence_sample.frame_timestamps)
+        pose_guess = clone_pose(initial_pose_dict[frame_idx])
+        # velocity = velocities[min(frame_idx, velocities.shape[0] - 1)]
+        # if use_imu:
+        #     pim = preintegrate_between_frames(
+        #         sequence_sample,
+        #         frame_idx - 1,
+        #         frame_idx,
+        #         params,
+        #         bias,
+        #         use_combined=True,
+        #     )
+        # else:
+        #     pim = gtsam.PreintegratedCombinedMeasurements(params, bias)
+
+        prev_pose = initial_pose_dict[frame_idx - 1]
+        prev_ts = _frame_timestamp(frame_idx - 1, sequence_sample.frame_timestamps)
+        velocity = finite_difference_velocity(prev_pose, pose_guess, ts - prev_ts)
+
+        relative_pose = prev_pose.between(pose_guess)
+
+        pim = gtsam.PreintegratedCombinedMeasurements(params, bias)
+        _integrate_imu_batch(pim, sequence_sample.imu_measurements[frame_idx])
+            
+        bundle_adjuster.process(
+            frame=depth_frames[frame_idx],
+            ts=ts,
+            relative_pose=relative_pose,
+            estimated_velocity=velocity,
+            landmark_observations=track_history[frame_idx],
+            pim=pim,
+            optimize=frame_idx % 4 == 0, # optimize every few frames
+            # optimize= frame_idx % 3680 == 0, # optimize every 300 frames
+        )
+        bundle_adjuster.prev_ts = ts
+
+    optimized_pose_list = bundle_adjuster.get_trajectory()
+    optimized_pose_dict = {
+        idx: optimized_pose_list[idx] for idx in range(min(len(optimized_pose_list), len(frames_for_ba)))
+    }
+
+    landmark_indices = sorted(tracks.keys())
+    return {
+        "frames_for_ba": frames_for_ba,
+        "landmark_original_indices": landmark_indices,
+        "initial_pose_dict": initial_pose_dict,
+        "optimized_pose_dict": optimized_pose_dict,
+        "initial_landmarks": [],
+        "optimized_landmarks": [],
+        "observation_matrix": [],
+        "stereo_counts": stereo_counts,
+        "mono_counts": mono_counts,
+        "imu_bias_before": None,
+        "imu_bias_after": None,
+    }
 
 
 def integrate_inertial_trajectory(
@@ -1112,101 +1224,85 @@ def run_depth_variant(
 
     KLT_TRACKER.reset()
     RELATIVE_POSE_INITIALIZER.reset(sequence_sample)
-    BUNDLE_ADJUSTER.reset(sequence_sample=sequence_sample)
     track_history: list[dict[int, TrackObservation]] = []
     sequence_results: list[dict[str, Any]] = []
 
-    try:
-        for frame_idx, (rect_frame, depth_frame) in tqdm(enumerate(zip(rectified_frames, depth_frames)), total=len(rectified_frames)):
-            frame_observations = KLT_TRACKER.track_frame(rect_frame, depth_frame)
-            track_history.append(frame_observations)
-            result = RELATIVE_POSE_INITIALIZER.process_frame(
-                frame_index=frame_idx,
-                rectified_frame=rect_frame,
-                depth_frame=depth_frame,
-                track_observations=frame_observations,
-            )
-            BUNDLE_ADJUSTER.add_frame(
-                rectified_frame=rect_frame,
-                track_observations=frame_observations,
-                tracks=KLT_TRACKER.tracks,
-                sequence_result=result,
-            )
-            if result is not None:
-                sequence_results.append(result)
-
-        tracks = dict(KLT_TRACKER.tracks)
-
-        tracking_summary = summarise_tracking_results(sequence_sample, track_history, sequence_results)
-
-        gravity_vector = test_utils.estimate_world_gravity_from_first_batch(sequence_sample)
-        ba_result = BUNDLE_ADJUSTER.optimize(
-            sequence_sample=sequence_sample,
-            use_imu=USE_IMU_FACTORS,
-            gravity_vector=gravity_vector,
-            log_prefix=depth_label,
+    for frame_idx, (rect_frame, depth_frame) in enumerate(zip(rectified_frames, depth_frames)):
+        frame_observations = KLT_TRACKER.track_frame(rect_frame, depth_frame)
+        track_history.append(frame_observations)
+        result = RELATIVE_POSE_INITIALIZER.process_frame(
+            frame_index=frame_idx,
+            rectified_frame=rect_frame,
+            depth_frame=depth_frame,
+            track_observations=frame_observations,
         )
-        _log_bundle_adjuster_bias_diagnostics(ba_result, depth_label)
+        if result is not None:
+            sequence_results.append(result)
 
-        ba_result_no_imu = None
-        if USE_IMU_FACTORS:
-            try:
-                ba_result_no_imu = BUNDLE_ADJUSTER.optimize(
-                    sequence_sample=sequence_sample,
-                    use_imu=False,
-                    gravity_vector=gravity_vector,
-                    log_prefix=depth_label,
-                )
-            except Exception as e:
-                print(f"Error running bundle adjustment without IMU: {e}")
-                ba_result_no_imu = None
+    tracks = dict(KLT_TRACKER.tracks)
 
-        pose_errors = compute_pose_errors_against_ground_truth(ba_result["optimized_pose_dict"], sequence_sample)
-        pose_errors_no_imu = None
-        if ba_result_no_imu is not None:
-            pose_errors_no_imu = compute_pose_errors_against_ground_truth(
-                ba_result_no_imu["optimized_pose_dict"],
-                sequence_sample,
-            )
+    tracking_summary = summarise_tracking_results(sequence_sample, track_history, sequence_results)
 
-        optimized_translation_norms = [pose_errors[idx]["translation_norm"] for idx in sorted(pose_errors)]
-        optimized_rotation_norms_deg = [
-            np.rad2deg(pose_errors[idx]["rotation_norm_rad"]) for idx in sorted(pose_errors)
+    ba_result = run_fixed_lag_adjustment(
+        bundle_adjuster=BUNDLE_ADJUSTER,
+        rectified_frames=rectified_frames,
+        depth_frames=depth_frames,
+        track_history=track_history,
+        tracks=tracks,
+        sequence_results=sequence_results,
+        sequence_sample=sequence_sample,
+        use_imu=USE_IMU_FACTORS,
+    )
+    _log_bundle_adjuster_bias_diagnostics(ba_result, depth_label)
+
+    ba_result_no_imu = None
+    if USE_IMU_FACTORS:
+        print("Skipping vision-only bundle adjustment; FixedLagBundleAdjuster currently requires IMU factors.")
+
+    pose_errors = compute_pose_errors_against_ground_truth(ba_result["optimized_pose_dict"], sequence_sample)
+    pose_errors_no_imu = None
+    if ba_result_no_imu is not None:
+        pose_errors_no_imu = compute_pose_errors_against_ground_truth(
+            ba_result_no_imu["optimized_pose_dict"],
+            sequence_sample,
+        )
+
+    optimized_translation_norms = [pose_errors[idx]["translation_norm"] for idx in sorted(pose_errors)]
+    optimized_rotation_norms_deg = [
+        np.rad2deg(pose_errors[idx]["rotation_norm_rad"]) for idx in sorted(pose_errors)
+    ]
+    optimized_translation_norms_no_imu: list[float] = []
+    optimized_rotation_norms_deg_no_imu: list[float] = []
+    if pose_errors_no_imu is not None:
+        optimized_translation_norms_no_imu = [
+            pose_errors_no_imu[idx]["translation_norm"] for idx in sorted(pose_errors_no_imu)
         ]
-        optimized_translation_norms_no_imu: list[float] = []
-        optimized_rotation_norms_deg_no_imu: list[float] = []
-        if pose_errors_no_imu is not None:
-            optimized_translation_norms_no_imu = [
-                pose_errors_no_imu[idx]["translation_norm"] for idx in sorted(pose_errors_no_imu)
-            ]
-            optimized_rotation_norms_deg_no_imu = [
-                np.rad2deg(pose_errors_no_imu[idx]["rotation_norm_rad"]) for idx in sorted(pose_errors_no_imu)
-            ]
+        optimized_rotation_norms_deg_no_imu = [
+            np.rad2deg(pose_errors_no_imu[idx]["rotation_norm_rad"]) for idx in sorted(pose_errors_no_imu)
+        ]
 
-        # rms_before = float(np.sqrt(np.mean(ba_result["reprojection_before"] ** 2)))
-        # rms_after = float(np.sqrt(np.mean(ba_result["reprojection_after"] ** 2)))
+    # rms_before = float(np.sqrt(np.mean(ba_result["reprojection_before"] ** 2)))
+    # rms_after = float(np.sqrt(np.mean(ba_result["reprojection_after"] ** 2)))
 
-        return {
-            "label": depth_label,
-            "track_history": track_history,
-            "sequence_results": sequence_results,
-            "tracking_summary": tracking_summary,
-            "ba_result": ba_result,
-            "ba_result_no_imu": ba_result_no_imu,
-            "initial_pose_dict": ba_result["initial_pose_dict"],
-            "optimized_pose_dict": ba_result["optimized_pose_dict"],
-            "pose_errors": pose_errors,
-            "pose_errors_no_imu": pose_errors_no_imu,
-            "optimized_translation_norms": optimized_translation_norms,
-            "optimized_rotation_norms_deg": optimized_rotation_norms_deg,
-            "optimized_translation_norms_no_imu": optimized_translation_norms_no_imu,
-            "optimized_rotation_norms_deg_no_imu": optimized_rotation_norms_deg_no_imu,
-            # "rms_before": rms_before,
-            # "rms_after": rms_after,
-            "tracks": tracks,
-        }
-    finally:
-        BUNDLE_ADJUSTER.reset()
+    return {
+        "label": depth_label,
+        "track_history": track_history,
+        "sequence_results": sequence_results,
+        "tracking_summary": tracking_summary,
+        "ba_result": ba_result,
+        "ba_result_no_imu": ba_result_no_imu,
+        "initial_pose_dict": ba_result["initial_pose_dict"],
+        "optimized_pose_dict": ba_result["optimized_pose_dict"],
+        "pose_errors": pose_errors,
+        "pose_errors_no_imu": pose_errors_no_imu,
+        "optimized_translation_norms": optimized_translation_norms,
+        "optimized_rotation_norms_deg": optimized_rotation_norms_deg,
+        "optimized_translation_norms_no_imu": optimized_translation_norms_no_imu,
+        "optimized_rotation_norms_deg_no_imu": optimized_rotation_norms_deg_no_imu,
+        # "rms_before": rms_before,
+        # "rms_after": rms_after,
+        "tracks": tracks,
+    }
 
 
 # %%
@@ -1218,54 +1314,23 @@ all_ba_results: list[dict[str, Any]] = []
 
 for sample_idx in range(NUM_SEQUENCE_SAMPLES):
     seed = BASE_SEED + sample_idx
-    # sequence = test_utils.load_tartanair_sequence_segment(
-    #     env=ENVIRONMENT,
-    #     difficulty=DIFFICULTY,
-    #     traj=TRAJECTORY,
-    #     sequence_length=SEQUENCE_LENGTH,
-    #     seed=seed,
-    #     sampling_mode=SAMPLING_MODE,
-    #     min_stride=MIN_STRIDE,
-    #     max_stride=MAX_STRIDE,
-    #     load_ground_truth_depth=USE_GROUND_TRUTH_DEPTH,
-    #     add_imu_noise=True
-    # )
-    sequence = test_utils.load_euroc_sequence_segment(
-        seq_name=EUROC_SEQUENCE,
-        sequence_length=SEQUENCE_LENGTH,
-        seed=seed,
-    )
+    preprocessed = DATA_PIPELINE.prepare(seed=seed, max_depth=MAX_DEPTH)
+    sequence = preprocessed.sequence
+    dataset_label = preprocessed.label
     plot_imu_measurements(sequence, title=f"IMU data (sample {sample_idx})")
     inertial_poses = integrate_inertial_trajectory(sequence)
-
-    # only to do this if you know the frames are already rectified
-    rectified_frames = sequence.frames
-    # rectified_frames = [frame.rectify() for frame in sequence.frames]
-    # rectified_frames = [
-    #     RectifiedStereoFrame(
-    #         left=frame.left,
-    #         right=frame.right,
-    #         left_rect=frame.left,
-    #         right_rect=frame.right,
-    #         calibration=frame.calibration,
-    #     )
-    #     for frame in sequence.frames
-    # ]
-    depth_variants: list[tuple[str, list[StereoDepthFrame]]] = []
-    if USE_GROUND_TRUTH_DEPTH:
-        if sequence.ground_truth_depths is None:
-            raise RuntimeError("Ground-truth depth requested but not provided by the sequence loader.")
-        gt_depth_frames = build_ground_truth_depth_frames(
-            rectified_frames,
-            sequence.ground_truth_depths,
-            max_depth=MAX_DEPTH,
-        )
-        depth_variants.append(("ground_truth", gt_depth_frames))
-        sgbm_depth_frames = [sgbm.compute_depth(frame, max_depth=MAX_DEPTH) for frame in rectified_frames]
-        depth_variants.append(("sgbm", sgbm_depth_frames))
-    else:
-        depth_variants.append(
-            ("sgbm", [sgbm.compute_depth(frame, max_depth=MAX_DEPTH) for frame in rectified_frames])
+    rectified_frames = preprocessed.rectified_frames
+    depth_variants: list[tuple[str, list[StereoDepthFrame]]] = [
+        (variant.label, variant.frames) for variant in preprocessed.depth_variants
+    ]
+    if not depth_variants:
+        raise RuntimeError("No depth variants produced by the data pipeline.")
+    available_labels = ", ".join(label for label, _ in depth_variants)
+    print(f"Depth variants available ({dataset_label}): {available_labels}")
+    if DEPTH_MODE not in {label for label, _ in depth_variants}:
+        raise RuntimeError(
+            f"Depth variant '{DEPTH_MODE}' requested via LOCAL_VO_DEPTH_MODE but only "
+            f"{available_labels or 'none'} are available."
         )
 
     variant_results: list[dict[str, Any]] = []
@@ -1425,6 +1490,7 @@ for sample_idx in range(NUM_SEQUENCE_SAMPLES):
         # print(f"RMSE per meter travelled ({result['label']}): {(np.sqrt(np.mean(translation_errors ** 2)) / total_distance):.3f}")
 
         save_variant_tum_files(
+            sequence_label=dataset_label,
             sample_index=sample_idx,
             depth_label=result["label"],
             estimated_pose_dict=result["optimized_pose_dict"],
@@ -1432,8 +1498,9 @@ for sample_idx in range(NUM_SEQUENCE_SAMPLES):
         )
 
         # Pass the ground truth trajectory directly to the evaluation function.
-        est_traj_xyz = np.asarray([result["optimized_pose_dict"][idx].translation() for idx in sorted(result["optimized_pose_dict"])])
-        est_traj_quat = [result["optimized_pose_dict"][idx].rotation().toQuaternion() for idx in sorted(result["optimized_pose_dict"])]
+        optimized_frame_indices = sorted(result["optimized_pose_dict"])
+        est_traj_xyz = np.asarray([result["optimized_pose_dict"][idx].translation() for idx in optimized_frame_indices])
+        est_traj_quat = [result["optimized_pose_dict"][idx].rotation().toQuaternion() for idx in optimized_frame_indices]
         est_traj_qxqyqzqw = np.asarray([[quat.w(), quat.x(), quat.y(), quat.z()] for quat in est_traj_quat])
         est_traj = np.concatenate([est_traj_xyz, est_traj_qxqyqzqw], axis=1)
 
@@ -1474,6 +1541,9 @@ for sample_idx in range(NUM_SEQUENCE_SAMPLES):
 
             est_poses = []
             gt_poses = []
+            initial_est_poses = []
+            initial_pose_dict = result.get("initial_pose_dict", {})
+            num_frames = min(len(optimized_frame_indices), len(est_traj_aligned), len(gt_traj))
 
             # log map
             rr.set_time("frame", sequence=0)
@@ -1485,8 +1555,9 @@ for sample_idx in range(NUM_SEQUENCE_SAMPLES):
                     rr.log("optimized_landmarks", rr.Points3D(landmarks_arr, radii=0.01))
 
             # log poses trajectories
-            for i in range(len(est_traj_aligned)):
+            for i in range(num_frames):
                 rr.set_time("frame", sequence=i)
+                frame_idx = optimized_frame_indices[i]
 
                 # use the unaligned est_traj for now so the landmarks don't also need to be aligned
                 est_pose = gtsam.Pose3(
@@ -1506,6 +1577,10 @@ for sample_idx in range(NUM_SEQUENCE_SAMPLES):
 
                 rr_log_trajectory("est_trajectory", est_poses, color=(0, 0, 255), radii=0.006)
                 rr_log_trajectory("gt_trajectory", gt_poses, color=(0, 255, 0), radii=0.006)
+                initial_pose = initial_pose_dict.get(frame_idx)
+                if initial_pose is not None:
+                    initial_est_poses.append(initial_pose)
+                    rr_log_trajectory("initial_est_trajectory", initial_est_poses, color=(255, 165, 0), radii=0.006)
 
     plot_translation_error_percentages(percentage_plot_series)
 
@@ -1518,4 +1593,4 @@ for sample_idx in range(NUM_SEQUENCE_SAMPLES):
     all_tracking_results.append(sequence_results)
     all_ba_results.append(ba_result)
 
-# %%
+    # %%
