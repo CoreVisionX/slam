@@ -983,6 +983,11 @@ class FixedLagBundleAdjuster:
         self.new_values = None
         self.new_timestamps = None
 
+        # Maps original track_id -> current active gtsam_key_index
+        # e.g. { 105: 105, 200: 9000200 }
+        self.landmark_key_map = None
+        self.next_replacement_id = None # Start high to avoid collision with raw track IDs
+
     def reset(self, ts: float, pose: gtsam.Pose3, velocity: np.ndarray) -> None:
         """Reset the smoother to the initial pose."""
 
@@ -996,6 +1001,9 @@ class FixedLagBundleAdjuster:
         self.full_values = gtsam.Values()
         self.landmark_observations = {}
         # self.pending_landmarks = {}
+
+        self.landmark_key_map = {}
+        self.next_replacement_id = 1000000
 
         # set the frame index to 0
         self.frame_idx = 0
@@ -1028,7 +1036,6 @@ class FixedLagBundleAdjuster:
 
         self.prev_ts = ts
 
-    # TODO: support not optimizing every single frame?
     def process(self, frame: StereoDepthFrame, ts: float, relative_pose: gtsam.Pose3, estimated_velocity: np.ndarray, landmark_observations: Mapping[int, TrackObservation], pim: gtsam.PreintegratedCombinedMeasurements, optimize: bool = True, profile: bool = False) -> None:
         """
         Processes a new frame.
@@ -1089,17 +1096,17 @@ class FixedLagBundleAdjuster:
                 )
             )
 
-        # add a very light relative pose factor between the previous frame and the current frame to avoid the system becoming underconstrained
-        with profiler.section("add_light_relative_pose_factor"):
-            relative_noise = gtsam.noiseModel.Diagonal.Sigmas(np.array(self.config.light_relative_pose_sigmas, dtype=float))
-            self.new_factors.add(
-                gtsam.BetweenFactorPose3(
-                    X(prev_frame_idx),
-                    X(self.frame_idx),
-                    relative_pose,
-                    relative_noise
-                )
-            )
+        # # add a very light relative pose factor between the previous frame and the current frame to avoid the system becoming underconstrained
+        # with profiler.section("add_light_relative_pose_factor"):
+        #     relative_noise = gtsam.noiseModel.Diagonal.Sigmas(np.array(self.config.light_relative_pose_sigmas, dtype=float))
+        #     self.new_factors.add(
+        #         gtsam.BetweenFactorPose3(
+        #             X(prev_frame_idx),
+        #             X(self.frame_idx),
+        #             relative_pose,
+        #             relative_noise
+        #         )
+        #     )
 
         # process landmark observations
         with profiler.section("process_landmark_observations"):
@@ -1151,10 +1158,20 @@ class FixedLagBundleAdjuster:
             # TODO: factor out the landmark observation processing into a helper, this is getting a little long
             added_features = 0
             invalid_depth_features = 0
+            old_features = 0
             invalid_reprojection_features = 0
             exceeded_max_observations_per_landmark_features = 0
+            invalid_observation_distance_features = 0
+            invalid_landmark_distance_features = 0
 
             for track_id, observation in landmark_observations.items():
+                # 1. RESOLVE KEY
+                # If we haven't seen this track before, map it 1:1
+                original_track_id = track_id
+                if track_id not in self.landmark_key_map:
+                    self.landmark_key_map[track_id] = track_id
+                track_id = self.landmark_key_map[track_id]
+                
                 if track_id in self.landmark_observations and self.landmark_observations[track_id] >= self.config.max_observations_per_landmark:
                     exceeded_max_observations_per_landmark_features += 1
                     continue
@@ -1171,6 +1188,26 @@ class FixedLagBundleAdjuster:
                 else:
                     point = self.full_values.atPoint3(L(track_id))
 
+                    # TODO: respawn with new observations instead of skipping? Or maybe these are outlier points/observations we shouldn't keep
+
+                    # TODO: measure from the camera?
+                    # check that this landmark is not too far away
+                    if np.linalg.norm(point) > 30.0:
+                        invalid_landmark_distance_features += 1
+                        continue
+
+                    # check if the landmark projects to the current camera pose without issues
+                    projected, valid = cam.projectSafe(point)
+                    if not valid:
+                        invalid_reprojection_features += 1
+                        continue
+
+                    # check that this observation is not too far from the optimized point
+                    obs_point = cam.backproject(observation.keypoint, observation.depth)
+                    if np.linalg.norm(obs_point - point) > 0.1:
+                        invalid_observation_distance_features += 1
+                        continue
+
                 # # don't accept observations that don't pass the reprojection gating threshold
                 # projected, valid = cam.projectSafe(point)
                 # if not valid or np.linalg.norm(projected - observation.keypoint) > self.config.reprojection_gating_threshold_px:
@@ -1183,7 +1220,8 @@ class FixedLagBundleAdjuster:
                 self.landmark_observations[track_id] += 1
 
                 # add a factor projecting the landmark into the current frame
-                valid_depth = observation.depth is not None and observation.depth > self.config.min_depth and np.isfinite(observation.depth)
+                # valid_depth = observation.depth is not None and observation.depth > self.config.min_depth and np.isfinite(observation.depth)
+                valid_depth = observation.depth is not None and np.isfinite(observation.depth)
                 if valid_depth:
                     disparity = (stereo_calib.fx() * stereo_calib.baseline()) / observation.depth
                     stereo_measurement = gtsam.StereoPoint2(
@@ -1196,6 +1234,13 @@ class FixedLagBundleAdjuster:
                 else:
                     invalid_depth_features += 1
                     continue # these could cause the system to become underdetermined
+                
+                    # maybe try adding a mono factor if there's already a stereo factor for it?
+
+                    # # only add a mono factor if it's already in the graph because a single projection factor won't constrain the landmark properly
+                    # if not self.full_values.exists(L(track_id)):
+                    #     continue
+
                     # mono_measurement = gtsam.Point2(float(observation.keypoint[0]), float(observation.keypoint[1]))
                     # obs_factor = gtsam.GenericProjectionFactorCal3_S2(mono_measurement, mono_noise, X(self.frame_idx), L(track_id), calib, body_P_sensor)
 
@@ -1207,11 +1252,40 @@ class FixedLagBundleAdjuster:
 
                 # if the landmark exists in the full values, but not in the smoothed values or new values, recreate the landmark since it's been marginalized out
                 elif self.full_values.exists(L(track_id)) and not self.smoothed_values.exists(L(track_id)) and not self.new_values.exists(L(track_id)):
+                    # # bringing back old landmarks like this could be the issue?
+                    # self.new_values.insert(L(track_id), point)
+                    # self.full_values.insert_or_assign(L(track_id), point)
+                    # self.new_timestamps[L(track_id)] = ts
+
+                    # old_features += 1
+                    # continue
+
+
+                    # with this could I use incrementalfixlagsmoother now?
+
+                    # we can't respawn the landmark with a single mono factor, we need to add a stereo factor to properly constrain the landmark
+                    if not valid_depth:
+                        continue
+
+                    # respawn the landmark
+                    self.next_replacement_id += 1
+                    self.landmark_key_map[original_track_id] = self.next_replacement_id
+                    track_id = self.next_replacement_id
+
+                    # regenerate the observation factor
+                    obs_factor = gtsam.GenericStereoFactor3D(stereo_measurement, stereo_noise, X(self.frame_idx), L(track_id), stereo_calib, body_P_sensor)
+                                        
+                    # insert the new landmark value and add the observation factor
                     self.new_values.insert(L(track_id), point)
                     self.new_timestamps[L(track_id)] = ts
+                    self.new_factors.add(obs_factor)
+                    self.full_values.insert(L(track_id), point)
 
-                    # # could not bringing back all these long running tracks be the issue?
-                    # continue
+                    added_features += 1
+                    old_features += 1
+
+                    continue
+
 
                 # add the factor
                 self.new_factors.add(obs_factor)
@@ -1268,7 +1342,9 @@ class FixedLagBundleAdjuster:
             print(f"Invalid depth features: {invalid_depth_features}")
             print(f"Invalid reprojection features: {invalid_reprojection_features}")
             print(f"Exceeded max observations per landmark features: {exceeded_max_observations_per_landmark_features}")
-
+            print(f"Invalid observation distance features: {invalid_observation_distance_features}")
+            print(f"Invalid landmark distance features: {invalid_landmark_distance_features}")
+            print(f"Old features: {old_features}")
         if optimize:
             with profiler.section("update_smoother"):
                 self.optimize()

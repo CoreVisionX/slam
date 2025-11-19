@@ -420,31 +420,31 @@ def run_fixed_lag_adjustment(
     first_velocity = finite_difference_velocity(sequence_sample.world_poses[0], sequence_sample.world_poses[1], _frame_timestamp(1, sequence_sample.frame_timestamps) - first_ts)
     bundle_adjuster.reset(first_ts, sequence_sample.world_poses[0], first_velocity)
 
-    track_observation_counts: dict[int, int] = {}
-    for observations in track_history:
-        for track_id in observations:
-            track_observation_counts[track_id] = track_observation_counts.get(track_id, 0) + 1
-    valid_track_ids = {track_id for track_id, count in track_observation_counts.items() if count >= 5}
+    # track_observation_counts: dict[int, int] = {}
+    # for observations in track_history:
+    #     for track_id in observations:
+    #         track_observation_counts[track_id] = track_observation_counts.get(track_id, 0) + 1
+    # valid_track_ids = {track_id for track_id, count in track_observation_counts.items() if count >= 5}
     
-    print(f"Total tracks: {len(track_observation_counts)}")
-    print(f"Valid tracks: {len(valid_track_ids)}")
+    # print(f"Total tracks: {len(track_observation_counts)}")
+    # print(f"Valid tracks: {len(valid_track_ids)}")
 
-    config = getattr(bundle_adjuster, "config", None)
-    use_inlier_filter = bool(getattr(config, "use_inlier_observations_only", False))
-    if use_inlier_filter and sequence_results:
-        inlier_lookup = IncrementalBundleAdjuster._build_inlier_lookup(sequence_results)
-        inlier_track_ids: set[int] = set()
-        for ids in inlier_lookup.values():
-            inlier_track_ids.update(ids)
-        if inlier_track_ids:
-            valid_track_ids &= inlier_track_ids
+    # config = getattr(bundle_adjuster, "config", None)
+    # use_inlier_filter = bool(getattr(config, "use_inlier_observations_only", False))
+    # if use_inlier_filter and sequence_results:
+    #     inlier_lookup = IncrementalBundleAdjuster._build_inlier_lookup(sequence_results)
+    #     inlier_track_ids: set[int] = set()
+    #     for ids in inlier_lookup.values():
+    #         inlier_track_ids.update(ids)
+    #     if inlier_track_ids:
+    #         valid_track_ids &= inlier_track_ids
 
-    print(f"Valid tracks after inlier filter: {len(valid_track_ids)}")
+    # print(f"Valid tracks after inlier filter: {len(valid_track_ids)}")
 
-    track_history = [
-        {track_id: obs for track_id, obs in observations.items() if track_id in valid_track_ids}
-        for observations in track_history
-    ]
+    # track_history = [
+    #     {track_id: obs for track_id, obs in observations.items() if track_id in valid_track_ids}
+    #     for observations in track_history
+    # ]
 
     stereo_counts, mono_counts = _count_observation_types(track_history)
 
