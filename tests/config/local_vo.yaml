@@ -1,0 +1,78 @@
+klt_tracker:
+  _target_: slam.local_vo.klt_tracker.KLTFeatureTracker
+  max_feature_count: 512
+  refill_feature_ratio: 0.9
+  feature_suppression_radius: 8.0
+  fast_threshold: 25
+  fast_nonmax: true
+  fast_border: 12
+  lk_win_size: [15, 15]
+  lk_max_level: 5
+  lk_max_iterations: 40
+  lk_epsilon: 0.01
+  lk_min_eig_threshold: 0.001
+  max_depth: 40.0
+
+relative_pose_initializer:
+  _target_: slam.local_vo.relative_pose.RelativePnPInitializer
+  min_matches_for_pnp: 6
+  max_depth: 40.0
+
+bundle_adjuster:
+  _target_: slam.local_vo.bundle_adjustment.IncrementalBundleAdjuster
+  min_observations_per_landmark: 1
+  min_observations_per_frame: 5
+  projection_noise_px: 1.0
+  disparity_noise_px: 1.0
+  use_huber_loss: true # try cauchy?
+  reprojection_gating_threshold_px: 4.0
+  use_inlier_observations_only: false
+  pose_prior_sigmas:
+    [
+      1.7453292519943296e-05,
+      1.7453292519943296e-05,
+      1.7453292519943296e-05,
+      0.0001,
+      0.0001,
+      0.0001,
+    ]
+  imu_gravity_magnitude: 9.80665
+  imu_accel_noise: 0.002
+  imu_gyro_noise: 0.00017
+  imu_integration_noise: 0.0005
+  imu_velocity_prior_sigma: 10.0
+  imu_bias_prior_sigmas:
+    [0.003, 0.003, 0.003, 1.9393e-05, 1.9393e-05, 1.9393e-05]
+  imu_bias_prior_for_factors: [0.01, 0.01, 0.01, 0.001, 0.001, 0.001]
+  max_landmarks: 10000000000
+  max_observations_per_landmark: 100000000
+  use_motion_only_smart_factors: false
+  light_relative_pose_sigmas: [3.0, 3.0, 3.0, 3.0, 3.0, 3.0]
+  min_depth: 0.0
+  lag: 2.0
+
+data_pipeline:
+  _target_: tests.datasets.pipeline.SequencePreprocessor
+  stages:
+    - _target_: tests.datasets.pipeline.LoadSequenceStage
+      loader:
+        _target_: tests.datasets.loaders.EurocSequenceLoader
+        seq_name: VI_02_medium
+        sequence_length: 50000
+        base_seed: 15
+        sampling_mode: contiguous
+        min_stride: 1
+        max_stride: 1
+        add_imu_noise: false
+    - _target_: tests.datasets.pipeline.RectifyFramesStage
+      rectifier:
+        _target_: tests.datasets.rectifiers.StereoSequenceRectifier
+        force_rectification: false
+    - _target_: tests.datasets.pipeline.DepthEstimationStage
+      label: sgbm
+      estimator:
+        _target_: tests.datasets.depth_estimators.SGBMDepthEstimator
+        num_disparities: 64
+        block_size: 5
+        default_max_depth: 40.0
+  default_max_depth: 40.0
