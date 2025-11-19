@@ -985,7 +985,7 @@ class FixedLagBundleAdjuster:
         self.new_values = gtsam.Values()
         self.new_timestamps = {}
         
-        self.smoother = gtsam.BatchFixedLagSmoother(self.config.lag)
+        self.smoother = gtsam.IncrementalFixedLagSmoother(self.config.lag)
         self.smoothed_values = gtsam.Values()
         self.full_values = gtsam.Values()
         self.landmark_observations = {}
@@ -1059,6 +1059,9 @@ class FixedLagBundleAdjuster:
             float(K[0,0]), float(K[1,1]), float(K[0,1]), float(K[0,2]), float(K[1,2]),
             float(np.abs(frame.calibration.P_right[0,3] / K[0,0]))
         )
+        
+        # Select the best tracks
+        observations = self._select_best_tracks(observations)
         
         # Stereo Noise
         sigma = self.config.projection_noise_px
@@ -1148,6 +1151,26 @@ class FixedLagBundleAdjuster:
                 # add a weak prior on the landmark to stop it from drifting too far
                 prior_factor = gtsam.PriorFactorPoint3(key_L, point, gtsam.noiseModel.Diagonal.Sigmas(np.array([5e-1]*3)))
                 self.new_factors.add(prior_factor)
+
+
+    def _select_best_tracks(self, observations, limit=400):
+        """
+        Selects the top 'limit' tracks to add to the optimizer.
+        Heuristic: Prioritize oldest tracks (smaller track_id).
+        """
+        if len(observations) <= limit:
+            return observations
+
+        # Sort by track_id (assuming strictly increasing IDs, smaller = older)
+        # In a real KLT, older tracks provide stronger drift constraints.
+        sorted_ids = sorted(observations.keys())
+        
+        # Simple top-N
+        # (A better version would ensure spatial grid distribution, but this is fast)
+        selected_ids = sorted_ids[:limit]
+        
+        return {tid: observations[tid] for tid in selected_ids}
+
 
 
     def _add_prior_factors(self, ts, pose, velocity):
