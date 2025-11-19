@@ -202,10 +202,12 @@ print(f"Using device: {device}")
 print(f"Primary depth variant: {DEPTH_MODE}")
 
 def create_preintegration_params(sequence=None) -> gtsam.PreintegrationParams:
-    params = gtsam.PreintegrationCombinedParams.MakeSharedU(IMU_GRAVITY_MAGNITUDE)
+    params = gtsam.PreintegrationParams.MakeSharedU(IMU_GRAVITY_MAGNITUDE)
     params.n_gravity = IMU_GRAVITY_VECTOR if sequence is None else test_utils.estimate_world_gravity_from_first_batch(sequence)
     params.setAccelerometerCovariance(np.eye(3) * (IMU_ACCEL_NOISE ** 2))
     params.setGyroscopeCovariance(np.eye(3) * (IMU_GYRO_NOISE ** 2))
+    # params.setAccelerometerBiasCovariance(np.eye(3) * (LOCAL_VO_CFG.bundle_adjuster.imu_bias_prior_sigmas[0] ** 2))
+    # params.setBiasOmegaCovariance(np.eye(3) * (LOCAL_VO_CFG.bundle_adjuster.imu_bias_prior_sigmas[3] ** 2))
     params.setIntegrationCovariance(np.eye(3) * (IMU_INTEGRATION_NOISE ** 2))
     return params
 
@@ -470,7 +472,7 @@ def run_fixed_lag_adjustment(
 
         relative_pose = prev_pose.between(pose_guess)
 
-        pim = gtsam.PreintegratedCombinedMeasurements(params, bias)
+        pim = gtsam.PreintegratedImuMeasurements(params, bias)
         _integrate_imu_batch(pim, sequence_sample.imu_measurements[frame_idx])
             
         bundle_adjuster.process(

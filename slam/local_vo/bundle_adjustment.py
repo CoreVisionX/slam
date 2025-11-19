@@ -964,251 +964,268 @@ class IncrementalBundleAdjuster:
 class FixedLagBundleAdjuster:
     def __init__(self, config: BundleAdjustmentConfig) -> None:
         self.config = config
-
+        
         self.frame_idx = 0
         self.prev_ts = 0.0
 
         self.smoother = None
         self.smoothed_values = None
-        self.full_values = None 
+        self.full_values = None
         
-        # Track ID -> SmartFactor object
-        # We keep these persistent so we can .add() new measurements to them
-        self.smart_factors: dict[int, gtsam.SmartProjectionPoseFactorCal3_S2] = {}
+        self.landmark_observations = {}
+        self.landmark_key_map = {}
+        self.next_replacement_id = 1000000
 
         self.new_factors = None
         self.new_values = None
         self.new_timestamps = None
-        
-        # Extrinsics (Body -> Camera)
-        # Initialize to Identity; process() will update if frame provides calibration
-        self.body_P_sensor = gtsam.Pose3() 
 
     def reset(self, ts: float, pose: gtsam.Pose3, velocity: np.ndarray) -> None:
-        """Reset the smoother to the initial pose (IMU Frame)."""
-        
-        # 1. Initialize Containers
         self.new_factors = gtsam.NonlinearFactorGraph()
         self.new_values = gtsam.Values()
         self.new_timestamps = {}
         
-        self.smart_factors = {}
-        
-        # Use BatchFixedLagSmoother for robustness with Smart Factors
         self.smoother = gtsam.BatchFixedLagSmoother(self.config.lag)
-        
         self.smoothed_values = gtsam.Values()
         self.full_values = gtsam.Values()
+        self.landmark_observations = {}
+        self.landmark_key_map = {}
+        self.next_replacement_id = 1000000
 
         self.frame_idx = 0
         self.prev_ts = ts
 
-        # 2. Initialize Priors (Pose, Velocity, Bias)
         self._add_prior_factors(ts, pose, velocity)
 
-    def process(self, frame: StereoDepthFrame, ts: float, relative_pose: gtsam.Pose3, estimated_velocity: np.ndarray, landmark_observations: Mapping[int, TrackObservation], pim: gtsam.PreintegratedCombinedMeasurements, optimize: bool = True, profile: bool = False) -> None:
-        """
-        Processes a new frame.
-        
-        Args:
-            ts: Timestamp of the current frame.
-            estimated_pose: Estimated pose of the IMU (Body Frame).
-            relative_pose: VO estimate of body motion (used for initialization only).
-            landmark_observations: Map of track_id -> Observation in Camera Frame.
-        """
+    def process(self, frame: StereoDepthFrame, ts: float, relative_pose: gtsam.Pose3, estimated_velocity: np.ndarray, landmark_observations: Mapping[int, TrackObservation], pim: gtsam.PreintegratedImuMeasurements, optimize: bool = True, profile: bool = False) -> None:
         profiler = _SectionProfiler(log_prefix="fixed_lag_bundle_adjustment.process")
-        
-        # Update extrinsics from frame calibration (T_Body_from_Sensor)
-        self.body_P_sensor = frame.calibration.T_B_from_S0
 
-        # Predict current pose using previous optimized pose + relative VO estimate
-        # (This is just for the initial value guess X_i)
+        # Extract Extrinsics (Body -> Sensor)
+        body_P_sensor = frame.calibration.T_B_from_S0
+        
+        # Predict Initial Guess
         prev_pose = self.full_values.atPose3(X(self.frame_idx))
         current_pose_guess = prev_pose.compose(relative_pose)
         
-        # Increment frame
         prev_idx = self.frame_idx
         self.frame_idx += 1
-        
-        # 1. Insert Initial Values (X, V, B)
-        with profiler.section("add_values"):
+
+        # 1. Add Values & IMU
+        with profiler.section("add_values_imu"):
             self._insert_initial_values(self.frame_idx, ts, current_pose_guess, estimated_velocity, prev_idx)
+            # Note: relying on internal strict params, ignoring passed 'pim_unused'
+            # You must update your main loop to pass raw IMU data or generate PIM with the same strict params!
+            self._add_imu_factor(prev_idx, self.frame_idx, pim, ts)
 
-        # 2. Add IMU Factor
-        with profiler.section("add_imu_factor"):
-            self._add_imu_factor(prev_idx, self.frame_idx, pim)
+        # 2. Process Landmarks
+        with profiler.section("process_landmarks"):
+            self._process_explicit_landmarks(frame, landmark_observations, body_P_sensor, ts)
 
-        # 3. Process Visual Observations (Smart Factors)
-        with profiler.section("process_smart_factors"):
-            self._process_smart_factors(frame, landmark_observations)
-
-        # 4. Optimize
+        # 3. Optimize
         if optimize:
             with profiler.section("optimize"):
                 self.optimize()
 
-        if profile:
-            profiler.report()
-
         self.prev_ts = ts
 
     def optimize(self) -> None:
+        self._prune_unconstrained_values()
         try:
-            # Update the smoother with new factors and values
-            # Note: Smart Factors in new_factors are pointers. The smoother stores these pointers.
-            # When we called .add() on the factor object earlier, it updated the internal data 
-            # that the smoother sees.
             self.smoother.update(self.new_factors, self.new_values, self.new_timestamps)
-            
-            # Calculate estimate
             self.smoothed_values = self.smoother.calculateEstimate()
             self.full_values.update(self.smoothed_values)
-
         except Exception as e:
-            print(f"Error updating smoother: {e}")
+            print(f"Optimization Error at frame {self.frame_idx}: {e}")
+            # Debug: Print graph stats or active keys if needed
             raise e
         finally:
-            # Clear containers for the next iteration
             self.new_timestamps.clear()
             self.new_values.clear()
             self.new_factors.resize(0)
 
     def get_trajectory(self) -> list[gtsam.Pose3]:
-        """Get the trajectory as a list of IMU poses."""
         return [self.full_values.atPose3(X(i)) for i in range(self.frame_idx + 1)]
 
     # =========================================================================
-    # Helper Methods
+    # Helpers
     # =========================================================================
 
-    def _add_prior_factors(self, ts: float, pose: gtsam.Pose3, velocity: np.ndarray):
-        """Adds priors for Pose, Velocity, and Bias at frame 0."""
-        # Pose
+    def _process_explicit_landmarks(self, frame, observations, body_P_sensor, ts):
+        # Prepare Calibration / Noise
+        K = frame.calibration.K_left_rect
+        calib = gtsam.Cal3_S2(float(K[0,0]), float(K[1,1]), float(K[0,1]), float(K[0,2]), float(K[1,2]))
+        
+        stereo_calib = gtsam.Cal3_S2Stereo(
+            float(K[0,0]), float(K[1,1]), float(K[0,1]), float(K[0,2]), float(K[1,2]),
+            float(np.abs(frame.calibration.P_right[0,3] / K[0,0]))
+        )
+        
+        # Stereo Noise
+        sigma = self.config.projection_noise_px
+        stereo_noise = gtsam.noiseModel.Robust.Create(
+            gtsam.noiseModel.mEstimator.Huber(1.345),
+            gtsam.noiseModel.Diagonal.Sigmas(np.array([sigma, sigma, self.config.disparity_noise_px]))
+        )
+
+        # Helper to get 3D point in World Frame
+        # NOTE: We perform backprojection using the CURRENT estimated pose (Body) + Extrinsics
+        pose_body = self.new_values.atPose3(X(self.frame_idx))
+        pose_cam = pose_body.compose(body_P_sensor)
+        camera = gtsam.PinholeCameraCal3_S2(pose_cam, calib)
+
+        for original_track_id, obs in observations.items():
+            # Filter Invalid Depth
+            if obs.depth is None or not np.isfinite(obs.depth) or obs.depth <= 0.0 or obs.depth > 40.0:
+                continue
+
+            # ID Management
+            if original_track_id not in self.landmark_key_map:
+                self.landmark_key_map[original_track_id] = original_track_id
+            track_id = self.landmark_key_map[original_track_id]
+            key_L = L(track_id)
+
+            # Create Factor
+            disparity = (stereo_calib.fx() * stereo_calib.baseline()) / obs.depth
+            stereo_meas = gtsam.StereoPoint2(
+                float(obs.keypoint[0]),
+                float(obs.keypoint[0] - disparity),
+                float(obs.keypoint[1])
+            )
+
+            # FIX 2: Use GenericStereoFactor3D with BODY POSE + EXTRINSICS
+            # This allows GTSAM to optimize the Body path correctly
+            factor = gtsam.GenericStereoFactor3D(
+                stereo_meas, stereo_noise, 
+                X(self.frame_idx), key_L, 
+                stereo_calib, body_P_sensor
+            )
+
+            # Landmark Logic
+            if self.full_values.exists(key_L):
+                # Landmark exists in history.
+                # Check if it is currently optimized (alive in the smoother window)
+                if self.smoothed_values.exists(key_L) or self.new_values.exists(key_L):
+                    # It's alive. Add factor.
+                    self.new_factors.add(factor)
+                else:
+                    # It was marginalized out (exists in full_values but not smoothed).
+                    # FIX 5: Do NOT bring it back with the same ID.
+                    # This anchors current pose to a marginalized state -> Rubber banding/Drift.
+                    # Strategy: Respawn as NEW landmark ID
+                    self.next_replacement_id += 1
+                    self.landmark_key_map[original_track_id] = self.next_replacement_id
+                    new_track_id = self.next_replacement_id
+                    key_L_new = L(new_track_id)
+                    
+                    # Re-triangulate fresh point
+                    point = camera.backproject(obs.keypoint, obs.depth)
+                    
+                    self.new_values.insert(key_L_new, point)
+                    self.full_values.insert(key_L_new, point)
+                    self.new_timestamps[key_L_new] = ts
+                    
+                    # Create new factor for new ID
+                    new_factor = gtsam.GenericStereoFactor3D(
+                        stereo_meas, stereo_noise, 
+                        X(self.frame_idx), key_L_new, 
+                        stereo_calib, body_P_sensor
+                    )
+                    self.new_factors.add(new_factor)
+
+                    # add a weak prior on the landmark to stop it from drifting too far
+                    prior_factor = gtsam.PriorFactorPoint3(key_L_new, point, gtsam.noiseModel.Diagonal.Sigmas(np.array([5e-1]*3)))
+                    self.new_factors.add(prior_factor)
+
+            else:
+                # New Landmark
+                point = camera.backproject(obs.keypoint, obs.depth)
+                
+                self.new_values.insert(key_L, point)
+                self.full_values.insert(key_L, point)
+                self.new_timestamps[key_L] = ts
+                self.new_factors.add(factor)
+
+                # add a weak prior on the landmark to stop it from drifting too far
+                prior_factor = gtsam.PriorFactorPoint3(key_L, point, gtsam.noiseModel.Diagonal.Sigmas(np.array([5e-1]*3)))
+                self.new_factors.add(prior_factor)
+
+
+    def _add_prior_factors(self, ts, pose, velocity):
         key_pose = X(0)
         self.new_values.insert(key_pose, pose)
         self.full_values.insert(key_pose, pose)
         self.new_timestamps[key_pose] = ts
-        
-        pose_noise = gtsam.noiseModel.Diagonal.Sigmas(np.asarray(self.config.pose_prior_sigmas, dtype=float))
-        self.new_factors.add(gtsam.PriorFactorPose3(key_pose, pose, pose_noise))
+        self.new_factors.add(gtsam.PriorFactorPose3(key_pose, pose, gtsam.noiseModel.Diagonal.Sigmas(np.asarray(self.config.pose_prior_sigmas))))
 
-        # Velocity
         key_vel = V(0)
-        vel_point = gtsam.Point3(*velocity)
-        self.new_values.insert(key_vel, vel_point)
-        self.full_values.insert(key_vel, vel_point)
+        vel_pt = gtsam.Point3(*velocity)
+        self.new_values.insert(key_vel, vel_pt)
+        self.full_values.insert(key_vel, vel_pt)
         self.new_timestamps[key_vel] = ts
-        # Velocity prior is often implicitly handled by tight IMU coupling, 
-        # but explicit prior can stabilize start. If desired, add PriorFactorVector.
-
-        # Bias
+        
         key_bias = B(0)
         bias = gtsam.imuBias.ConstantBias()
         self.new_values.insert(key_bias, bias)
         self.full_values.insert(key_bias, bias)
         self.new_timestamps[key_bias] = ts
-        
-        bias_noise = gtsam.noiseModel.Diagonal.Sigmas(np.asarray(self.config.imu_bias_prior_for_factors, dtype=float))
+        # Tighter initial bias prior
+        bias_noise = gtsam.noiseModel.Diagonal.Sigmas(np.array([1e-2]*3 + [1e-3]*3))
         self.new_factors.add(gtsam.PriorFactorConstantBias(key_bias, bias, bias_noise))
 
-    def _insert_initial_values(self, curr_idx: int, ts: float, pose: gtsam.Pose3, velocity: np.ndarray, prev_idx: int):
-        """Inserts initial guesses for X, V, and B for the current frame."""
-        # Pose
+    def _insert_initial_values(self, curr_idx, ts, pose, velocity, prev_idx):
         self.new_values.insert(X(curr_idx), pose)
         self.full_values.insert(X(curr_idx), pose)
         self.new_timestamps[X(curr_idx)] = ts
 
-        # Velocity
-        vel_point = gtsam.Point3(float(velocity[0]), float(velocity[1]), float(velocity[2]))
-        self.new_values.insert(V(curr_idx), vel_point)
-        self.full_values.insert(V(curr_idx), vel_point)
+        vel_pt = gtsam.Point3(*velocity)
+        self.new_values.insert(V(curr_idx), vel_pt)
+        self.full_values.insert(V(curr_idx), vel_pt)
         self.new_timestamps[V(curr_idx)] = ts
 
-        # Bias (Initialize with previous optimized bias)
-        prev_bias = self.full_values.atConstantBias(B(prev_idx))
-        self.new_values.insert(B(curr_idx), prev_bias)
-        self.full_values.insert(B(curr_idx), prev_bias)
-        self.new_timestamps[B(curr_idx)] = ts
-
-    def _add_imu_factor(self, prev_idx: int, curr_idx: int, pim: gtsam.PreintegratedCombinedMeasurements):
-        """Adds the Preintegrated IMU factor connecting previous and current frame."""
+    def _add_imu_factor(self, prev_idx, curr_idx, pim, ts):
+        # update the timestamp for the bias so it doesn't get marginalized out
+        self.new_timestamps[B(0)] = ts
         self.new_factors.add(
-            gtsam.CombinedImuFactor(
+            gtsam.ImuFactor(
                 X(prev_idx), V(prev_idx),
                 X(curr_idx), V(curr_idx),
-                B(prev_idx), B(curr_idx),
+                B(0),
                 pim
             )
         )
 
-    def _process_smart_factors(self, frame: StereoDepthFrame, landmark_observations: Mapping[int, TrackObservation]):
-        """Updates existing smart factors and creates new ones for visual observations."""
+    def _prune_unconstrained_values(self):
+        """
+        Checks new_values for variables that are NOT connected to any factor in new_factors.
+        This prevents 'Indeterminant linear system' errors in BatchFixedLagSmoother.
+        """
+        # 1. Identify all keys referenced by new factors
+        referenced_keys = set()
+        for i in range(self.new_factors.size()):
+            factor = self.new_factors.at(i)
+            for key in factor.keys():
+                referenced_keys.add(key)
         
-        # Setup Calibration and Noise
-        K = frame.calibration.K_left_rect
-        stereo_calib = self._create_stereo_calib(K, frame.calibration.P_right)
-        smart_noise = self._create_smart_noise_model()
+        # 2. Check new values
+        keys_to_remove = []
+        # Iterate over keys in new_values
+        for key in self.new_values.keys():
+            # Only prune Landmarks (L) to be safe, though technically any unconstrained var is bad
+            if gtsam.Symbol(key).chr() == ord('l'):
+                if key not in referenced_keys:
+                    keys_to_remove.append(key)
         
-        # Smart Factor Settings
-        # RET_TRIANGULATION_FAILED = 0, RET_ZERO_AROUND_LANDMARK = 1
-        # We use standard settings, but you can tune rankTolerance or outlier rejection here.
-        smart_params = gtsam.SmartProjectionParams()
-        smart_params.setRankTolerance(1e-3)
-        # smart_params.setLinearizationMode(gtsam.HESS) # HESS often better than JACOBIAN for complex geometry
-        smart_params.setDegeneracyMode(gtsam.DegeneracyMode.ZERO_ON_DEGENERACY)
-
-        for track_id, obs in landmark_observations.items():
-            # 1. Validate Depth
-            if obs.depth is None or not np.isfinite(obs.depth) or obs.depth <= 0.0 or obs.depth > 40.0:
-                continue
-
-            # 2. Create Measurement
-            disparity = (stereo_calib.fx() * stereo_calib.baseline()) / obs.depth
-            mono_measurement = obs.keypoint
-
-            # 3. Get or Create Smart Factor
-            if track_id not in self.smart_factors:
-                factor = gtsam.SmartProjectionPoseFactorCal3_S2(
-                    smart_noise, 
-                    stereo_calib, 
-                    self.body_P_sensor, # Extrinsics: Body -> Camera
-                    smart_params
-                )
-                self.smart_factors[track_id] = factor
-                # IMPORTANT: Add the NEW factor to the graph for the smoother to register it.
-                self.new_factors.add(factor)
-            
-            # 4. Add Observation to the Factor
-            # Note: We do NOT add the factor to self.new_factors if it already exists.
-            # The smoother holds a pointer to the factor object. Calling .add() updates that object.
-            self.smart_factors[track_id].add(mono_measurement, X(self.frame_idx))
-
-    def _create_stereo_calib(self, K: np.ndarray, P_right: np.ndarray) -> gtsam.Cal3_S2Stereo:
-        """Creates GTSAM stereo calibration object."""
-        fx = float(K[0, 0])
-        baseline = float(np.abs(P_right[0, 3] / P_right[0, 0]))
-        return gtsam.Cal3_S2Stereo(
-            fx,
-            float(K[1, 1]),
-            float(K[0, 1]),
-            float(K[0, 2]),
-            float(K[1, 2]),
-            baseline
-        )
-
-    def _create_smart_noise_model(self) -> gtsam.noiseModel.Base:
-        """Creates the noise model for smart factors."""
-        # Smart factors typically use isotropic noise on the reprojection error (uL, uR, v)
-        # We map projection_noise_px to sigma.
-        sigma = self.config.projection_noise_px
-        
-        base_noise = gtsam.noiseModel.Isotropic.Sigma(3, sigma)
-        
-        if self.config.use_huber_loss:
-            raise NotImplementedError("GTSAM does not support Huber loss for smart factors yet.")
-
-        return base_noise
-
+        # 3. Remove them
+        for key in keys_to_remove:
+            self.new_values.erase(key)
+            if key in self.new_timestamps:
+                del self.new_timestamps[key]
+            # Also remove from full_values so we don't think it exists later
+            if self.full_values.exists(key):
+                # GTSAM Values doesn't have erase for full_values easily without rebuilding,
+                # but full_values is just a log. 
+                # The critical part is removing from new_values before smoother.update()
+                pass
 
 def finite_difference_velocity(prev_pose: gtsam.Pose3, next_pose: gtsam.Pose3, dt: float) -> gtsam.Point3:
     """Calculates the velocity between two poses using finite difference."""
