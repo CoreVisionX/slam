@@ -27,6 +27,7 @@ class RelativePnPInitializer:
         *,
         min_matches_for_pnp: int = 6,
         max_depth: float = 40.0,
+        store_results: bool = True,
     ) -> None:
         self.config = RelativePnPInitializerConfig(
             min_matches_for_pnp=min_matches_for_pnp,
@@ -40,13 +41,24 @@ class RelativePnPInitializer:
         self._prev_track_observations: dict[int, TrackObservation] | None = None
         self._prev_frame_index: int | None = None
         self.results: list[dict[str, Any]] = []
+        self.store_results = store_results
 
-    def reset(self, sequence_sample: Any) -> None:
+    def reset_with_gt(self, sequence_sample: Any) -> None:
         """Reset state so poses can be estimated incrementally."""
         self._sequence_sample = sequence_sample
         first_pose = gtsam.Pose3(sequence_sample.world_poses[0].rotation(), np.zeros(3))
         self._first_gt_pose = first_pose
         self._world_pose = gtsam.Pose3(sequence_sample.world_poses[0].rotation(), np.zeros(3))
+        self._prev_rectified_frame = None
+        self._prev_depth_frame = None
+        self._prev_track_observations = None
+        self._prev_frame_index = None
+        self.results = []
+
+    def reset(self, pose: gtsam.Pose3) -> None:
+        self._world_pose = pose
+        self._sequence_sample = None
+        self._first_gt_pose = None
         self._prev_rectified_frame = None
         self._prev_depth_frame = None
         self._prev_track_observations = None
@@ -60,7 +72,7 @@ class RelativePnPInitializer:
         track_history: list[dict[int, TrackObservation]],
         sequence_sample: Any,
     ) -> list[dict[str, Any]]:
-        self.reset(sequence_sample)
+        self.reset_with_gt(sequence_sample)
         for frame_idx, (rect_frame, depth_frame) in enumerate(zip(rectified_frames, depth_frames)):
             track_obs = track_history[frame_idx]
             self.process_frame(
@@ -78,9 +90,10 @@ class RelativePnPInitializer:
         rectified_frame: RectifiedStereoFrame,
         depth_frame: StereoDepthFrame,
         track_observations: dict[int, TrackObservation],
+        frame_id: str | None = None,
     ) -> dict[str, Any] | None:
         """Incrementally process a frame and return the PnP result when available."""
-        if self._sequence_sample is None or self._world_pose is None or self._first_gt_pose is None:
+        if self._world_pose is None:
             raise RuntimeError("RelativePnPInitializer.reset() must be called before processing frames.")
 
         if self._prev_track_observations is None:
@@ -103,14 +116,23 @@ class RelativePnPInitializer:
         prev_world_pose = self._world_pose
         curr_obs = track_observations
         common_track_ids = sorted(set(prev_obs.keys()) & set(curr_obs.keys()))
+        
+        current_frame_id = frame_id
+        if current_frame_id is None:
+            if sequence_sample is not None:
+                current_frame_id = sequence_sample.frame_ids[frame_index]
+            else:
+                current_frame_id = str(frame_index)
+
         if not common_track_ids:
             result = {
                 "frame_index": frame_index,
-                "frame_id": sequence_sample.frame_ids[frame_index],
+                "frame_id": current_frame_id,
                 "status": "no_tracks",
                 "active_track_count": 0,
             }
-            self.results.append(result)
+            if self.store_results:
+                self.results.append(result)
             self._update_previous_frame(rectified_frame, depth_frame, track_observations, frame_index)
             return result
 
@@ -132,11 +154,12 @@ class RelativePnPInitializer:
         if not np.any(valid_mask):
             result = {
                 "frame_index": frame_index,
-                "frame_id": sequence_sample.frame_ids[frame_index],
+                "frame_id": current_frame_id,
                 "status": "no_valid_depth",
                 "active_track_count": len(common_track_ids),
             }
-            self.results.append(result)
+            if self.store_results:
+                self.results.append(result)
             self._update_previous_frame(rectified_frame, depth_frame, track_observations, frame_index)
             return result
 
@@ -146,11 +169,12 @@ class RelativePnPInitializer:
         if prev_valid.shape[0] < cfg.min_matches_for_pnp:
             result = {
                 "frame_index": frame_index,
-                "frame_id": sequence_sample.frame_ids[frame_index],
+                "frame_id": current_frame_id,
                 "status": "insufficient_tracks",
                 "active_track_count": prev_valid.shape[0],
             }
-            self.results.append(result)
+            if self.store_results:
+                self.results.append(result)
             self._update_previous_frame(rectified_frame, depth_frame, track_observations, frame_index)
             return result
 
@@ -171,22 +195,28 @@ class RelativePnPInitializer:
         except Exception as exc:  # noqa: BLE001
             result = {
                 "frame_index": frame_index,
-                "frame_id": sequence_sample.frame_ids[frame_index],
+                "frame_id": current_frame_id,
                 "status": "pnp_failed",
                 "active_track_count": prev_valid.shape[0],
                 "error": str(exc),
             }
-            self.results.append(result)
+            if self.store_results:
+                self.results.append(result)
             self._update_previous_frame(rectified_frame, depth_frame, track_observations, frame_index)
             return result
 
         estimated_pose = prev_world_pose.compose(relative_pose)
         self._world_pose = estimated_pose
-        ground_truth_pose = self._first_gt_pose.inverse() * sequence_sample.world_poses[frame_index]
-        pose_error = ground_truth_pose.between(estimated_pose)
+        
+        ground_truth_pose = None
+        pose_error = None
+        if sequence_sample is not None and self._first_gt_pose is not None:
+            ground_truth_pose = (self._first_gt_pose.inverse() * sequence_sample.world_poses[frame_index])
+            pose_error = ground_truth_pose.between(estimated_pose)
+
         result = {
             "frame_index": frame_index,
-            "frame_id": sequence_sample.frame_ids[frame_index],
+            "frame_id": current_frame_id,
             "status": "success",
             "active_track_count": prev_valid.shape[0],
             "matches_before_filter": len(common_track_ids),
@@ -199,7 +229,8 @@ class RelativePnPInitializer:
             "relative_pose": relative_pose,
             "anchor_frame_index": prev_frame_idx,
         }
-        self.results.append(result)
+        if self.store_results:
+            self.results.append(result)
         self._update_previous_frame(rectified_frame, depth_frame, track_observations, frame_index)
         return result
 

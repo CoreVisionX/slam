@@ -1,7 +1,7 @@
 klt_tracker:
   _target_: slam.local_vo.klt_tracker.KLTFeatureTracker
-  max_feature_count: 512
-  refill_feature_ratio: 0.9
+  max_feature_count: 256 # use 512 or 1024 for the MH sequences. or maybe just start maintaing seperate configs lol
+  refill_feature_ratio: 0.8
   feature_suppression_radius: 8.0
   fast_threshold: 25
   fast_nonmax: true
@@ -24,8 +24,8 @@ bundle_adjuster:
   min_observations_per_frame: 5
   projection_noise_px: 1.0
   disparity_noise_px: 1.0
-  use_huber_loss: true # try cauchy?
-  reprojection_gating_threshold_px: 4.0
+  use_huber_loss: true
+  reprojection_gating_threshold_px: 8.0 # a wider threshold helps with some tricky parts of the MH sequences, I think it's because all the old landmarks go out of the threshold at once or something?
   use_inlier_observations_only: false
   pose_prior_sigmas:
     [
@@ -49,7 +49,7 @@ bundle_adjuster:
   use_motion_only_smart_factors: false
   light_relative_pose_sigmas: [3.0, 3.0, 3.0, 3.0, 3.0, 3.0]
   min_depth: 0.0
-  lag: 2.0
+  lag: 8.0
 
 data_pipeline:
   _target_: tests.datasets.pipeline.SequencePreprocessor
@@ -58,7 +58,7 @@ data_pipeline:
       loader:
         _target_: tests.datasets.loaders.EurocSequenceLoader
         seq_name: VI_02_medium
-        sequence_length: 50000
+        sequence_length: 2000
         base_seed: 15
         sampling_mode: contiguous
         min_stride: 1

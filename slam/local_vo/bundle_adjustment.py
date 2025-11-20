@@ -1046,18 +1046,24 @@ class FixedLagBundleAdjuster:
     def get_trajectory(self) -> list[gtsam.Pose3]:
         return [self.full_values.atPose3(X(i)) for i in range(self.frame_idx + 1)]
 
+    def get_latest_pose(self) -> gtsam.Pose3:
+        return self.full_values.atPose3(X(self.frame_idx))
+
+    def get_latest_velocity(self) -> np.ndarray:
+        return self.full_values.atVector(V(self.frame_idx))
+
     # =========================================================================
     # Helpers
     # =========================================================================
 
-    def _process_explicit_landmarks(self, frame, observations, body_P_sensor, ts):
+    def _process_explicit_landmarks(self, frame: StereoDepthFrame, observations, body_P_sensor, ts):
         # Prepare Calibration / Noise
         K = frame.calibration.K_left_rect
         calib = gtsam.Cal3_S2(float(K[0,0]), float(K[1,1]), float(K[0,1]), float(K[0,2]), float(K[1,2]))
         
         stereo_calib = gtsam.Cal3_S2Stereo(
             float(K[0,0]), float(K[1,1]), float(K[0,1]), float(K[0,2]), float(K[1,2]),
-            float(np.abs(frame.calibration.P_right[0,3] / K[0,0]))
+            float(np.linalg.norm(frame.calibration.T)) # TODO: is this way of calculating the baseline the most accurate? should it be factor out to a more central place, there's a few places where we calculate it and having one function might be good. compose don't inherit.
         )
         
         # Select the best tracks
@@ -1066,7 +1072,8 @@ class FixedLagBundleAdjuster:
         # Stereo Noise
         sigma = self.config.projection_noise_px
         stereo_noise = gtsam.noiseModel.Robust.Create(
-            gtsam.noiseModel.mEstimator.Huber(1.345),
+            gtsam.noiseModel.mEstimator.Huber(0.5), # TODO: turn K into a configurable parameter
+            # gtsam.noiseModel.mEstimator.Cauchy(1.345),
             gtsam.noiseModel.Diagonal.Sigmas(np.array([sigma, sigma, self.config.disparity_noise_px]))
         )
 
@@ -1105,6 +1112,17 @@ class FixedLagBundleAdjuster:
 
             # Landmark Logic
             if self.full_values.exists(key_L):
+                # TODO: collect and log (to rerun) stats about landmarks that were added and rejected
+                # Reprojection Gating
+                existing_point = self.full_values.atPoint3(key_L)
+                try:
+                    projected_pt2 = camera.project(existing_point)
+                    residual = projected_pt2 - gtsam.Point2(float(obs.keypoint[0]), float(obs.keypoint[1]))
+                    if np.linalg.norm(residual) ** 2 > self.config.reprojection_gating_threshold_px ** 2:
+                        continue
+                except RuntimeError:
+                    continue
+
                 # Landmark exists in history.
                 # Check if it is currently optimized (alive in the smoother window)
                 if self.smoothed_values.exists(key_L) or self.new_values.exists(key_L):
@@ -1135,8 +1153,10 @@ class FixedLagBundleAdjuster:
                     )
                     self.new_factors.add(new_factor)
 
+                    # TODO: factor out the landmark prior construction into a function
+                    # TODO: make sure this doesn't end up effectively overruling outlier rejection of the robust noise models on the projection factors
                     # add a weak prior on the landmark to stop it from drifting too far
-                    prior_factor = gtsam.PriorFactorPoint3(key_L_new, point, gtsam.noiseModel.Diagonal.Sigmas(np.array([5e-1]*3)))
+                    prior_factor = gtsam.PriorFactorPoint3(key_L_new, point, gtsam.noiseModel.Diagonal.Sigmas(np.array([1e+2]*3)))
                     self.new_factors.add(prior_factor)
 
             else:
@@ -1148,12 +1168,14 @@ class FixedLagBundleAdjuster:
                 self.new_timestamps[key_L] = ts
                 self.new_factors.add(factor)
 
+                # TODO: make sure the 1e+2 still works as well as the 5e-0 on the euroc VI sequences
+                # TODO: add a hydra config option for the landmark prior sigmas, this new BA seems to work fine in the euroc vicon room sequences, but doesn't on the machine hall ones, maybe it has to do with a larger range of depth and this landmark prior noise model could be more tight? either way it needs to be configurable. try a looser configuration and see if that improves performance on the machine hall sequences.
                 # add a weak prior on the landmark to stop it from drifting too far
-                prior_factor = gtsam.PriorFactorPoint3(key_L, point, gtsam.noiseModel.Diagonal.Sigmas(np.array([5e-1]*3)))
+                prior_factor = gtsam.PriorFactorPoint3(key_L, point, gtsam.noiseModel.Diagonal.Sigmas(np.array([1e+2]*3)))
                 self.new_factors.add(prior_factor)
 
 
-    def _select_best_tracks(self, observations, limit=400):
+    def _select_best_tracks(self, observations, limit=1024): # TODO: this limit should be part of the hydra config
         """
         Selects the top 'limit' tracks to add to the optimizer.
         Heuristic: Prioritize oldest tracks (smaller track_id).

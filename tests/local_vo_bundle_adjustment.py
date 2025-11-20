@@ -31,6 +31,7 @@ from registration.registration import (  # noqa: E402
 )
 from registration.utils import draw_matches  # noqa: E402
 import tests.test_utils as test_utils  # noqa: E402
+from tests.test_utils import se3_inverse
 from slam.local_vo import (  # noqa: E402
     BundleAdjustmentConfig,
     FeatureTrack,
@@ -40,6 +41,7 @@ from slam.local_vo import (  # noqa: E402
     RelativePnPInitializer,
     TrackObservation,
 )
+from tests.vio_example import VIO, VIOConfig
 from tests.datasets.pipeline import SequencePreprocessor
 
 # TODO: expressing disparity uncertainty for depth measurements in BA properly might help a ton
@@ -403,89 +405,99 @@ def run_fixed_lag_adjustment(
     if not rectified_frames:
         raise ValueError("No frames provided for fixed-lag optimization.")
 
-    pose_initials = _build_initial_pose_dict_from_pnp(sequence_sample, sequence_results)
-    frames_for_ba = list(range(len(rectified_frames)))
-    initial_pose_dict = {idx: clone_pose(pose_initials[idx]) for idx in frames_for_ba}
+    # Construct VIO Config from the first frame's calibration
+    calib = rectified_frames[0].calibration
+    # Calculate baseline from T_B_from_S0 and T_B_from_S1
+    # Assuming T_B_from_S1 = T_B_from_S0 * T_S0_from_S1
+    # T_S0_from_S1 = inv(T_B_from_S0) * T_B_from_S1
+    # baseline is usually -Tx of T_S1_from_S0 (or Tx of T_S0_from_S1 if right is S1)
+    # Let's use the norm of the translation between cameras
+    
+    # T_B_from_S0 is gtsam.Pose3 in EuRoCStereoCalibration
+    T_B_from_S0_mat = calib.T_B_from_S0.matrix()
+    T_B_from_S1_mat = calib.T_B_from_S1.matrix()
+    
+    T_left_inv = se3_inverse(T_B_from_S0_mat)
+    T_right_from_left = T_left_inv @ T_B_from_S1_mat
+    baseline = np.linalg.norm(T_right_from_left[:3, 3])
 
-    velocities = estimate_sequence_velocities(sequence_sample)
-    if velocities.size == 0:
-        velocities = np.zeros((len(frames_for_ba), 3), dtype=np.float64)
-    elif velocities.shape[0] < len(frames_for_ba):
-        pad_length = len(frames_for_ba) - velocities.shape[0]
-        padding = np.tile(velocities[-1], (pad_length, 1))
-        velocities = np.vstack([velocities, padding])
+    vio_config = VIOConfig(
+        gravity=IMU_GRAVITY_VECTOR,
+        imu_from_left=T_B_from_S0_mat,
+        imu_from_right=T_B_from_S1_mat,
+        baseline=baseline,
+        K_left_rect=calib.K_left_rect,
+        K_right_rect=calib.K_right_rect,
+        width=calib.width,
+        height=calib.height,
+        optimize_every=4, # Hardcoded to match previous logic or config
+    )
+
+    # Instantiate VIO
+    # We use the global KLT_TRACKER and RELATIVE_POSE_INITIALIZER
+    # Note: VIO will reset them, so the previous tracking results in run_depth_variant might be invalidated
+    # if we were relying on the tracker state, but we passed track_history and tracks as args.
+    vio = VIO(
+        config=vio_config,
+        feature_tracker=KLT_TRACKER,
+        relative_pose_initializer=RELATIVE_POSE_INITIALIZER,
+        ba=bundle_adjuster
+    )
+
+    frames_for_ba = list(range(len(rectified_frames)))
+    
+    # Initial state
+    first_ts = _frame_timestamp(0, sequence_sample.frame_timestamps)
+    first_pose = sequence_sample.world_poses[0]
+    first_velocity = finite_difference_velocity(
+        sequence_sample.world_poses[0], 
+        sequence_sample.world_poses[1], 
+        _frame_timestamp(1, sequence_sample.frame_timestamps) - first_ts
+    )
+
+    # Reset VIO
+    vio.reset(
+        timestamp=first_ts,
+        left_rect=rectified_frames[0].left_rect,
+        right_rect=rectified_frames[0].right_rect,
+        t=to_numpy_vec3(first_pose.translation()),
+        R=first_pose.rotation().matrix(),
+        v=first_velocity
+    )
+
+    # Re-build initial pose dict to match return signature (though VIO doesn't expose it directly, 
+    # we can use the one passed in or reconstruct it if needed. 
+    # For now, let's use the one from the arguments which was computed by run_depth_variant)
+    pose_initials = _build_initial_pose_dict_from_pnp(sequence_sample, sequence_results)
+    initial_pose_dict = {idx: clone_pose(pose_initials[idx]) for idx in frames_for_ba}
 
     params = create_preintegration_params(sequence_sample)
     bias = gtsam.imuBias.ConstantBias()
-    first_ts = _frame_timestamp(0, sequence_sample.frame_timestamps)
-
-    first_velocity = finite_difference_velocity(sequence_sample.world_poses[0], sequence_sample.world_poses[1], _frame_timestamp(1, sequence_sample.frame_timestamps) - first_ts)
-    bundle_adjuster.reset(first_ts, sequence_sample.world_poses[0], first_velocity)
-
-    # track_observation_counts: dict[int, int] = {}
-    # for observations in track_history:
-    #     for track_id in observations:
-    #         track_observation_counts[track_id] = track_observation_counts.get(track_id, 0) + 1
-    # valid_track_ids = {track_id for track_id, count in track_observation_counts.items() if count >= 5}
-    
-    # print(f"Total tracks: {len(track_observation_counts)}")
-    # print(f"Valid tracks: {len(valid_track_ids)}")
-
-    # config = getattr(bundle_adjuster, "config", None)
-    # use_inlier_filter = bool(getattr(config, "use_inlier_observations_only", False))
-    # if use_inlier_filter and sequence_results:
-    #     inlier_lookup = IncrementalBundleAdjuster._build_inlier_lookup(sequence_results)
-    #     inlier_track_ids: set[int] = set()
-    #     for ids in inlier_lookup.values():
-    #         inlier_track_ids.update(ids)
-    #     if inlier_track_ids:
-    #         valid_track_ids &= inlier_track_ids
-
-    # print(f"Valid tracks after inlier filter: {len(valid_track_ids)}")
-
-    # track_history = [
-    #     {track_id: obs for track_id, obs in observations.items() if track_id in valid_track_ids}
-    #     for observations in track_history
-    # ]
 
     stereo_counts, mono_counts = _count_observation_types(track_history)
-
+    
     for frame_idx in tqdm(range(1, len(frames_for_ba)), desc="Running bundle adjustment"):
         ts = _frame_timestamp(frame_idx, sequence_sample.frame_timestamps)
-        pose_guess = clone_pose(initial_pose_dict[frame_idx])
-        # velocity = velocities[min(frame_idx, velocities.shape[0] - 1)]
-        # if use_imu:
-        #     pim = preintegrate_between_frames(
-        #         sequence_sample,
-        #         frame_idx - 1,
-        #         frame_idx,
-        #         params,
-        #         bias,
-        #         use_combined=True,
-        #     )
-        # else:
-        #     pim = gtsam.PreintegratedCombinedMeasurements(params, bias)
-
-        prev_pose = initial_pose_dict[frame_idx - 1]
-        prev_ts = _frame_timestamp(frame_idx - 1, sequence_sample.frame_timestamps)
-        velocity = finite_difference_velocity(prev_pose, pose_guess, ts - prev_ts)
-
-        relative_pose = prev_pose.between(pose_guess)
-
+        
+        # IMU integration
+        # VIO expects pim from previous frame to current frame.
+        # For frame 0, pim should probably be empty or None?
+        # VIO.process takes pim.
+        # In the original loop:
+        # pim = gtsam.PreintegratedImuMeasurements(params, bias)
+        # _integrate_imu_batch(pim, sequence_sample.imu_measurements[frame_idx])
+        # This integrates measurements *associated* with frame_idx (usually between prev and curr).
+        
         pim = gtsam.PreintegratedImuMeasurements(params, bias)
-        _integrate_imu_batch(pim, sequence_sample.imu_measurements[frame_idx])
-            
-        bundle_adjuster.process(
-            frame=depth_frames[frame_idx],
-            ts=ts,
-            relative_pose=relative_pose,
-            estimated_velocity=velocity,
-            landmark_observations=track_history[frame_idx],
+        if frame_idx < len(sequence_sample.imu_measurements):
+             _integrate_imu_batch(pim, sequence_sample.imu_measurements[frame_idx])
+        
+        vio.process(
+            timestamp=ts,
+            left_rect=rectified_frames[frame_idx].left_rect,
+            right_rect=rectified_frames[frame_idx].right_rect,
             pim=pim,
-            optimize=frame_idx % 4 == 0, # optimize every few frames
-            # optimize= frame_idx % 3680 == 0, # optimize every 300 frames
         )
-        bundle_adjuster.prev_ts = ts
 
     optimized_pose_list = bundle_adjuster.get_trajectory()
     optimized_pose_dict = {
@@ -1225,7 +1237,7 @@ def run_depth_variant(
         raise ValueError("Number of rectified frames and depth frames must match.")
 
     KLT_TRACKER.reset()
-    RELATIVE_POSE_INITIALIZER.reset(sequence_sample)
+    RELATIVE_POSE_INITIALIZER.reset_with_gt(sequence_sample)
     track_history: list[dict[int, TrackObservation]] = []
     sequence_results: list[dict[str, Any]] = []
 
