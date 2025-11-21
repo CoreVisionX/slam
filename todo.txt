@@ -7,3 +7,4 @@ nice to haves tbh, get the VIO working on the robot first:
 - loosen python version requirements
 - create a config catalog for different environments
 - figure out licensing (for this package and any problematic depedencies/data)
+- performance profiling output/data in rerun (and logs)
