@@ -57,8 +57,8 @@ data_pipeline:
     - _target_: tests.datasets.pipeline.LoadSequenceStage
       loader:
         _target_: tests.datasets.loaders.EurocSequenceLoader
-        seq_name: VI_02_medium
-        sequence_length: 2000
+        seq_name: VI_01_easy
+        sequence_length: 500
         base_seed: 15
         sampling_mode: contiguous
         min_stride: 1
