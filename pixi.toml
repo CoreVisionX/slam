@@ -5,63 +5,22 @@ name = "slam"
 platforms = ["linux-aarch64", "osx-arm64"]
 version = "0.1.0"
 
-[system-requirements]
-cuda = "12"
-
 [tasks]
 
 [dependencies]
-python = ">=3.10,<3.11"                  # Jetson GPU wheels exist; 3.12 often doesn't
+python = ">=3.10,<3.11"
 pip = ">=25.2,<26"
 hydra-core = ">=1.3.2,<2"
-optuna = ">=4.6.0,<5"
 
-# Cross-platform-safe (for Jetson) PyPI deps
 [pypi-dependencies]
 gtsam-develop = ">=4.3a0.dev202510200041, <5"
-kornia = ">=0.8.1, <0.9"
-opencv-python-headless = ">=4.12.0.88, <5"   # headless on Jetson
+opencv-python-headless = ">=4.12.0.88, <5"
 rerun-sdk = ">=0.27.2, <0.28"
-open3d = ">=0.18.0, <0.20"
+tqdm = ">=4.66.0, <5"
 
-# ------------ Jetson CUDA 12.6 (JetPack 6.2.x) ------------
-[feature.jetson-cu126]
-platforms = ["linux-aarch64"]
-
-[feature.jetson-cu126.pypi-options]
-index-url = "https://pypi.jetson-ai-lab.io/jp6/cu126"
-extra-index-urls = [
-  "https://pypi.nvidia.com/simple",
-  "https://pypi.org/simple"
-]
-# default index-strategy ("first-index") — SAFE
-
-[feature.jetson-cu126.pypi-dependencies]
-torch = { version = "==2.8.0", index = "https://pypi.jetson-ai-lab.io/jp6/cu126" }
-torchvision = { version = "*", index = "https://pypi.jetson-ai-lab.io/jp6/cu126" }
-onnxruntime-gpu = { version = "*", index = "https://pypi.jetson-ai-lab.io/jp6/cu126" }
-flash-attn = { version = "*", index = "https://pypi.jetson-ai-lab.io/jp6/cu126" }
-triton = ">=3.5.0, <4"
-
-# ------------ Mac OS feature ------------
-[feature.macos]
-platforms = ["osx-arm64"]
-
-[feature.macos.pypi-dependencies]
-torch = "*"
-torchvision = "*"
-
-# ------------ Dev feature ------------
 [feature.dev.pypi-dependencies]
-tartanair = { editable = true, path = "submodules/tartanairpy" }
 ipykernel = ">=7.1.0, <8"
 matplotlib = ">=3.10.7, <4"
 
-# ------------ Environments ------------
-[environments.dev-jetson-cu126]
-features = ["dev", "jetson-cu126"]
-solve-group = "jetson-cu126"
-
-[environments.dev-macos]
-features = ["dev", "macos"]
-solve-group = "macos"
+[environments.dev]
+features = ["dev"]

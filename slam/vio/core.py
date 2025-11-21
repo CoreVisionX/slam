@@ -4,9 +4,9 @@ from typing import Sequence
 import gtsam
 import numpy as np
 from hydra.utils import instantiate
-from slam.local_vo.bundle_adjustment import FixedLagBundleAdjuster, finite_difference_velocity
-from slam.local_vo.klt_tracker import KLTFeatureTracker
-from slam.local_vo.relative_pose import RelativePnPInitializer
+from slam.vio.bundle_adjustment import FixedLagBundleAdjuster, finite_difference_velocity
+from slam.vio.klt_tracker import KLTFeatureTracker
+from slam.vio.relative_pose import RelativePnPInitializer
 from registration.registration import RectifiedStereoFrame, StereoDepthFrame
 from depth.sgbm import SGBM
 from .config import VIOConfig, compute_vio_calibration

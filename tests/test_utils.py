@@ -6,13 +6,18 @@ from typing import Dict, Tuple, Generic, TypeVar
 import cv2
 import gtsam
 from registration.registration import RectifiedStereoFrame, StereoCalibration, StereoFrame, FramePairWithGroundTruth
-import tartanair as ta
 from cvx_utils import convert_coordinate_frame, se3_flattened_to_pose3
 import numpy as np
 
-# setup tartanair
+try:
+    import tartanair as ta  # type: ignore
+except ImportError:  # pragma: no cover
+    ta = None
+
+# setup tartanair if available
 tartanair_data_root = str(Path(__file__).parent / 'data')
-ta.init(tartanair_data_root)
+if ta is not None:
+    ta.init(tartanair_data_root)
 
 kitti_data_root = Path(__file__).parent / 'data' / 'ktti'
 

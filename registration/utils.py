@@ -1,8 +1,6 @@
 import cv2
 import gtsam
 import numpy as np
-import torch
-import kornia as K
 
 from registration.registration import FramePair, MatchedFramePair, RectifiedStereoFrame, StereoDepthFrame, FeatureFrame, StereoFrame
 
@@ -38,11 +36,6 @@ def draw_matches(pair: FramePair[RectifiedStereoFrame], mkpts1: np.ndarray, mkpt
 
     return combined_img
 
-def np_to_kornia(np_array: np.ndarray) -> torch.Tensor:
-    assert np_array.ndim == 3 and np_array.shape[-1] == 3
-
-    return K.image_to_tensor(np_array, keepdim=False).float() / 255.0
-
 def get_matching_keypoints(kp1, kp2, idxs):
     mkpts1 = kp1[idxs[:, 0]]
     mkpts2 = kp2[idxs[:, 1]]
@@ -59,20 +52,11 @@ def fundamental_fitler(mkpts1: np.ndarray, mkpts2: np.ndarray) -> tuple[np.ndarr
 
 
 def solve_pnp(pair: MatchedFramePair[FeatureFrame]) -> tuple[gtsam.Pose3, MatchedFramePair[FeatureFrame]]:
-    # mkpts1 = pair.first.features['keypoints'].cpu().numpy()[pair.matches[:, 0]]
-    # mkpts2 = pair.second.features['keypoints'].cpu().numpy()[pair.matches[:, 1]]
     mkpts1, mkpts2 = get_matching_keypoints(
-        kp1=pair.first.features['keypoints'].cpu().numpy() if isinstance(pair.first.features['keypoints'], torch.Tensor) else pair.first.features['keypoints'],
-        kp2=pair.second.features['keypoints'].cpu().numpy() if isinstance(pair.second.features['keypoints'], torch.Tensor) else pair.second.features['keypoints'],
+        kp1=pair.first.features['keypoints'],
+        kp2=pair.second.features['keypoints'],
         idxs=pair.matches
     )
-
-    # u = mkpts1[:, 1].astype(int)
-    # v = mkpts1[:, 0].astype(int)
-
-    # mkpts1_3d = pair.first.left_depth_xyz[u, v, :]
-    # mkpts1_depth = pair.first.left_depth[u, v]
-    # mkpts1_color = pair.first.left[u, v]
 
     mkpts1_3d = pair.first.features['keypoints_3d'][pair.matches[:, 0]]
     mkpts1_depth = pair.first.features['keypoints_depth'][pair.matches[:, 0]]

@@ -2,7 +2,7 @@ from pathlib import Path
 
 from tqdm import tqdm
 
-from slam.local_vo.bundle_adjustment import finite_difference_velocity
+from slam.vio.bundle_adjustment import finite_difference_velocity
 from slam.vio import save_tum_sequence
 from slam.vio.core import VIO
 from tests.datasets.pipeline import SequencePreprocessor, load_euroc_pipeline

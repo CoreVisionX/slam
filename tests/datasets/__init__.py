@@ -6,7 +6,7 @@ from .pipeline import (
     RectifyFramesStage,
     DepthEstimationStage,
 )
-from .loaders import EurocSequenceLoader, TartanAirSequenceLoader
+from .loaders import EurocSequenceLoader
 from .rectifiers import StereoSequenceRectifier
 from .depth_estimators import (
     GroundTruthDepthEstimator,
@@ -21,7 +21,6 @@ __all__ = [
     "RectifyFramesStage",
     "DepthEstimationStage",
     "EurocSequenceLoader",
-    "TartanAirSequenceLoader",
     "StereoSequenceRectifier",
     "GroundTruthDepthEstimator",
     "SGBMDepthEstimator",
