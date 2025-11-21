@@ -254,8 +254,7 @@ class VIO:
 
         return rect_frame, depth_frame
 
-# TODO: logging information like how many observations were added, how many were rejected, how many active landmarks there are, 3D logs of the landmarks as the evolve throughout the sequence will all be super helpful for debugging
-# TODO: make sure it logs the KLT features in 2D space like klt.py with correct class ids assigned. It would be so awesome if you could assign the same class ids to the 3D landmarks as well
+# TODO: provide a blueprint too
 # this is a prime example of something you should be careful to do composition over inheritance for
 # don't rewrite a bunch of rerun logging functions because you do low level rerun logging the same way in a bunch
 # of different domain specific classes
