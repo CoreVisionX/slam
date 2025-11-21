@@ -19,6 +19,8 @@ from .types import VIOEstimate
 # TODO: see if switching to CombinedImuFactors helps on longer sequences by accounting for IMU bias drift
 # TODO: see if relative pose initialization via Imu Preintegration is better than PnP
 
+# support for absolute orientation with magnometers (or even GPS) would be super useful and not that hard to add
+
 # TODO: see if adding keyframing helps accuracy and performance at all. definitely could by making longer lag windows much more feasible
 # TODO: see if adding a minimum number of observations per landmark before it's added to the graph helps accuracy
 
