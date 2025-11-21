@@ -1,12 +1,13 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Any, Sequence
 
 from hydra.utils import instantiate
-from omegaconf import DictConfig, ListConfig
 from registration.registration import RectifiedStereoFrame, StereoDepthFrame
 import tests.test_utils as test_utils
+from slam.hydra_utils import compose_config, extract_target_config
 
 
 @dataclass
@@ -136,3 +137,13 @@ class DepthEstimationStage:
         rectified = state.require_rectified_frames()
         depth_frames = self.estimator.build(sequence, rectified, max_depth=max_depth)
         state.add_depth_variant(DepthVariant(label=self.label, frames=depth_frames))
+
+
+def load_euroc_pipeline(
+    config_path: str | Path,
+    overrides: Sequence[str] | None = None,
+    **override_kwargs: object,
+) -> SequencePreprocessor:
+    cfg = compose_config(config_path, overrides=overrides, **override_kwargs)
+    pipeline_cfg = extract_target_config(cfg, context=str(config_path))
+    return instantiate(pipeline_cfg, _convert_="partial")

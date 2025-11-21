@@ -1,5 +1,9 @@
+from pathlib import Path
+from typing import Sequence
+
 import gtsam
 import numpy as np
+from hydra.utils import instantiate
 from slam.local_vo.bundle_adjustment import FixedLagBundleAdjuster, finite_difference_velocity
 from slam.local_vo.klt_tracker import KLTFeatureTracker
 from slam.local_vo.relative_pose import RelativePnPInitializer
@@ -9,8 +13,10 @@ from .config import VIOConfig, compute_vio_calibration
 from .types import VIOEstimate
 from .io import VIORerunLogger
 from .imu_preintegration import ImuPreintegrator
+from slam.hydra_utils import compose_config, extract_target_config
 
 # TODO: see if switching to CombinedImuFactors helps on longer sequences by accounting for IMU bias drift
+# TODO: see if relative pose initialization via Imu Preintegration is better than PnP
 
 # TODO: see if adding keyframing helps accuracy and performance at all. definitely could by making longer lag windows much more feasible
 # TODO: see if adding a minimum number of observations per landmark before it's added to the graph helps accuracy
@@ -194,3 +200,13 @@ class VIO:
         depth_frame = self.sgbm.compute_depth(rect_frame)
 
         return rect_frame, depth_frame
+
+    @staticmethod
+    def from_config(
+        config_path: str | Path,
+        overrides: Sequence[str] | None = None,
+        **override_kwargs: object,
+    ) -> "VIO":
+        cfg = compose_config(config_path, overrides=overrides, **override_kwargs)
+        vio_cfg = extract_target_config(cfg, context=str(config_path))
+        return instantiate(vio_cfg)

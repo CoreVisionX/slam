@@ -1,30 +1,24 @@
-from slam.local_vo.bundle_adjustment import finite_difference_velocity
-import hydra
-from hydra.utils import instantiate
-from omegaconf import DictConfig
 from pathlib import Path
+
 from tqdm import tqdm
 
-from slam.vio.core import VIO
+from slam.local_vo.bundle_adjustment import finite_difference_velocity
 from slam.vio import save_tum_sequence
-from tests.datasets.pipeline import SequencePreprocessor
+from slam.vio.core import VIO
+from tests.datasets.pipeline import SequencePreprocessor, load_euroc_pipeline
 
 
-# TODO: there should be an easy way to load VIO that doesn't require knowing anything about hydra. Just have a library function that uses compose with default or overriden config options and instantiates the VIO class in one easy line
-@hydra.main(version_base=None, config_path="config", config_name="vio_config")
-def main(cfg: DictConfig):
-    # Instantiate VIO directly from config
-    vio: VIO = instantiate(cfg.vio)
-    
-    # Load data pipeline
-    pipeline: SequencePreprocessor = instantiate(cfg.data_pipeline, _convert_="partial")
+def run_vio(vio_config_path: Path, data_config_path: Path) -> None:
+    vio: VIO = VIO.from_config(vio_config_path)
+
+    pipeline: SequencePreprocessor = load_euroc_pipeline(data_config_path)
     preprocessed = pipeline.prepare(seed=13, max_depth=40.0)
     rectified_frames = preprocessed.rectified_frames
     sequence = preprocessed.sequence
     
     print(f"Processing {len(rectified_frames)} frames...")
 
-    # Reset VIO with initial state
+    # Reset VIO with the initial ground truth state
     gt_pose = sequence.world_poses[0]
     next_gt_pose = sequence.world_poses[1]
     dt = sequence.frame_timestamps[1] - sequence.frame_timestamps[0]
@@ -55,6 +49,15 @@ def main(cfg: DictConfig):
     # Save TUM trajectory
     output_path = Path(__file__).parent / "results" / "vio_estimated.txt"
     save_tum_sequence(vio.get_estimated_trajectory(), str(output_path))
+
+
+def main() -> None:
+    config_dir = Path(__file__).parent / "config"
+    run_vio(
+        vio_config_path=config_dir / "vio.yaml",
+        data_config_path=config_dir / "euroc_pipeline.yaml",
+    )
+
 
 if __name__ == "__main__":
     main()
