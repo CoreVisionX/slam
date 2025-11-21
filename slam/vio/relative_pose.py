@@ -6,8 +6,8 @@ from typing import Any
 import gtsam
 import numpy as np
 
-from registration.registration import MatchedFramePair, RectifiedStereoFrame, StereoDepthFrame
-from registration.utils import solve_pnp
+from slam.registration.registration import MatchedFramePair, RectifiedStereoFrame, StereoDepthFrame
+from slam.registration.utils import solve_pnp
 
 from .feature_utils import build_feature_frame, extract_keypoint_attributes, make_feature_frame_for_view
 from .klt_tracker import TrackObservation

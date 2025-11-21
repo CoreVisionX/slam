@@ -2,7 +2,7 @@ import cv2
 import gtsam
 import numpy as np
 
-from registration.registration import FramePair, MatchedFramePair, RectifiedStereoFrame, StereoDepthFrame, FeatureFrame, StereoFrame
+from .registration import FramePair, MatchedFramePair, RectifiedStereoFrame, StereoDepthFrame, FeatureFrame, StereoFrame
 
 def rectify_stereo_frame_pair(pair: FramePair[StereoFrame]) -> FramePair[RectifiedStereoFrame]:
     first_rect = pair.first.rectify()

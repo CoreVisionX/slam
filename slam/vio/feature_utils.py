@@ -4,7 +4,7 @@ from typing import Any
 
 import numpy as np
 
-from registration.registration import FeatureFrame, RectifiedStereoFrame, StereoDepthFrame
+from slam.registration.registration import FeatureFrame, RectifiedStereoFrame, StereoDepthFrame
 
 
 def extract_keypoint_attributes(

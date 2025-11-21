@@ -4,8 +4,8 @@ from dataclasses import dataclass
 import cv2
 import numpy as np
 
-from depth.sgbm import SGBM
-from registration.registration import (
+from slam.depth.sgbm import SGBM
+from slam.registration.registration import (
     RectifiedStereoFrame,
     StereoCalibration,
     StereoDepthFrame,

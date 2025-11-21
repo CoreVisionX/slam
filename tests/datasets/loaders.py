@@ -1,8 +1,9 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from pathlib import Path
 
-from registration.registration import RectifiedStereoFrame
+from slam.registration.registration import RectifiedStereoFrame
 import tests.test_utils as test_utils
 
 
@@ -10,6 +11,7 @@ import tests.test_utils as test_utils
 class EurocSequenceLoader:
     """Loads a EuRoC V1/V2 sequence segment."""
 
+    data_root: str | Path | None = None
     seq_name: str = "MH_01_easy"
     sequence_length: int = 6000
     base_seed: int = 0
@@ -27,7 +29,14 @@ class EurocSequenceLoader:
         seed: int | None = None,
     ) -> test_utils.FrameSequenceWithGroundTruth[RectifiedStereoFrame]:
         load_seed = self.base_seed if seed is None else seed
+        resolved_root = None
+        if self.data_root is not None:
+            resolved_root = Path(self.data_root)
+            if not resolved_root.is_absolute():
+                resolved_root = Path(__file__).resolve().parents[2] / resolved_root
+
         return test_utils.load_euroc_sequence_segment(
+            data_root=resolved_root,
             seq_name=self.seq_name,
             sequence_length=self.sequence_length,
             seed=load_seed,

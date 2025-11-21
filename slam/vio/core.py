@@ -4,16 +4,17 @@ from typing import Sequence
 import gtsam
 import numpy as np
 from hydra.utils import instantiate
+
+from slam.depth.sgbm import SGBM
+from slam.hydra_utils import compose_config, extract_target_config
+from slam.registration.registration import RectifiedStereoFrame, StereoDepthFrame
 from slam.vio.bundle_adjustment import FixedLagBundleAdjuster, finite_difference_velocity
 from slam.vio.klt_tracker import KLTFeatureTracker
 from slam.vio.relative_pose import RelativePnPInitializer
-from registration.registration import RectifiedStereoFrame, StereoDepthFrame
-from depth.sgbm import SGBM
 from .config import VIOConfig, compute_vio_calibration
-from .types import VIOEstimate
 from .io import VIORerunLogger
 from .imu_preintegration import ImuPreintegrator
-from slam.hydra_utils import compose_config, extract_target_config
+from .types import VIOEstimate
 
 # TODO: see if switching to CombinedImuFactors helps on longer sequences by accounting for IMU bias drift
 # TODO: see if relative pose initialization via Imu Preintegration is better than PnP

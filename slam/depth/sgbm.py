@@ -6,7 +6,7 @@ from typing import Literal, Optional
 import cv2
 import numpy as np
 
-from registration.registration import FramePair, RectifiedStereoFrame, StereoDepthFrame
+from slam.registration.registration import FramePair, RectifiedStereoFrame, StereoDepthFrame
 
 
 class SGBM:

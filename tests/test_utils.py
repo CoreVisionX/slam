@@ -5,8 +5,8 @@ from typing import Dict, Tuple, Generic, TypeVar
 
 import cv2
 import gtsam
-from registration.registration import RectifiedStereoFrame, StereoCalibration, StereoFrame, FramePairWithGroundTruth
-from cvx_utils import convert_coordinate_frame, se3_flattened_to_pose3
+from slam.registration.registration import RectifiedStereoFrame, StereoCalibration, StereoFrame, FramePairWithGroundTruth
+from slam.cvx_utils import convert_coordinate_frame, se3_flattened_to_pose3
 import numpy as np
 
 try:
@@ -14,12 +14,24 @@ try:
 except ImportError:  # pragma: no cover
     ta = None
 
+PROJECT_ROOT = Path(__file__).resolve().parent.parent
+DATA_ROOT = PROJECT_ROOT / "tests" / "data"
+
 # setup tartanair if available
-tartanair_data_root = str(Path(__file__).parent / 'data')
+tartanair_data_root = str(DATA_ROOT)
 if ta is not None:
     ta.init(tartanair_data_root)
 
-kitti_data_root = Path(__file__).parent / 'data' / 'ktti'
+kitti_data_root = DATA_ROOT / 'ktti'
+euroc_data_root = DATA_ROOT / "euroc"
+
+
+def _resolve_data_root(path: str | Path | None) -> Path:
+    """Resolve a dataset root to an absolute path."""
+    base = Path(path) if path is not None else euroc_data_root
+    if not base.is_absolute():
+        base = PROJECT_ROOT / base
+    return base
 
 # converts the TartanAir coordinate frame to the CV coordinate frame
 TA_TO_CV = np.array([
@@ -1162,8 +1174,7 @@ import yaml
 
 # Folder layout expected:
 # data/euroc/<SEQ>/mav0/{cam0,cam1,imu0,state_groundtruth_estimate0}
-euroc_data_root = Path(__file__).parent / "data" / "euroc"
-_euroc_sequence_cache: dict[str, "EuRoCSequence"] = {}
+_euroc_sequence_cache: dict[tuple[str, str], "EuRoCSequence"] = {}
 
 EUROC_WORLD_GRAVITY = np.array([0.0, 0.0, -9.81], dtype=np.float64)  # ENU, z-up
 
@@ -1598,11 +1609,15 @@ def _load_euroc_imu_measurements_camframe(
 def _load_euroc_sequence(
     seq_name: str = "MH_01_easy",
     alpha: float = 0.0,
+    data_root: str | Path | None = None,
 ) -> EuRoCSequence:
-    if seq_name in _euroc_sequence_cache:
-        return _euroc_sequence_cache[seq_name]
+    base_root = _resolve_data_root(data_root)
+    cache_key = (str(base_root), seq_name)
 
-    root = euroc_data_root / seq_name / "mav0"
+    if cache_key in _euroc_sequence_cache:
+        return _euroc_sequence_cache[cache_key]
+
+    root = base_root / seq_name / "mav0"
     cam0_dir = root / "cam0"
     cam1_dir = root / "cam1"
     imu_dir = root / "imu0"
@@ -1677,7 +1692,7 @@ def _load_euroc_sequence(
         distortion_model_left=dml,
         distortion_model_right=dmr,
     )
-    _euroc_sequence_cache[seq_name] = seq
+    _euroc_sequence_cache[cache_key] = seq
     return seq
 
 
@@ -1729,6 +1744,8 @@ def _scale_calibration_for_resize(calib: StereoCalibration, new_w: int, new_h: i
 
 # are we rectifying correctly?
 def load_euroc_sequence_segment(
+    *,
+    data_root: str | Path | None = None,
     seq_name: str = "MH_01_easy",
     sequence_length: int = 4,
     seed: int = 0,
@@ -1751,7 +1768,9 @@ def load_euroc_sequence_segment(
     if max_stride < min_stride:
         raise ValueError("max_stride must be >= min_stride.")
 
-    seq = _load_euroc_sequence(seq_name, alpha=alpha)
+    base_root = _resolve_data_root(data_root)
+
+    seq = _load_euroc_sequence(seq_name, alpha=alpha, data_root=base_root)
     N = len(seq.left_paths)
     if N < sequence_length:
         print(f"Sequence too short for requested length {sequence_length}, using full sequence length of {N}.")
@@ -1829,6 +1848,7 @@ def load_euroc_sequence_segment(
 
 def get_euroc_iterator_with_odometry(
     seq_name: str = "MH_01_easy",
+    data_root: str | Path | None = None,
     rotation_noise_sigmas: np.ndarray | None = None,
     translation_noise_sigmas: np.ndarray | None = None,
     include_ground_truth: bool = False,
@@ -1836,7 +1856,8 @@ def get_euroc_iterator_with_odometry(
     resize_to: tuple[int, int] | None = None,
 ):
     """Yields (StereoFrame, noisy_prev_to_curr [, first_to_curr]) on rectified (and optionally resized) frames."""
-    seq = _load_euroc_sequence(seq_name, alpha=alpha)
+    base_root = _resolve_data_root(data_root)
+    seq = _load_euroc_sequence(seq_name, alpha=alpha, data_root=base_root)
 
     if rotation_noise_sigmas is None:
         rotation_noise_sigmas = np.zeros(3, dtype=np.float64)
@@ -1887,8 +1908,9 @@ def get_euroc_iterator_with_odometry(
             yield frame, noisy_rel
 
 
-def get_euroc_calibration(seq_name: str = "MH_01_easy") -> StereoCalibration:
-    return _load_euroc_sequence(seq_name).calibration
+def get_euroc_calibration(seq_name: str = "MH_01_easy", data_root: str | Path | None = None) -> StereoCalibration:
+    base_root = _resolve_data_root(data_root)
+    return _load_euroc_sequence(seq_name, data_root=base_root).calibration
 
 
 def estimate_world_gravity_from_first_batch(sequence, g=9.81, max_batches=50, normalize_to_g=False):

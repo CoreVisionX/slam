@@ -3,6 +3,7 @@ stages:
   - _target_: tests.datasets.pipeline.LoadSequenceStage
     loader:
       _target_: tests.datasets.loaders.EurocSequenceLoader
+      data_root: tests/data/euroc
       seq_name: VI_02_medium
       sequence_length: 200
       base_seed: 15

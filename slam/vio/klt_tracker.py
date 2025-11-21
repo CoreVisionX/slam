@@ -6,7 +6,7 @@ from typing import Any
 import cv2
 import numpy as np
 
-from registration.registration import RectifiedStereoFrame, StereoDepthFrame
+from slam.registration.registration import RectifiedStereoFrame, StereoDepthFrame
 
 from .feature_utils import extract_keypoint_attributes
 

@@ -12,7 +12,7 @@ import gtsam
 import numpy as np
 from gtsam.symbol_shorthand import B, L, V, X
 
-from registration.registration import RectifiedStereoFrame, StereoDepthFrame
+from slam.registration.registration import RectifiedStereoFrame, StereoDepthFrame
 
 from .klt_tracker import FeatureTrack, TrackObservation
 from slam.vio.imu_preintegration import ImuPreintegrationConfig

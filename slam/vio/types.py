@@ -1,7 +1,7 @@
 from dataclasses import dataclass
 import numpy as np
 import gtsam
-from registration.registration import StereoCalibration
+from slam.registration.registration import StereoCalibration
 
 @dataclass
 class VIOEstimate:

@@ -2,9 +2,10 @@ import rerun as rr
 import numpy as np
 import gtsam
 from typing import Sequence, Mapping
-from slam.vio.klt_tracker import TrackObservation
-from registration.registration import RectifiedStereoFrame, StereoDepthFrame
-from viz import rr_log_pose, rr_log_trajectory
+
+from slam.registration.registration import RectifiedStereoFrame, StereoDepthFrame
+from slam.viz import rr_log_pose, rr_log_trajectory
+from .klt_tracker import TrackObservation
 from .types import VIOEstimate
 
 class VIORerunLogger:

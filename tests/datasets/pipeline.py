@@ -5,7 +5,7 @@ from pathlib import Path
 from typing import Any, Sequence
 
 from hydra.utils import instantiate
-from registration.registration import RectifiedStereoFrame, StereoDepthFrame
+from slam.registration.registration import RectifiedStereoFrame, StereoDepthFrame
 import tests.test_utils as test_utils
 from slam.hydra_utils import compose_config, extract_target_config
 

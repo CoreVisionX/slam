@@ -1,6 +1,6 @@
 import gtsam
 import rerun as rr
-from registration.registration import RectifiedStereoFrame, StereoDepthFrame
+from slam.registration.registration import RectifiedStereoFrame, StereoDepthFrame
 
 
 def rr_log_pose(

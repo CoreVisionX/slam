@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
-from registration.registration import RectifiedStereoFrame, StereoFrame
+from slam.registration.registration import RectifiedStereoFrame, StereoFrame
 import tests.test_utils as test_utils
 
 
