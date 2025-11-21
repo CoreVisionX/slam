@@ -89,7 +89,7 @@ IMU_VELOCITY_PRIOR_SIGMA = 10.0
 # IMU_BIAS_PRIOR_SIGMAS = np.array([0.01, 0.01, 0.01, 0.01, 0.01, 0.01], dtype=float) * 100.0
 
 # IMU_GRAVITY_VECTOR = np.array([0.0, 0.0, IMU_GRAVITY_MAGNITUDE], dtype=float)
-IMU_GRAVITY_VECTOR = np.array([0.0, IMU_GRAVITY_MAGNITUDE, 0.0], dtype=float)
+IMU_GRAVITY_VECTOR = np.array([0.0, 0.0, -IMU_GRAVITY_MAGNITUDE], dtype=float)
 
 RESULTS_DIR = Path(__file__).parent / "results"
 RESULTS_PATH = RESULTS_DIR / "klt_local_vo_bundle_adjustment.npz"
@@ -124,7 +124,7 @@ if isinstance(bundle_adjuster_cfg, dict):
 else:
     bundle_adjuster_config = BundleAdjustmentConfig()
 BUNDLE_ADJUSTER: FixedLagBundleAdjuster = FixedLagBundleAdjuster(bundle_adjuster_config)
-DATA_PIPELINE: SequencePreprocessor = instantiate(LOCAL_VO_CFG.data_pipeline, _recursive_=False)
+DATA_PIPELINE: SequencePreprocessor = instantiate(LOCAL_VO_CFG.data_pipeline, _convert_="partial")
 
 TRACKING_MAX_DEPTH = float(getattr(getattr(KLT_TRACKER, "config", None), "max_depth", 40.0))
 PNP_MAX_DEPTH = float(getattr(getattr(RELATIVE_POSE_INITIALIZER, "config", None), "max_depth", 40.0))
@@ -205,7 +205,8 @@ print(f"Primary depth variant: {DEPTH_MODE}")
 
 def create_preintegration_params(sequence=None) -> gtsam.PreintegrationParams:
     params = gtsam.PreintegrationParams.MakeSharedU(IMU_GRAVITY_MAGNITUDE)
-    params.n_gravity = IMU_GRAVITY_VECTOR if sequence is None else test_utils.estimate_world_gravity_from_first_batch(sequence)
+    # params.n_gravity = IMU_GRAVITY_VECTOR if sequence is None else test_utils.estimate_world_gravity_from_first_batch(sequence)
+    params.n_gravity = IMU_GRAVITY_VECTOR
     params.setAccelerometerCovariance(np.eye(3) * (IMU_ACCEL_NOISE ** 2))
     params.setGyroscopeCovariance(np.eye(3) * (IMU_GYRO_NOISE ** 2))
     # params.setAccelerometerBiasCovariance(np.eye(3) * (LOCAL_VO_CFG.bundle_adjuster.imu_bias_prior_sigmas[0] ** 2))
@@ -421,28 +422,42 @@ def run_fixed_lag_adjustment(
     T_right_from_left = T_left_inv @ T_B_from_S1_mat
     baseline = np.linalg.norm(T_right_from_left[:3, 3])
 
-    vio_config = VIOConfig(
-        gravity=IMU_GRAVITY_VECTOR,
-        imu_from_left=T_B_from_S0_mat,
-        imu_from_right=T_B_from_S1_mat,
-        baseline=baseline,
-        K_left_rect=calib.K_left_rect,
-        K_right_rect=calib.K_right_rect,
-        width=calib.width,
-        height=calib.height,
-        optimize_every=4, # Hardcoded to match previous logic or config
-    )
+    # vio_config = VIOConfig(
+    #     gravity=IMU_GRAVITY_VECTOR,
+    #     imu_from_left=T_B_from_S0_mat,
+    #     imu_from_right=T_B_from_S1_mat,
+    #     baseline=baseline,
+    #     K_left_rect=calib.K_left_rect,
+    #     K_right_rect=calib.K_right_rect,
+    #     width=calib.width,
+    #     height=calib.height,
+    #     optimize_every=4, # Hardcoded to match previous logic or config
+    # )
 
-    # Instantiate VIO
-    # We use the global KLT_TRACKER and RELATIVE_POSE_INITIALIZER
-    # Note: VIO will reset them, so the previous tracking results in run_depth_variant might be invalidated
-    # if we were relying on the tracker state, but we passed track_history and tracks as args.
-    vio = VIO(
-        config=vio_config,
-        feature_tracker=KLT_TRACKER,
-        relative_pose_initializer=RELATIVE_POSE_INITIALIZER,
-        ba=bundle_adjuster
-    )
+    # # Instantiate VIO
+    # # We use the global KLT_TRACKER and RELATIVE_POSE_INITIALIZER
+    # # Note: VIO will reset them, so the previous tracking results in run_depth_variant might be invalidated
+    # # if we were relying on the tracker state, but we passed track_history and tracks as args.
+    # vio = VIO(
+    #     config=vio_config,
+    #     feature_tracker=KLT_TRACKER,
+    #     relative_pose_initializer=RELATIVE_POSE_INITIALIZER,
+    #     ba=bundle_adjuster
+    # )
+
+    # Instansiate VIO using it's hydra config
+    config_dir = Path(__file__).parent / "config"
+    with initialize_config_dir(
+            config_dir=str(config_dir),
+            job_name="local_vo_bundle_adjustment",
+            version_base=None,
+        ):
+        cfg = compose("vio_config")
+        vio = instantiate(cfg.vio)
+
+    vio_config = vio.config
+
+    bundle_adjuster = vio.ba
 
     frames_for_ba = list(range(len(rectified_frames)))
     
@@ -491,6 +506,12 @@ def run_fixed_lag_adjustment(
         pim = gtsam.PreintegratedImuMeasurements(params, bias)
         if frame_idx < len(sequence_sample.imu_measurements):
              _integrate_imu_batch(pim, sequence_sample.imu_measurements[frame_idx])
+
+        print(f"K_left_rect: {rectified_frames[frame_idx].calibration.K_left_rect}")
+        print(f"K_right_rect: {rectified_frames[frame_idx].calibration.K_right_rect}")
+        print(f"Baseline: {rectified_frames[frame_idx].calibration.T}")
+        print(f"imu_from_left: {rectified_frames[frame_idx].calibration.T_B_from_S0}")
+        print(f"imu_from_right: {rectified_frames[frame_idx].calibration.T_B_from_S1}")
         
         vio.process(
             timestamp=ts,

@@ -968,6 +968,8 @@ class FixedLagBundleAdjuster:
         self.frame_idx = 0
         self.prev_ts = 0.0
 
+        self.ts = []
+
         self.smoother = None
         self.smoothed_values = None
         self.full_values = None
@@ -994,6 +996,8 @@ class FixedLagBundleAdjuster:
 
         self.frame_idx = 0
         self.prev_ts = ts
+
+        self.ts.append(ts)
 
         self._add_prior_factors(ts, pose, velocity)
 
@@ -1028,6 +1032,8 @@ class FixedLagBundleAdjuster:
 
         self.prev_ts = ts
 
+        self.ts.append(ts)
+
     def optimize(self) -> None:
         self._prune_unconstrained_values()
         try:
@@ -1046,11 +1052,17 @@ class FixedLagBundleAdjuster:
     def get_trajectory(self) -> list[gtsam.Pose3]:
         return [self.full_values.atPose3(X(i)) for i in range(self.frame_idx + 1)]
 
+    def get_trajectory_velocities(self) -> list[np.ndarray]:
+        return [self.full_values.atVector(V(i)) for i in range(self.frame_idx + 1)]
+
     def get_latest_pose(self) -> gtsam.Pose3:
         return self.full_values.atPose3(X(self.frame_idx))
 
     def get_latest_velocity(self) -> np.ndarray:
         return self.full_values.atVector(V(self.frame_idx))
+
+    def get_bias(self) -> gtsam.imuBias.ConstantBias:
+        return self.full_values.atConstantBias(B(0))
 
     # =========================================================================
     # Helpers

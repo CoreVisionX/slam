@@ -1735,7 +1735,7 @@ def load_euroc_sequence_segment(
     imu_noise_tau_bias: float = 500.0,
     alpha: float = 0.0,                  # stereoRectify alpha (0=crop more, 1=keep FOV)
     resize_to: tuple[int, int] | None = None,  # e.g., (640, 480) or (640, 640)
-) -> FrameSequenceWithGroundTruth[StereoFrame]:
+) -> FrameSequenceWithGroundTruth[RectifiedStereoFrame]:
     """Analogous to load_tartanair_sequence_segment, but for EuRoC with proper rectification and IMU/camera conversions."""
     if sequence_length < 2:
         raise ValueError("sequence_length must be at least 2.")
@@ -1752,34 +1752,34 @@ def load_euroc_sequence_segment(
         print(f"Sequence too short for requested length {sequence_length}, using full sequence length of {N}.")
         sequence_length = N
 
-    rng = random.Random(seed)
-    sampling_mode = sampling_mode.lower()
-    if sampling_mode == "contiguous":
-        max_start = N - sequence_length
-        start_idx = rng.randint(0, max_start)
-        sampled = list(range(start_idx, start_idx + sequence_length))
-    elif sampling_mode == "stride":
-        sampled = []
-        max_attempts = min(1024, N * 8)
-        for _ in range(max_attempts):
-            s = rng.randint(0, N - 1)
-            cur = s
-            cand = [cur]
-            for _ in range(sequence_length - 1):
-                stride = rng.randint(min_stride, max_stride)
-                cur += stride
-                if cur >= N:
-                    break
-                cand.append(cur)
-            if len(cand) == sequence_length:
-                sampled = cand
-                break
-        if len(sampled) != sequence_length:
-            raise RuntimeError("Could not sample a sequence satisfying stride bounds.")
-    else:
-        raise ValueError("sampling_mode must be 'contiguous' or 'stride'.")
+    # rng = random.Random(seed)
+    # sampling_mode = sampling_mode.lower()
+    # if sampling_mode == "contiguous":
+    #     max_start = N - sequence_length
+    #     start_idx = rng.randint(0, max_start)
+    #     sampled = list(range(start_idx, start_idx + sequence_length))
+    # elif sampling_mode == "stride":
+    #     sampled = []
+    #     max_attempts = min(1024, N * 8)
+    #     for _ in range(max_attempts):
+    #         s = rng.randint(0, N - 1)
+    #         cur = s
+    #         cand = [cur]
+    #         for _ in range(sequence_length - 1):
+    #             stride = rng.randint(min_stride, max_stride)
+    #             cur += stride
+    #             if cur >= N:
+    #                 break
+    #             cand.append(cur)
+    #         if len(cand) == sequence_length:
+    #             sampled = cand
+    #             break
+    #     if len(sampled) != sequence_length:
+    #         raise RuntimeError("Could not sample a sequence satisfying stride bounds.")
+    # else:
+    #     raise ValueError("sampling_mode must be 'contiguous' or 'stride'.")
 
-    # sampled = list(range(sequence_length))
+    sampled = list(range(sequence_length))
 
     # Optionally scale calibration if resizing
     if resize_to is not None:
@@ -1788,7 +1788,7 @@ def load_euroc_sequence_segment(
         scaled_calib = seq.calibration
 
     # Load rectified frames (then optionally resize)
-    frames: list[StereoFrame] = []
+    frames: list[RectifiedStereoFrame] = []
     for idx in sampled:
         left = _rectify_and_load(seq.left_paths[idx], seq.calibration.map_left_x, seq.calibration.map_left_y)
         right = _rectify_and_load(seq.right_paths[idx], seq.calibration.map_right_x, seq.calibration.map_right_y)
