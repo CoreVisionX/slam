@@ -1,0 +1,5 @@
+nice to haves, get the VIO working on the robot first:
+- redo the interface of the euroc sequence loader to return an iterator of (timestamp, left_rect, right_rect, imu_acc, imu_gyro, imu_ts, gt_pose) so that it's easier to understand for people seeing the code in vio_example.py who aren't familiar with this project.
+  also add a comment at the top of the loop that explains the types/brief description of each variable
+- loosen python version requirements
+- create a config catalog for different environments
