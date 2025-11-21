@@ -190,8 +190,8 @@ class RelativePnPInitializer:
 
         try:
             relative_pose_s0, inlier_pair = solve_pnp(matched_pair)
-            T_B_from_S0 = prev_rectified.calibration.T_B_from_S0
-            relative_pose = T_B_from_S0 * relative_pose_s0 * T_B_from_S0.inverse()
+            imu_from_left = prev_rectified.calibration.imu_from_left
+            relative_pose = imu_from_left * relative_pose_s0 * imu_from_left.inverse()
         except Exception as exc:  # noqa: BLE001
             result = {
                 "frame_index": frame_index,

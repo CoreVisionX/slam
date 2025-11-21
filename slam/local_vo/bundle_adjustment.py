@@ -553,10 +553,10 @@ class IncrementalBundleAdjuster:
                 continue
 
             with (profiler.section("world point init") if profiler else nullcontext()):
-                T_B_from_S0 = rectified_frames[track.anchor_frame].calibration.T_B_from_S0
+                imu_from_left = rectified_frames[track.anchor_frame].calibration.imu_from_left
                 anchor_pose = values.atPose3(X(track.anchor_frame))
                 anchor_point_S0 = gtsam.Point3(*track.anchor_point3.tolist())
-                world_point = anchor_pose.compose(T_B_from_S0).transformFrom(anchor_point_S0)
+                world_point = anchor_pose.compose(imu_from_left).transformFrom(anchor_point_S0)
                 world_point_np = self._point3_like_to_numpy(world_point)
 
             with (profiler.section("collect track observations") if profiler else nullcontext()):
@@ -600,7 +600,7 @@ class IncrementalBundleAdjuster:
                                 X(frame_idx),
                                 L(landmark_key),
                                 stereo_calibration,
-                                rectified_frames[frame_idx].calibration.T_B_from_S0,
+                                rectified_frames[frame_idx].calibration.imu_from_left,
                             )
                         )
                         stereo_counts[frame_idx] += 1
@@ -620,7 +620,7 @@ class IncrementalBundleAdjuster:
                                     X(frame_idx),
                                     L(landmark_key),
                                     stereo_calibration,
-                                    rectified_frames[frame_idx].calibration.T_B_from_S0,
+                                    rectified_frames[frame_idx].calibration.imu_from_left,
                                 )
                             )
                             stereo_counts[frame_idx] += 1
@@ -632,7 +632,7 @@ class IncrementalBundleAdjuster:
                                     X(frame_idx),
                                     L(landmark_key),
                                     calibration,
-                                    rectified_frames[frame_idx].calibration.T_B_from_S0,
+                                    rectified_frames[frame_idx].calibration.imu_from_left,
                                 )
                             )
                             mono_counts[frame_idx] += 1
@@ -699,7 +699,7 @@ class IncrementalBundleAdjuster:
 
         # Pose of the left camera in the body frame is constant across frames.
         # Smart factors treat X(i) as the body pose, so we pass body_P_sensor once.
-        body_P_sensor = rectified_frames[0].calibration.T_B_from_S0
+        body_P_sensor = rectified_frames[0].calibration.imu_from_left
 
         # Smart factors require *plain* isotropic noise in pixel space
         smart_pixel_sigma = float(self.config.projection_noise_px)
@@ -716,12 +716,12 @@ class IncrementalBundleAdjuster:
 
             # World point computed only for gating (same as in explicit-landmark mode)
             with (profiler.section("world point init (smart)") if profiler else nullcontext()):
-                T_B_from_S0 = rectified_frames[track.anchor_frame].calibration.T_B_from_S0
+                imu_from_left = rectified_frames[track.anchor_frame].calibration.imu_from_left
                 # Here we assume you treat X(k) as the body pose as in the explicit-landmark pipeline.
                 # For motion-only we only use this to gate reprojections.
                 anchor_pose = values.atPose3(X(track.anchor_frame))  # see note below
                 anchor_point_S0 = gtsam.Point3(*track.anchor_point3.tolist())
-                world_point = anchor_pose.compose(T_B_from_S0).transformFrom(anchor_point_S0)
+                world_point = anchor_pose.compose(imu_from_left).transformFrom(anchor_point_S0)
                 world_point_np = self._point3_like_to_numpy(world_point)
 
             with (profiler.section("collect track obs (smart)") if profiler else nullcontext()):
@@ -782,8 +782,8 @@ class IncrementalBundleAdjuster:
         translations: list[np.ndarray] = []
         for slot, frame_idx in enumerate(frames_for_ba):
             pose_initial = values.atPose3(X(frame_idx))
-            T_B_from_S0 = rectified_frames[frame_idx].calibration.T_B_from_S0
-            cam_pose = pose_initial.compose(T_B_from_S0)
+            imu_from_left = rectified_frames[frame_idx].calibration.imu_from_left
+            cam_pose = pose_initial.compose(imu_from_left)
             rot_world_from_cam = cam_pose.rotation().matrix()
             t_world_from_cam = self._point3_like_to_numpy(cam_pose.translation())
             rot_cam_from_world = rot_world_from_cam.T
@@ -1015,7 +1015,7 @@ class FixedLagBundleAdjuster:
         }
 
         # Extract Extrinsics (Body -> Sensor)
-        body_P_sensor = frame.calibration.T_B_from_S0
+        body_P_sensor = frame.calibration.imu_from_left
         
         # Predict Initial Guess
         prev_pose = self.full_values.atPose3(X(self.frame_idx))

@@ -1325,8 +1325,8 @@ def _read_euroc_groundtruth(gt_dir: Path) -> tuple[np.ndarray, list[gtsam.Pose3]
 # ----------- Helpers -----------
 @dataclass
 class EuRoCStereoCalibration(StereoCalibration):
-    T_B_from_S0: gtsam.Pose3
-    T_B_from_S1: gtsam.Pose3
+    imu_from_left: gtsam.Pose3
+    imu_from_right: gtsam.Pose3
 
 # how near is nearest?
 def _nearest_indices(src_times: np.ndarray, ref_times: np.ndarray) -> np.ndarray:
@@ -1408,14 +1408,14 @@ def _stereo_rectify_from_yaml(
     # Parse both cameras
     c0 = _load_euroc_camera_yaml(cam0_yaml)
     c1 = _load_euroc_camera_yaml(cam1_yaml)
-    K0, D0, w0, h0, T_B_from_S0, dm0 = c0["K"], c0["D"], c0["width"], c0["height"], c0["T_imu_from_cam"], c0["distortion_model"]
-    K1, D1, w1, h1, T_B_from_S1, dm1 = c1["K"], c1["D"], c1["width"], c1["height"], c1["T_imu_from_cam"], c1["distortion_model"]
+    K0, D0, w0, h0, imu_from_left, dm0 = c0["K"], c0["D"], c0["width"], c0["height"], c0["T_imu_from_cam"], c0["distortion_model"]
+    K1, D1, w1, h1, imu_from_right, dm1 = c1["K"], c1["D"], c1["width"], c1["height"], c1["T_imu_from_cam"], c1["distortion_model"]
 
     if (w0 != w1) or (h0 != h1):
         raise ValueError("EuRoC left/right image sizes differ; unify before rectification.")
 
     # Compute stereo extrinsic camera right (1) <- left (0)
-    T_S1_from_S0 = se3_inverse(T_B_from_S1) @ T_B_from_S0 
+    T_S1_from_S0 = se3_inverse(imu_from_right) @ imu_from_left 
     R_S1_from_S0 = T_S1_from_S0[:3, :3].astype(np.float64, copy=False)
     t_S1_from_S0 = T_S1_from_S0[:3, 3].astype(np.float64, copy=False).reshape(3, 1)
     size = (w0, h0)
@@ -1454,11 +1454,11 @@ def _stereo_rectify_from_yaml(
         map_right_y=map1y,
         width=w0,
         height=h0,
-        T_B_from_S0=gtsam.Pose3(gtsam.Rot3(T_B_from_S0[:3, :3]), gtsam.Point3(T_B_from_S0[:3, 3])),
-        T_B_from_S1=gtsam.Pose3(gtsam.Rot3(T_B_from_S1[:3, :3]), gtsam.Point3(T_B_from_S1[:3, 3])),
+        imu_from_left=gtsam.Pose3(gtsam.Rot3(imu_from_left[:3, :3]), gtsam.Point3(imu_from_left[:3, 3])),
+        imu_from_right=gtsam.Pose3(gtsam.Rot3(imu_from_right[:3, :3]), gtsam.Point3(imu_from_right[:3, 3])),
     )
     # return both B<-S matrices for later use and distortion models
-    return calib, T_B_from_S0, T_B_from_S1, dm0, dm1
+    return calib, imu_from_left, imu_from_right, dm0, dm1
 
 
 # ----------- IMU chunking -----------
@@ -1609,8 +1609,8 @@ def _load_euroc_sequence(
         raise FileNotFoundError("Missing sensor.yaml for cam0/cam1 (required for calibration).")
 
     # Stereo calibration + extrinsics from EuRoC yaml
-    # NOTE: T_B_from_S0, T_B_from_S1 here are actually EuRoC T_BS (IMU <- cam)
-    calibration, T_B_from_S0, T_B_from_S1, dml, dmr = _stereo_rectify_from_yaml(
+    # NOTE: imu_from_left, imu_from_right here are actually EuRoC T_BS (IMU <- cam)
+    calibration, imu_from_left, imu_from_right, dml, dmr = _stereo_rectify_from_yaml(
         cam0_dir / "sensor.yaml", cam1_dir / "sensor.yaml", alpha=alpha
     )
 
@@ -1623,11 +1623,11 @@ def _load_euroc_sequence(
     gt_t, gt_world_T_imu, gt_vel_world = _read_euroc_groundtruth(gt_dir)
 
     # EuRoC yaml extrinsic: IMU <- cam0 (sensor to body)
-    R_B_from_S0 = T_B_from_S0[:3, :3].astype(np.float64, copy=False)
-    t_B_from_S0 = T_B_from_S0[:3, 3].astype(np.float64, copy=False)
+    R_B_from_S0 = imu_from_left[:3, :3].astype(np.float64, copy=False)
+    imu_from_left = imu_from_left[:3, 3].astype(np.float64, copy=False)
     B_from_S0 = gtsam.Pose3(
         gtsam.Rot3(R_B_from_S0),
-        gtsam.Point3(t_B_from_S0),
+        gtsam.Point3(imu_from_left),
     )
 
     poses_B_from_world: list[gtsam.Pose3] = []

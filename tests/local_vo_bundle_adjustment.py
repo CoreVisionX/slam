@@ -363,9 +363,9 @@ def _initialize_fixed_lag_landmarks(
         anchor_pose = pose_dict.get(track.anchor_frame)
         if anchor_pose is None:
             continue
-        T_B_from_S0 = rectified_frames[track.anchor_frame].calibration.T_B_from_S0
+        imu_from_left = rectified_frames[track.anchor_frame].calibration.imu_from_left
         anchor_point = gtsam.Point3(*track.anchor_point3.tolist())
-        world_point = anchor_pose.compose(T_B_from_S0).transformFrom(anchor_point)
+        world_point = anchor_pose.compose(imu_from_left).transformFrom(anchor_point)
         key = L(track_id)
         if not bundle_adjuster.full_values.exists(key):
             bundle_adjuster.full_values.insert(key, world_point)
@@ -408,24 +408,24 @@ def run_fixed_lag_adjustment(
 
     # Construct VIO Config from the first frame's calibration
     calib = rectified_frames[0].calibration
-    # Calculate baseline from T_B_from_S0 and T_B_from_S1
-    # Assuming T_B_from_S1 = T_B_from_S0 * T_S0_from_S1
-    # T_S0_from_S1 = inv(T_B_from_S0) * T_B_from_S1
+    # Calculate baseline from imu_from_left and imu_from_right
+    # Assuming imu_from_right = imu_from_left * T_S0_from_S1
+    # T_S0_from_S1 = inv(imu_from_left) * imu_from_right
     # baseline is usually -Tx of T_S1_from_S0 (or Tx of T_S0_from_S1 if right is S1)
     # Let's use the norm of the translation between cameras
     
-    # T_B_from_S0 is gtsam.Pose3 in EuRoCStereoCalibration
-    T_B_from_S0_mat = calib.T_B_from_S0.matrix()
-    T_B_from_S1_mat = calib.T_B_from_S1.matrix()
+    # imu_from_left is gtsam.Pose3 in EuRoCStereoCalibration
+    imu_from_left_mat = calib.imu_from_left.matrix()
+    imu_from_right_mat = calib.imu_from_right.matrix()
     
-    T_left_inv = se3_inverse(T_B_from_S0_mat)
-    T_right_from_left = T_left_inv @ T_B_from_S1_mat
+    T_left_inv = se3_inverse(imu_from_left_mat)
+    T_right_from_left = T_left_inv @ imu_from_right_mat
     baseline = np.linalg.norm(T_right_from_left[:3, 3])
 
     # vio_config = VIOConfig(
     #     gravity=IMU_GRAVITY_VECTOR,
-    #     imu_from_left=T_B_from_S0_mat,
-    #     imu_from_right=T_B_from_S1_mat,
+    #     imu_from_left=imu_from_left_mat,
+    #     imu_from_right=imu_from_right_mat,
     #     baseline=baseline,
     #     K_left_rect=calib.K_left_rect,
     #     K_right_rect=calib.K_right_rect,
@@ -510,8 +510,8 @@ def run_fixed_lag_adjustment(
         print(f"K_left_rect: {rectified_frames[frame_idx].calibration.K_left_rect}")
         print(f"K_right_rect: {rectified_frames[frame_idx].calibration.K_right_rect}")
         print(f"Baseline: {rectified_frames[frame_idx].calibration.T}")
-        print(f"imu_from_left: {rectified_frames[frame_idx].calibration.T_B_from_S0}")
-        print(f"imu_from_right: {rectified_frames[frame_idx].calibration.T_B_from_S1}")
+        print(f"imu_from_left: {rectified_frames[frame_idx].calibration.imu_from_left}")
+        print(f"imu_from_right: {rectified_frames[frame_idx].calibration.imu_from_right}")
         
         vio.process(
             timestamp=ts,

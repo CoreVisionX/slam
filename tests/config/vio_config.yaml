@@ -1,8 +1,8 @@
 vio:
-  _target_: tests.vio_example.VIO
+  _target_: slam.vio.core.VIO
 
   config:
-    _target_: tests.vio_example.VIOConfig
+    _target_: slam.vio.config.VIOConfig
     gravity: [0.0, 0.0, -9.80665]
     imu_from_left:
       - [0.0148655429818, -0.999880929698, 0.00414029679422, -0.0216401454975]
@@ -49,6 +49,8 @@ vio:
     max_depth: 40.0
 
   # TODO: remove unused params
+  # TODO: add params for configuring the LM/iSAM2 optimizer (and choosing between them!) and see if tweaking them can yield any performance improvements
+  # TODO: huber/cauchy k parameters (good candidates for leveraging _target_ to directly instansiate the gtsam nosie models)
   ba:
     _target_: slam.local_vo.bundle_adjustment.FixedLagBundleAdjuster
     config:
@@ -85,7 +87,8 @@ vio:
       lag: 8.0
 
   logger:
-    _target_: tests.vio_example.VIORerunLogger
+    _target_: slam.vio.io.VIORerunLogger
+
     spawn: true
     feature_radii: 4.0
     image_plane_dist: 0.6
@@ -97,8 +100,8 @@ data_pipeline:
     - _target_: tests.datasets.pipeline.LoadSequenceStage
       loader:
         _target_: tests.datasets.loaders.EurocSequenceLoader
-        seq_name: VI_01_easy
-        sequence_length: 5000
+        seq_name: VI_02_medium
+        sequence_length: 200
         base_seed: 15
         sampling_mode: contiguous
         min_stride: 1
