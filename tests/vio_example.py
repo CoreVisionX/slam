@@ -169,7 +169,7 @@ class VIO:
             dt=dt
         )
 
-        self.ba.process(
+        ba_stats = self.ba.process(
             frame=depth_frame,
             ts=timestamp,
             relative_pose=relative_pose,
@@ -191,6 +191,7 @@ class VIO:
                 frame=depth_frame,
                 trajectory=trajectory,
                 observations=observations,
+                ba_stats=ba_stats,
             )
 
         t = latest_pose.translation()
@@ -287,6 +288,7 @@ class VIORerunLogger:
         frame: RectifiedStereoFrame | StereoDepthFrame,
         trajectory: Sequence[gtsam.Pose3],
         observations: Mapping[int, TrackObservation],
+        ba_stats: Mapping[str, int] | None = None,
     ) -> None:
         """Log the current VIO step to rerun."""
         rr.set_time("frame", sequence=frame_idx)
@@ -294,6 +296,7 @@ class VIORerunLogger:
         self._log_pose(pose, frame)
         self._log_trajectory(trajectory)
         self._log_klt_features(observations)
+        self._log_bundle_stats(ba_stats)
 
     def _log_pose(self, pose: gtsam.Pose3, frame: RectifiedStereoFrame | StereoDepthFrame) -> None:
         rr_log_pose(f"{self._base_path}/pose", pose, frame, camera_xyz=self.view_coordinates)
@@ -309,7 +312,7 @@ class VIORerunLogger:
 
         if observation_count == 0:
             rr.log(image_path, rr.Points2D(np.empty((0, 2), dtype=np.float32)))
-            rr.log(f"{self._base_path}/klt/n_observations", rr.Scalars(0))
+            rr.log(f"{self._base_path}/klt/observations", rr.Scalars(0))
             return
 
         obs_items = list(observations.items())
@@ -320,9 +323,17 @@ class VIORerunLogger:
             rr.Points2D(points, radii=3.0, class_ids=class_ids),
         )
         rr.log(
-            f"{self._base_path}/klt/n_observations",
+            f"{self._base_path}/klt/observations",
             rr.Scalars(observation_count),
         )
+
+    def _log_bundle_stats(self, stats: Mapping[str, int] | None) -> None:
+        if not stats:
+            return
+
+        base_path = f"{self._base_path}/bundle_adjustment"
+        for key in stats.keys():
+            rr.log(f"{base_path}/{key}", rr.Scalars(int(stats[key])))
 
 
 # TODO: factor out into an output/eval utils file or something

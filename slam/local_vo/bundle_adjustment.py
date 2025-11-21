@@ -1001,8 +1001,18 @@ class FixedLagBundleAdjuster:
 
         self._add_prior_factors(ts, pose, velocity)
 
-    def process(self, frame: StereoDepthFrame, ts: float, relative_pose: gtsam.Pose3, estimated_velocity: np.ndarray, landmark_observations: Mapping[int, TrackObservation], pim: gtsam.PreintegratedImuMeasurements, optimize: bool = True, profile: bool = False) -> None:
+    def process(self, frame: StereoDepthFrame, ts: float, relative_pose: gtsam.Pose3, estimated_velocity: np.ndarray, landmark_observations: Mapping[int, TrackObservation], pim: gtsam.PreintegratedImuMeasurements, optimize: bool = True, profile: bool = False) -> dict[str, int]:
         profiler = _SectionProfiler(log_prefix="fixed_lag_bundle_adjustment.process")
+
+        stats: dict[str, int] = {
+            "frame_idx": self.frame_idx + 1,
+            "selected": 0,
+            "features_added": 0,
+            "rejected_depth": 0,
+            "rejected_reprojection": 0,
+            "rejected_not_selected": 0,
+            "active_landmarks": 0,
+        }
 
         # Extract Extrinsics (Body -> Sensor)
         body_P_sensor = frame.calibration.T_B_from_S0
@@ -1023,7 +1033,7 @@ class FixedLagBundleAdjuster:
 
         # 2. Process Landmarks
         with profiler.section("process_landmarks"):
-            self._process_explicit_landmarks(frame, landmark_observations, body_P_sensor, ts)
+            self._process_explicit_landmarks(frame, landmark_observations, body_P_sensor, ts, stats=stats)
 
         # 3. Optimize
         if optimize:
@@ -1033,6 +1043,10 @@ class FixedLagBundleAdjuster:
         self.prev_ts = ts
 
         self.ts.append(ts)
+
+        stats["active_landmarks"] = self._count_active_landmarks()
+
+        return stats
 
     def optimize(self) -> None:
         self._prune_unconstrained_values()
@@ -1068,7 +1082,20 @@ class FixedLagBundleAdjuster:
     # Helpers
     # =========================================================================
 
-    def _process_explicit_landmarks(self, frame: StereoDepthFrame, observations, body_P_sensor, ts):
+    def _count_active_landmarks(self) -> int:
+        """Count landmarks that are still inside the fixed-lag smoother window."""
+        active_keys: set[int] = set()
+        if self.smoothed_values is not None:
+            for key in self.smoothed_values.keys():
+                if gtsam.Symbol(key).chr() == ord("l"):
+                    active_keys.add(key)
+        if self.new_values is not None:
+            for key in self.new_values.keys():
+                if gtsam.Symbol(key).chr() == ord("l"):
+                    active_keys.add(key)
+        return len(active_keys)
+
+    def _process_explicit_landmarks(self, frame: StereoDepthFrame, observations, body_P_sensor, ts, stats: dict[str, int] | None = None):
         # Prepare Calibration / Noise
         K = frame.calibration.K_left_rect
         calib = gtsam.Cal3_S2(float(K[0,0]), float(K[1,1]), float(K[0,1]), float(K[0,2]), float(K[1,2]))
@@ -1079,7 +1106,11 @@ class FixedLagBundleAdjuster:
         )
         
         # Select the best tracks
+        initial_observation_count = len(observations)
         observations = self._select_best_tracks(observations)
+        if stats is not None:
+            stats["selected"] = len(observations)
+            stats["rejected_not_selected"] += max(initial_observation_count - len(observations), 0)
         
         # Stereo Noise
         sigma = self.config.projection_noise_px
@@ -1098,6 +1129,8 @@ class FixedLagBundleAdjuster:
         for original_track_id, obs in observations.items():
             # Filter Invalid Depth
             if obs.depth is None or not np.isfinite(obs.depth) or obs.depth <= 0.0 or obs.depth > 40.0:
+                if stats is not None:
+                    stats["rejected_depth"] += 1
                 continue
 
             # ID Management
@@ -1131,8 +1164,12 @@ class FixedLagBundleAdjuster:
                     projected_pt2 = camera.project(existing_point)
                     residual = projected_pt2 - gtsam.Point2(float(obs.keypoint[0]), float(obs.keypoint[1]))
                     if np.linalg.norm(residual) ** 2 > self.config.reprojection_gating_threshold_px ** 2:
+                        if stats is not None:
+                            stats["rejected_reprojection"] += 1
                         continue
                 except RuntimeError:
+                    if stats is not None:
+                        stats["rejected_reprojection"] += 1
                     continue
 
                 # Landmark exists in history.
@@ -1140,6 +1177,8 @@ class FixedLagBundleAdjuster:
                 if self.smoothed_values.exists(key_L) or self.new_values.exists(key_L):
                     # It's alive. Add factor.
                     self.new_factors.add(factor)
+                    if stats is not None:
+                        stats["features_added"] += 1
                 else:
                     # It was marginalized out (exists in full_values but not smoothed).
                     # FIX 5: Do NOT bring it back with the same ID.
@@ -1164,6 +1203,8 @@ class FixedLagBundleAdjuster:
                         stereo_calib, body_P_sensor
                     )
                     self.new_factors.add(new_factor)
+                    if stats is not None:
+                        stats["features_added"] += 1
 
                     # TODO: factor out the landmark prior construction into a function
                     # TODO: make sure this doesn't end up effectively overruling outlier rejection of the robust noise models on the projection factors
@@ -1179,6 +1220,8 @@ class FixedLagBundleAdjuster:
                 self.full_values.insert(key_L, point)
                 self.new_timestamps[key_L] = ts
                 self.new_factors.add(factor)
+                if stats is not None:
+                    stats["features_added"] += 1
 
                 # TODO: make sure the 1e+2 still works as well as the 5e-0 on the euroc VI sequences
                 # TODO: add a hydra config option for the landmark prior sigmas, this new BA seems to work fine in the euroc vicon room sequences, but doesn't on the machine hall ones, maybe it has to do with a larger range of depth and this landmark prior noise model could be more tight? either way it needs to be configurable. try a looser configuration and see if that improves performance on the machine hall sequences.
