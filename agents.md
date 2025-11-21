@@ -1,0 +1,3 @@
+- To run any python code in this repo's venv, use `pixi run -e dev-macos python`
+- Prefer composition over inheritance. It's better to have modular and atomic code you can pull in when necessary than an inflexible inheritance structure that results in repeating the same logic in a bunch of places that's hard to maintain and debug
+- Don't introduce unnecessary error handling for situations that are going to be catastrophic failures no matter how you try to handle them. Prefer simplicity over unnecessary complexity.

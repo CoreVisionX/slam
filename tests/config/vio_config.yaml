@@ -26,6 +26,7 @@ vio:
     width: 752
     height: 480
     optimize_every: 4
+    log_every: 1
 
   feature_tracker:
     _target_: slam.local_vo.klt_tracker.KLTFeatureTracker
@@ -86,6 +87,8 @@ vio:
   logger:
     _target_: tests.vio_example.VIORerunLogger
     spawn: true
+    feature_radii: 4.0
+    image_plane_dist: 0.6
   
 
 data_pipeline:
@@ -95,7 +98,7 @@ data_pipeline:
       loader:
         _target_: tests.datasets.loaders.EurocSequenceLoader
         seq_name: VI_01_easy
-        sequence_length: 500
+        sequence_length: 5000
         base_seed: 15
         sampling_mode: contiguous
         min_stride: 1

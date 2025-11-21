@@ -50,6 +50,9 @@ class VIOConfig:
     # bundle adjustment
     optimize_every: int
 
+    # logging
+    log_every: int
+
     def __post_init__(self):
         if not isinstance(self.gravity, np.ndarray):
             self.gravity = np.array(self.gravity)
@@ -183,7 +186,7 @@ class VIO:
         latest_velocity = self.ba.get_latest_velocity()
         trajectory = self.ba.get_trajectory()
 
-        if self.logger is not None:
+        if self.logger is not None and self.ba.frame_idx % self.config.log_every == 0:
             self.logger.log_step(
                 frame_idx=self.ba.frame_idx,
                 timestamp=timestamp,
@@ -268,6 +271,8 @@ class VIORerunLogger:
         view_coordinates: rr.ViewCoordinates = rr.ViewCoordinates.RIGHT_HAND_X_UP,
         trajectory_thickness: float = 0.008,
         trajectory_color: tuple[int, int, int] = (0, 0, 255),
+        feature_radii: float = 3.0,
+        image_plane_dist: float = 2.0,
     ) -> None:
         rr.init(app_id, spawn=spawn)
 
@@ -278,6 +283,8 @@ class VIORerunLogger:
         self.view_coordinates = view_coordinates
         self.trajectory_thickness = trajectory_thickness
         self.trajectory_color = trajectory_color
+        self.feature_radii = feature_radii
+        self.image_plane_dist = image_plane_dist
 
     def log_step(
         self,
@@ -301,7 +308,7 @@ class VIORerunLogger:
         self._log_bundle_stats(ba_stats)
 
     def _log_pose(self, pose: gtsam.Pose3, frame: RectifiedStereoFrame | StereoDepthFrame) -> None:
-        rr_log_pose(f"{self._base_path}/pose", pose, frame, camera_xyz=self.view_coordinates)
+        rr_log_pose(f"{self._base_path}/pose", pose, frame, camera_xyz=self.view_coordinates, image_plane_dist=self.image_plane_dist)
 
     def _log_trajectory(self, trajectory: Sequence[gtsam.Pose3]) -> None:
         if not trajectory:
@@ -322,7 +329,7 @@ class VIORerunLogger:
         class_ids = [track_id for track_id, _ in obs_items]
         rr.log(
             image_path,
-            rr.Points2D(points, radii=3.0, class_ids=class_ids),
+            rr.Points2D(points, radii=self.feature_radii, class_ids=class_ids),
         )
         rr.log(
             f"{self._base_path}/klt/observations",
