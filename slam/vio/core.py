@@ -8,6 +8,9 @@ from depth.sgbm import SGBM
 from .config import VIOConfig, compute_vio_calibration
 from .types import VIOEstimate
 from .io import VIORerunLogger
+from .imu_preintegration import ImuPreintegrator
+
+# TODO: see if switching to CombinedImuFactors helps on longer sequences by accounting for IMU bias drift
 
 # TODO: see if adding keyframing helps accuracy and performance at all. definitely could by making longer lag windows much more feasible
 # TODO: see if adding a minimum number of observations per landmark before it's added to the graph helps accuracy
@@ -23,19 +26,53 @@ class VIO:
         feature_tracker: KLTFeatureTracker,
         relative_pose_initializer: RelativePnPInitializer,
         ba: FixedLagBundleAdjuster,
+        imu_preintegrator: ImuPreintegrator,
         logger: "VIORerunLogger | None" = None,
     ):
         self.config = config
         self.feature_tracker = feature_tracker
         self.relative_pose_initializer = relative_pose_initializer
         self.ba = ba
+        self.imu_preintegrator = imu_preintegrator
         self.logger = logger
 
         self.calibration = compute_vio_calibration(config)
         self.sgbm = SGBM() # TODO: configure sgbm via hydra too. definitely need to support max depth at least
 
-    # TODO: do imu preintegration in here
-    def process(self, timestamp: float, left_rect: np.ndarray, right_rect: np.ndarray, pim: gtsam.PreintegratedImuMeasurements):
+    def process(
+        self,
+        timestamp: float,
+        left_rect: np.ndarray,
+        right_rect: np.ndarray,
+        imu_acc: np.ndarray,
+        imu_gyro: np.ndarray,
+        imu_ts: np.ndarray,
+    ) -> VIOEstimate:
+        """
+        Process a single frame with IMU measurements.
+        
+        Args:
+            timestamp: Frame timestamp
+            left_rect: Rectified left image
+            right_rect: Rectified right image
+            imu_acc: IMU linear accelerations (N x 3)
+            imu_gyro: IMU angular velocities (N x 3)
+            imu_ts: IMU timestamps (N,)
+        
+        Returns:
+            VIOEstimate with pose, velocity, and timestamp
+        """
+        # Calculate time deltas from timestamps
+        imu_dts = np.diff(imu_ts, prepend=self.prev_imu_ts)
+        self.prev_imu_ts = imu_ts[-1]  # Update to last timestamp
+        
+        # Preintegrate IMU measurements
+        self.imu_preintegrator.integrate_batch(
+            linear_accelerations=imu_acc,
+            angular_velocities=imu_gyro,
+            dts=imu_dts,
+        )
+        
         rect_frame, depth_frame = self.preprocess_frame(left_rect, right_rect)
 
         observations = self.feature_tracker.track_frame(rect_frame, depth_frame)        
@@ -72,10 +109,14 @@ class VIO:
             relative_pose=relative_pose,
             estimated_velocity=estimated_velocity,
             landmark_observations=observations,
-            pim=pim,
+            pim=self.imu_preintegrator.pim,
             optimize=(self.ba.frame_idx % self.config.optimize_every == 0),
             profile=False,
         )
+        
+        # Update IMU preintegrator with latest bias estimate
+        self.imu_preintegrator.reset(self.ba.get_bias())
+        
         latest_pose = self.ba.get_latest_pose()
         latest_velocity = self.ba.get_latest_velocity()
         trajectory = self.ba.get_trajectory()
@@ -117,6 +158,9 @@ class VIO:
         if v is None:
             v = np.zeros(3)
         self.ba.reset(ts=timestamp, pose=gtsam.Pose3(gtsam.Rot3(R), t), velocity=v)
+        
+        # Initialize IMU timestamp tracking
+        self.prev_imu_ts = timestamp
 
         estimate = VIOEstimate(timestamp=timestamp, t=t, R=R, v=v)
         return estimate

@@ -36,20 +36,27 @@ bundle_adjuster:
       0.0001,
       0.0001,
     ]
-  imu_gravity_magnitude: 9.80665
-  imu_accel_noise: 0.002
-  imu_gyro_noise: 0.00017
-  imu_integration_noise: 0.0005
-  imu_velocity_prior_sigma: 10.0
-  imu_bias_prior_sigmas:
-    [0.003, 0.003, 0.003, 1.9393e-05, 1.9393e-05, 1.9393e-05]
-  imu_bias_prior_for_factors: [0.01, 0.01, 0.01, 0.001, 0.001, 0.001]
+      0.0001,
+    ]
   max_landmarks: 10000000000
   max_observations_per_landmark: 100000000
   use_motion_only_smart_factors: false
   light_relative_pose_sigmas: [3.0, 3.0, 3.0, 3.0, 3.0, 3.0]
   min_depth: 0.0
   lag: 8.0
+  imu_bias_prior_for_factors: [0.01, 0.01, 0.01, 0.001, 0.001, 0.001]
+
+imu_preintegrator:
+  _target_: slam.vio.imu_preintegration.ImuPreintegrator
+  config:
+    _target_: slam.vio.imu_preintegration.ImuPreintegrationConfig
+    gravity_magnitude: 9.80665
+    accel_noise: 0.002
+    gyro_noise: 0.00017
+    integration_noise: 0.0005
+    velocity_prior_sigma: 10.0
+    bias_prior_sigmas: [0.003, 0.003, 0.003, 1.9393e-05, 1.9393e-05, 1.9393e-05]
+    bias_prior_for_factors: [0.01, 0.01, 0.01, 0.001, 0.001, 0.001]
 
 data_pipeline:
   _target_: tests.datasets.pipeline.SequencePreprocessor

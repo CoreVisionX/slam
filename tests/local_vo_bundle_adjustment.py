@@ -41,7 +41,9 @@ from slam.local_vo import (  # noqa: E402
     RelativePnPInitializer,
     TrackObservation,
 )
-from tests.vio_example import VIO, VIOConfig
+from slam.vio.imu_preintegration import ImuPreintegrationConfig
+from slam.vio.core import VIO
+from tests.vio_example import VIOConfig
 from tests.datasets.pipeline import SequencePreprocessor
 
 # TODO: expressing disparity uncertainty for depth measurements in BA properly might help a ton
@@ -203,15 +205,31 @@ device = "cuda" if torch.cuda.is_available() else "cpu"
 print(f"Using device: {device}")
 print(f"Primary depth variant: {DEPTH_MODE}")
 
-def create_preintegration_params(sequence=None) -> gtsam.PreintegrationParams:
-    params = gtsam.PreintegrationParams.MakeSharedU(IMU_GRAVITY_MAGNITUDE)
+def create_preintegration_params(sequence=None, imu_config: ImuPreintegrationConfig | None = None) -> gtsam.PreintegrationParams:
+    if imu_config is None:
+        # Fallback to globals if no config provided (for backward compatibility or other tests)
+        gravity = IMU_GRAVITY_MAGNITUDE
+        accel_noise = IMU_ACCEL_NOISE
+        gyro_noise = IMU_GYRO_NOISE
+        integration_noise = IMU_INTEGRATION_NOISE
+    else:
+        gravity = imu_config.gravity_magnitude
+        accel_noise = imu_config.accel_noise
+        gyro_noise = imu_config.gyro_noise
+        integration_noise = imu_config.integration_noise
+
+    params = gtsam.PreintegrationParams.MakeSharedU(gravity)
     # params.n_gravity = IMU_GRAVITY_VECTOR if sequence is None else test_utils.estimate_world_gravity_from_first_batch(sequence)
-    params.n_gravity = IMU_GRAVITY_VECTOR
-    params.setAccelerometerCovariance(np.eye(3) * (IMU_ACCEL_NOISE ** 2))
-    params.setGyroscopeCovariance(np.eye(3) * (IMU_GYRO_NOISE ** 2))
+    if imu_config is not None:
+         params.n_gravity = np.array([0.0, 0.0, -gravity]) # Assuming gravity is aligned with Z down
+    else:
+         params.n_gravity = IMU_GRAVITY_VECTOR
+         
+    params.setAccelerometerCovariance(np.eye(3) * (accel_noise ** 2))
+    params.setGyroscopeCovariance(np.eye(3) * (gyro_noise ** 2))
     # params.setAccelerometerBiasCovariance(np.eye(3) * (LOCAL_VO_CFG.bundle_adjuster.imu_bias_prior_sigmas[0] ** 2))
     # params.setBiasOmegaCovariance(np.eye(3) * (LOCAL_VO_CFG.bundle_adjuster.imu_bias_prior_sigmas[3] ** 2))
-    params.setIntegrationCovariance(np.eye(3) * (IMU_INTEGRATION_NOISE ** 2))
+    params.setIntegrationCovariance(np.eye(3) * (integration_noise ** 2))
     return params
 
 
@@ -454,6 +472,7 @@ def run_fixed_lag_adjustment(
         ):
         cfg = compose("vio_config")
         vio = instantiate(cfg.vio)
+        imu_preintegrator = instantiate(cfg.imu_preintegrator)
 
     vio_config = vio.config
 
@@ -477,7 +496,7 @@ def run_fixed_lag_adjustment(
         right_rect=rectified_frames[0].right_rect,
         t=to_numpy_vec3(first_pose.translation()),
         R=first_pose.rotation().matrix(),
-        v=first_velocity
+        v=first_velocity,
     )
 
     # Re-build initial pose dict to match return signature (though VIO doesn't expose it directly, 
@@ -486,7 +505,7 @@ def run_fixed_lag_adjustment(
     pose_initials = _build_initial_pose_dict_from_pnp(sequence_sample, sequence_results)
     initial_pose_dict = {idx: clone_pose(pose_initials[idx]) for idx in frames_for_ba}
 
-    params = create_preintegration_params(sequence_sample)
+    params = create_preintegration_params(sequence_sample, imu_preintegrator.config)
     bias = gtsam.imuBias.ConstantBias()
 
     stereo_counts, mono_counts = _count_observation_types(track_history)

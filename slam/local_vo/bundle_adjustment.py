@@ -15,6 +15,7 @@ from gtsam.symbol_shorthand import B, L, V, X
 from registration.registration import RectifiedStereoFrame, StereoDepthFrame
 
 from .klt_tracker import FeatureTrack, TrackObservation
+from slam.vio.imu_preintegration import ImuPreintegrationConfig
 
 
 @dataclass
@@ -44,30 +45,15 @@ class BundleAdjustmentConfig:
         )
         * 0.001,
     )
-    imu_gravity_magnitude: float = 9.80665
-    imu_accel_noise: float = 2.0e-3
-    imu_gyro_noise: float = 1.7e-4
-    imu_integration_noise: float = 5.0e-4
-    imu_velocity_prior_sigma: float = 10.0
-    imu_bias_prior_sigmas: Sequence[float] = field(
-        default_factory=lambda: [
-            3.0e-3,
-            3.0e-3,
-            3.0e-3,
-            1.9393e-5,
-            1.9393e-5,
-            1.9393e-5,
-        ]
-    )
-    imu_bias_prior_for_factors: Sequence[float] = field(
-        default_factory=lambda: [0.01, 0.01, 0.01, 0.001, 0.001, 0.001]
-    )
     use_motion_only_smart_factors: bool = False
     light_relative_pose_sigmas: Sequence[float] = field(
         default_factory=lambda: [0.3, 0.3, 0.3, 0.3, 0.3, 0.3]
     )
     min_depth: float = 0.2
     lag: float = 3.0
+    imu_bias_prior_for_factors: Sequence[float] = field(
+        default_factory=lambda: [0.01, 0.01, 0.01, 0.001, 0.001, 0.001]
+    )
 
 
 class _SectionProfiler:
@@ -118,6 +104,7 @@ class IncrementalBundleAdjuster:
         sequence_results: Sequence[dict[str, Any]],
         sequence_sample: Any,
         use_imu: bool = True,
+        imu_config: ImuPreintegrationConfig | None = None,
         gravity_vector: Sequence[float] | np.ndarray | None = None,
         log_prefix: str | None = None,
     ) -> dict[str, Any]:
@@ -165,8 +152,10 @@ class IncrementalBundleAdjuster:
 
         if imu_available:
             with profiler.section("imu initialization"):
+                if imu_config is None:
+                    raise ValueError("IMU configuration required when use_imu=True")
                 imu_bias_key = B(frames_for_ba[0])
-                imu_params = self._create_preintegration_params(gravity_vector)
+                imu_params = self._create_preintegration_params(imu_config, gravity_vector)
                 if not values.exists(imu_bias_key):
                     values.insert(imu_bias_key, imu_bias_initial)
 
@@ -428,21 +417,22 @@ class IncrementalBundleAdjuster:
 
     def _create_preintegration_params(
         self,
+        imu_config: ImuPreintegrationConfig,
         gravity_vector: Sequence[float] | np.ndarray | None,
     ) -> gtsam.PreintegrationCombinedParams:
-        params = gtsam.PreintegrationCombinedParams.MakeSharedU(self.config.imu_gravity_magnitude)
+        params = gtsam.PreintegrationCombinedParams.MakeSharedU(imu_config.gravity_magnitude)
         if gravity_vector is not None:
             params.n_gravity = np.asarray(gravity_vector, dtype=float)
         else:
-            params.n_gravity = np.array([0.0, 0.0, -self.config.imu_gravity_magnitude], dtype=float)
-        params.setAccelerometerCovariance(np.eye(3) * (self.config.imu_accel_noise**2))
-        params.setGyroscopeCovariance(np.eye(3) * (self.config.imu_gyro_noise**2))
-        params.setIntegrationCovariance(np.eye(3) * (self.config.imu_integration_noise**2))
+            params.n_gravity = np.array([0.0, 0.0, -imu_config.gravity_magnitude], dtype=float)
+        params.setAccelerometerCovariance(np.eye(3) * (imu_config.accel_noise**2))
+        params.setGyroscopeCovariance(np.eye(3) * (imu_config.gyro_noise**2))
+        params.setIntegrationCovariance(np.eye(3) * (imu_config.integration_noise**2))
         params.setBiasAccCovariance(
-            np.eye(3) * (self._as_array(self.config.imu_bias_prior_sigmas)[0] ** 2)
+            np.eye(3) * (self._as_array(imu_config.bias_prior_sigmas)[0] ** 2)
         )
         params.setBiasOmegaCovariance(
-            np.eye(3) * (self._as_array(self.config.imu_bias_prior_sigmas)[3] ** 2)
+            np.eye(3) * (self._as_array(imu_config.bias_prior_sigmas)[3] ** 2)
         )
         return params
 
@@ -1308,7 +1298,7 @@ class FixedLagBundleAdjuster:
         self.full_values.insert(key_bias, bias)
         self.new_timestamps[key_bias] = ts
         # Tighter initial bias prior
-        bias_noise = gtsam.noiseModel.Diagonal.Sigmas(np.array([1e-2]*3 + [1e-3]*3))
+        bias_noise = gtsam.noiseModel.Diagonal.Sigmas(np.array(self.config.imu_bias_prior_for_factors))
         self.new_factors.add(gtsam.PriorFactorConstantBias(key_bias, bias, bias_noise))
 
     def _insert_initial_values(self, curr_idx, ts, pose, velocity, prev_idx):
