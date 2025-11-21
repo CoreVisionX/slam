@@ -1,0 +1,40 @@
+klt_tracker:
+  _target_: slam.local_vo.klt_tracker.KLTFeatureTracker
+  max_feature_count: 512
+  refill_feature_ratio: 0.95
+  feature_suppression_radius: 8.0
+  fast_threshold: 25
+  fast_nonmax: true
+  fast_border: 12
+  lk_win_size: [15, 15]
+  lk_max_level: 5
+  lk_max_iterations: 40
+  lk_epsilon: 0.01
+  lk_min_eig_threshold: 0.001
+  max_depth: 40.0
+
+data_pipeline:
+  _target_: tests.datasets.pipeline.SequencePreprocessor
+  stages:
+    - _target_: tests.datasets.pipeline.LoadSequenceStage
+      loader:
+        _target_: tests.datasets.loaders.EurocSequenceLoader
+        seq_name: VI_01_easy
+        sequence_length: 500
+        base_seed: 12
+        sampling_mode: contiguous
+        min_stride: 1
+        max_stride: 1
+        add_imu_noise: false
+    - _target_: tests.datasets.pipeline.RectifyFramesStage
+      rectifier:
+        _target_: tests.datasets.rectifiers.StereoSequenceRectifier
+        force_rectification: false
+    - _target_: tests.datasets.pipeline.DepthEstimationStage
+      label: sgbm
+      estimator:
+        _target_: tests.datasets.depth_estimators.SGBMDepthEstimator
+        num_disparities: 64
+        block_size: 5
+        default_max_depth: 40.0
+  default_max_depth: 40.0
