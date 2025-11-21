@@ -6,3 +6,4 @@ nice to haves tbh, get the VIO working on the robot first:
   also add a comment at the top of the loop that explains the types/brief description of each variable
 - loosen python version requirements
 - create a config catalog for different environments
+- figure out licensing (for this package and any problematic depedencies/data)
