@@ -191,6 +191,7 @@ class VIO:
                 frame=depth_frame,
                 trajectory=trajectory,
                 observations=observations,
+                landmarks=self.ba.get_active_landmarks(),
                 ba_stats=ba_stats,
             )
 
@@ -288,6 +289,7 @@ class VIORerunLogger:
         frame: RectifiedStereoFrame | StereoDepthFrame,
         trajectory: Sequence[gtsam.Pose3],
         observations: Mapping[int, TrackObservation],
+        landmarks: Sequence[Mapping[str, object]] | None,
         ba_stats: Mapping[str, int] | None = None,
     ) -> None:
         """Log the current VIO step to rerun."""
@@ -296,6 +298,7 @@ class VIORerunLogger:
         self._log_pose(pose, frame)
         self._log_trajectory(trajectory)
         self._log_klt_features(observations)
+        self._log_landmarks(landmarks)
         self._log_bundle_stats(ba_stats)
 
     def _log_pose(self, pose: gtsam.Pose3, frame: RectifiedStereoFrame | StereoDepthFrame) -> None:
@@ -325,6 +328,21 @@ class VIORerunLogger:
         rr.log(
             f"{self._base_path}/klt/observations",
             rr.Scalars(observation_count),
+        )
+
+    def _log_landmarks(self, landmarks: Sequence[Mapping[str, object]] | None) -> None:
+        base_path = f"{self._base_path}/landmarks"
+
+        if not landmarks:
+            rr.log(base_path, rr.Points3D(np.empty((0, 3), dtype=np.float32)))
+            return
+
+        positions = np.array([lm["position"] for lm in landmarks], dtype=np.float32)
+        class_ids = [int(lm.get("original_track_id", lm.get("landmark_id", -1))) for lm in landmarks]
+
+        rr.log(
+            base_path,
+            rr.Points3D(positions, class_ids=class_ids, radii=0.01),
         )
 
     def _log_bundle_stats(self, stats: Mapping[str, int] | None) -> None:

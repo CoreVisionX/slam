@@ -1078,6 +1078,45 @@ class FixedLagBundleAdjuster:
     def get_bias(self) -> gtsam.imuBias.ConstantBias:
         return self.full_values.atConstantBias(B(0))
 
+    def get_active_landmarks(self) -> list[dict[str, np.ndarray | int]]:
+        """Return landmark positions inside the current smoothing window.
+
+        Each entry includes the active landmark id (which may differ from the
+        original track id after a respawn), the original track id, and the
+        3D position in world coordinates.
+        """
+        active: dict[int, np.ndarray] = {}
+
+        def _collect(values: gtsam.Values | None) -> None:
+            if values is None:
+                return
+            for key in values.keys():
+                symbol = gtsam.Symbol(key)
+                if symbol.chr() != ord("l"):
+                    continue
+                active[symbol.index()] = values.atPoint3(key)
+
+        _collect(self.smoothed_values)
+        _collect(self.new_values)
+
+        if not active:
+            return []
+
+        inverse_map = {current_id: original_id for original_id, current_id in self.landmark_key_map.items()}
+        landmarks = []
+        for landmark_id, position in active.items():
+            original_id = inverse_map.get(landmark_id, landmark_id)
+            landmarks.append(
+                {
+                    "landmark_id": int(landmark_id),
+                    "original_track_id": int(original_id),
+                    "position": position,
+                }
+            )
+
+        # sort by original id for deterministic ordering
+        return sorted(landmarks, key=lambda entry: entry["original_track_id"])
+
     # =========================================================================
     # Helpers
     # =========================================================================
