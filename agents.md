@@ -1,4 +1,4 @@
 - To run any python code in this repo's venv, use `pixi run python`
 - Prefer composition over inheritance. It's better to have modular and atomic code you can pull in when necessary than an inflexible inheritance structure that results in repeating the same logic in a bunch of places that's hard to maintain and debug
-- Don't introduce unnecessary error handling for situations that are going to be catastrophic failures no matter how you try to handle them. Prefer simplicity over unnecessary complexity.
+- Don't introduce unnecessary error handling for situations that aren't what the user intended, or are going to be catastrophic failures no matter how you try to handle them. Prefer simplicity over unnecessary complexity.
 - After you're finished with a feature, always run `pixi run python tests/vio_example_euroc.py` to make sure there isn't a regression. You will need to ask for approval since assessing the trajectory quality is a bit subjective.

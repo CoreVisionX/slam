@@ -11,6 +11,7 @@ from slam.hydra_utils import compose_config, extract_target_config
 from slam.registration.registration import RectifiedStereoFrame, StereoDepthFrame
 from slam.vio.bundle_adjustment import FixedLagBundleAdjuster, finite_difference_velocity
 from slam.vio.klt_tracker import KLTFeatureTracker
+from slam.vio.klt_tracker_cpp import KLTFeatureTrackerCpp
 from slam.vio.relative_pose import RelativePnPInitializer
 from .config import VIOConfig, compute_vio_calibration
 from .io import VIORerunLogger
@@ -33,7 +34,7 @@ class VIO:
     def __init__(
         self,
         config: VIOConfig,
-        feature_tracker: KLTFeatureTracker,
+        feature_tracker: KLTFeatureTracker | KLTFeatureTrackerCpp,
         relative_pose_initializer: RelativePnPInitializer,
         ba: FixedLagBundleAdjuster,
         imu_preintegrator: ImuPreintegrator,
