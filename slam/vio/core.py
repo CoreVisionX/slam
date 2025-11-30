@@ -4,6 +4,7 @@ from typing import Sequence
 import gtsam
 import numpy as np
 from hydra.utils import instantiate
+from line_profiler import profile
 
 from slam.depth.sgbm import SGBM
 from slam.hydra_utils import compose_config, extract_target_config
@@ -44,10 +45,15 @@ class VIO:
         self.ba = ba
         self.imu_preintegrator = imu_preintegrator
         self.logger = logger
+        self.keyframe_interval = config.keyframe_interval
 
         self.calibration = compute_vio_calibration(config)
         self.sgbm = SGBM() # TODO: configure sgbm via hydra too. definitely need to support max depth at least
 
+        self.frame_idx = 0
+        self.relative_pose = gtsam.Pose3.Identity() # relative pose from the latest keyframe to the current frame
+
+    @profile
     def process(
         self,
         timestamp: float,
@@ -55,7 +61,8 @@ class VIO:
         right_rect: np.ndarray,
         imu_acc: np.ndarray,
         imu_gyro: np.ndarray,
-        imu_ts: np.ndarray,
+        imu_ts: np.ndarray | None = None,
+        imu_dts: np.ndarray | None = None,
     ) -> VIOEstimate:
         """
         Process a single frame with IMU measurements.
@@ -71,9 +78,19 @@ class VIO:
         Returns:
             VIOEstimate with pose, velocity, and timestamp
         """
+
+        # increment frame index
+        self.frame_idx += 1
+        is_keyframe = self.frame_idx % self.keyframe_interval == 0
+
         # Calculate time deltas from timestamps
-        imu_dts = np.diff(imu_ts, prepend=self.prev_imu_ts)
-        self.prev_imu_ts = imu_ts[-1]  # Update to last timestamp
+        if imu_dts is not None:
+            pass
+        elif imu_ts is not None:
+            imu_dts = np.diff(imu_ts, prepend=self.prev_imu_ts)
+            self.prev_imu_ts = imu_ts[-1]  # Update to last timestamp
+        else:
+            raise ValueError("Must provide either imu_ts or imu_dts")
         
         # Preintegrate IMU measurements
         self.imu_preintegrator.integrate_batch(
@@ -82,13 +99,12 @@ class VIO:
             dts=imu_dts,
         )
         
-        rect_frame, depth_frame = self.preprocess_frame(left_rect, right_rect)
+        rect_frame = self.preprocess_frame(left_rect, right_rect)
 
-        observations = self.feature_tracker.track_frame(rect_frame, depth_frame)        
+        observations = self.feature_tracker.track_frame(rect_frame)        
         pnp_result = self.relative_pose_initializer.process_frame(
-            frame_index=self.ba.frame_idx + 1,
+            frame_index=self.frame_idx,
             rectified_frame=rect_frame,
-            depth_frame=depth_frame,
             track_observations=observations
         )
         assert pnp_result is not None, "PnP result should not be None, make sure you called reset() first"
@@ -103,6 +119,46 @@ class VIO:
         else:
             relative_pose = pnp_result["relative_pose"]
 
+        # compose the relative pose with the current keyframe relative pose
+        self.relative_pose = relative_pose * self.relative_pose
+
+        # only process keyframes
+        if not is_keyframe:
+            pose = self.relative_pose * self.ba.get_latest_pose()
+            trajectory = self.ba.get_trajectory() + [pose] # add the latest pose to the keyframed trajectory
+            landmarks = self.ba.get_active_landmarks()
+            all_landmarks = self.ba.get_all_landmarks()
+
+            if self.logger is not None and self.frame_idx % self.config.log_every == 0:
+                self.logger.log_step(
+                    frame_idx=self.frame_idx,
+                    timestamp=timestamp,
+                    pose=pose,
+                    frame=rect_frame,
+                    trajectory=trajectory,
+                    observations=observations,
+                    landmarks=landmarks,
+                    all_landmarks=all_landmarks,
+                    ba_stats=None,
+                )
+
+            T = pose.translation()
+            R = pose.rotation().matrix()
+            v = self.ba.get_latest_velocity()
+
+            return VIOEstimate(
+                timestamp=timestamp,
+                t=T,
+                R=R,
+                v=v,
+                keyframe=False,
+            )
+
+        # only use pnp inliers
+        if self.config.ransac_inliers_only and pnp_result["status"] == "success":
+            valid_track_ids = pnp_result["track_ids"]
+            observations = { k: v for k, v in observations.items() if k in valid_track_ids }
+
         dt = timestamp - self.ba.prev_ts
         assert dt > 0, f"dt must be positive, got {dt}"
 
@@ -113,15 +169,19 @@ class VIO:
         )
 
         ba_stats = self.ba.process(
-            frame=depth_frame,
+            frame=rect_frame,
             ts=timestamp,
-            relative_pose=relative_pose,
+            relative_pose=self.relative_pose,
             estimated_velocity=estimated_velocity,
             landmark_observations=observations,
             pim=self.imu_preintegrator.pim,
             optimize=(self.ba.frame_idx % self.config.optimize_every == 0),
             profile=False,
         )
+
+        # reset relative pose since this is a new keyframe
+        assert is_keyframe
+        self.relative_pose = gtsam.Pose3.Identity()
         
         # Update IMU preintegrator with latest bias estimate
         self.imu_preintegrator.reset(self.ba.get_bias())
@@ -130,23 +190,25 @@ class VIO:
         latest_velocity = self.ba.get_latest_velocity()
         trajectory = self.ba.get_trajectory()
 
-        if self.logger is not None and self.ba.frame_idx % self.config.log_every == 0:
+        if self.logger is not None and self.frame_idx % self.config.log_every == 0:
             self.logger.log_step(
-                frame_idx=self.ba.frame_idx,
+                frame_idx=self.frame_idx,
                 timestamp=timestamp,
                 pose=latest_pose,
-                frame=depth_frame,
+                frame=rect_frame,
                 trajectory=trajectory,
                 observations=observations,
                 landmarks=self.ba.get_active_landmarks(),
+                all_landmarks=self.ba.get_all_landmarks(),
                 ba_stats=ba_stats,
+                bias=self.ba.get_bias(),
             )
 
         t = latest_pose.translation()
         R = latest_pose.rotation().matrix()
         v = latest_velocity
         
-        return VIOEstimate(timestamp=timestamp, t=t, R=R, v=v)
+        return VIOEstimate(timestamp=timestamp, t=t, R=R, v=v, keyframe=True)
 
     
     def reset(self, timestamp: float, left_rect: np.ndarray, right_rect: np.ndarray, t: np.ndarray, R: np.ndarray, v: np.ndarray = None):
@@ -154,12 +216,11 @@ class VIO:
         initial_pose = gtsam.Pose3(gtsam.Rot3(R), t)
         self.relative_pose_initializer.reset(initial_pose)
 
-        rect_frame, depth_frame = self.preprocess_frame(left_rect, right_rect)
-        observations = self.feature_tracker.track_frame(rect_frame, depth_frame)
+        rect_frame = self.preprocess_frame(left_rect, right_rect)
+        observations = self.feature_tracker.track_frame(rect_frame)
         pnp_result = self.relative_pose_initializer.process_frame(
             frame_index=0,
             rectified_frame=rect_frame,
-            depth_frame=depth_frame,
             track_observations=observations
         )
         assert pnp_result is None
@@ -171,7 +232,7 @@ class VIO:
         # Initialize IMU timestamp tracking
         self.prev_imu_ts = timestamp
 
-        estimate = VIOEstimate(timestamp=timestamp, t=t, R=R, v=v)
+        estimate = VIOEstimate(timestamp=timestamp, t=t, R=R, v=v, keyframe=True)
         return estimate
 
 
@@ -185,14 +246,23 @@ class VIO:
             t = poses[i].translation()
             R = poses[i].rotation().matrix()
             v = velocities[i]
-            estimates.append(VIOEstimate(timestamp=self.ba.ts[i], t=t, R=R, v=v))
+            estimates.append(VIOEstimate(timestamp=self.ba.ts[i], t=t, R=R, v=v, keyframe=True))
         
         return estimates
 
     def get_estimated_bias(self) -> gtsam.imuBias.ConstantBias:
         return self.ba.get_bias()
+
+    def get_distance_traveled(self) -> float:
+        trajectory = self.ba.get_trajectory()
+        
+        total_distance = 0.0
+        for i in range(len(trajectory) - 1):
+            total_distance += np.linalg.norm(trajectory[i].translation() - trajectory[i + 1].translation())
+        
+        return total_distance
     
-    def preprocess_frame(self, left_rect: np.ndarray, right_rect: np.ndarray) -> tuple[RectifiedStereoFrame, StereoDepthFrame]:
+    def preprocess_frame(self, left_rect: np.ndarray, right_rect: np.ndarray) -> RectifiedStereoFrame:
         rect_frame = RectifiedStereoFrame(
             left=None,
             right=None,
@@ -200,9 +270,8 @@ class VIO:
             right_rect=right_rect,
             calibration=self.calibration,
         )
-        depth_frame = self.sgbm.compute_depth(rect_frame)
 
-        return rect_frame, depth_frame
+        return rect_frame
 
     @staticmethod
     def from_config(

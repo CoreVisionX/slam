@@ -6,10 +6,13 @@ from typing import Any
 import gtsam
 import numpy as np
 
-from slam.registration.registration import MatchedFramePair, RectifiedStereoFrame, StereoDepthFrame
+from slam.registration.registration import (
+    FeatureFrame,
+    MatchedFramePair,
+    RectifiedStereoFrame,
+)
 from slam.registration.utils import solve_pnp
 
-from .feature_utils import build_feature_frame, extract_keypoint_attributes, make_feature_frame_for_view
 from .klt_tracker import TrackObservation
 
 
@@ -20,7 +23,7 @@ class RelativePnPInitializerConfig:
 
 
 class RelativePnPInitializer:
-    """Estimate relative poses between consecutive frames using PnP."""
+    """Estimate relative poses between consecutive frames using PnP on tracked features."""
 
     def __init__(
         self,
@@ -37,7 +40,6 @@ class RelativePnPInitializer:
         self._first_gt_pose: gtsam.Pose3 | None = None
         self._world_pose: gtsam.Pose3 | None = None
         self._prev_rectified_frame: RectifiedStereoFrame | None = None
-        self._prev_depth_frame: StereoDepthFrame | None = None
         self._prev_track_observations: dict[int, TrackObservation] | None = None
         self._prev_frame_index: int | None = None
         self.results: list[dict[str, Any]] = []
@@ -50,7 +52,6 @@ class RelativePnPInitializer:
         self._first_gt_pose = first_pose
         self._world_pose = gtsam.Pose3(sequence_sample.world_poses[0].rotation(), np.zeros(3))
         self._prev_rectified_frame = None
-        self._prev_depth_frame = None
         self._prev_track_observations = None
         self._prev_frame_index = None
         self.results = []
@@ -60,7 +61,6 @@ class RelativePnPInitializer:
         self._sequence_sample = None
         self._first_gt_pose = None
         self._prev_rectified_frame = None
-        self._prev_depth_frame = None
         self._prev_track_observations = None
         self._prev_frame_index = None
         self.results = []
@@ -68,17 +68,15 @@ class RelativePnPInitializer:
     def estimate_sequence_poses(
         self,
         rectified_frames: list[RectifiedStereoFrame],
-        depth_frames: list[StereoDepthFrame],
         track_history: list[dict[int, TrackObservation]],
         sequence_sample: Any,
     ) -> list[dict[str, Any]]:
         self.reset_with_gt(sequence_sample)
-        for frame_idx, (rect_frame, depth_frame) in enumerate(zip(rectified_frames, depth_frames)):
+        for frame_idx, rect_frame in enumerate(rectified_frames):
             track_obs = track_history[frame_idx]
             self.process_frame(
                 frame_index=frame_idx,
                 rectified_frame=rect_frame,
-                depth_frame=depth_frame,
                 track_observations=track_obs,
             )
         return list(self.results)
@@ -88,7 +86,6 @@ class RelativePnPInitializer:
         *,
         frame_index: int,
         rectified_frame: RectifiedStereoFrame,
-        depth_frame: StereoDepthFrame,
         track_observations: dict[int, TrackObservation],
         frame_id: str | None = None,
     ) -> dict[str, Any] | None:
@@ -99,22 +96,22 @@ class RelativePnPInitializer:
         if self._prev_track_observations is None:
             self._prev_track_observations = track_observations
             self._prev_rectified_frame = rectified_frame
-            self._prev_depth_frame = depth_frame
             self._prev_frame_index = frame_index
             return None
 
         prev_obs = self._prev_track_observations
         prev_frame_idx = self._prev_frame_index
-        prev_depth = self._prev_depth_frame
         prev_rectified = self._prev_rectified_frame
 
-        if prev_frame_idx is None or prev_depth is None or prev_rectified is None:
+        if prev_frame_idx is None or prev_rectified is None:
             raise RuntimeError("Previous frame data missing; ensure frames are processed in order.")
 
         cfg = self.config
         sequence_sample = self._sequence_sample
         prev_world_pose = self._world_pose
         curr_obs = track_observations
+        
+        # Identify common tracks
         common_track_ids = sorted(set(prev_obs.keys()) & set(curr_obs.keys()))
         
         current_frame_id = frame_id
@@ -125,62 +122,92 @@ class RelativePnPInitializer:
                 current_frame_id = str(frame_index)
 
         if not common_track_ids:
-            result = {
-                "frame_index": frame_index,
-                "frame_id": current_frame_id,
-                "status": "no_tracks",
-                "active_track_count": 0,
-            }
-            if self.store_results:
-                self.results.append(result)
-            self._update_previous_frame(rectified_frame, depth_frame, track_observations, frame_index)
-            return result
+            return self._record_failure(
+                frame_index, current_frame_id, "no_tracks", 0,
+                rectified_frame, track_observations
+            )
 
-        prev_points = np.asarray(
-            [prev_obs[track_id].keypoint for track_id in common_track_ids],
-            dtype=np.float32,
+        # Gather points and verify depth from previous observations
+        prev_kps_list = []
+        prev_depths_list = []
+        curr_kps_list = []
+        valid_track_ids_list = []
+
+        for tid in common_track_ids:
+            obs = prev_obs[tid]
+            depth_val = obs.depth
+            
+            # Filter invalid depths
+            if depth_val <= 0.0 or depth_val > cfg.max_depth or not np.isfinite(depth_val):
+                continue
+                
+            prev_kps_list.append(obs.keypoint)
+            prev_depths_list.append(depth_val)
+            curr_kps_list.append(curr_obs[tid].keypoint)
+            valid_track_ids_list.append(tid)
+
+        if len(prev_kps_list) < cfg.min_matches_for_pnp:
+            return self._record_failure(
+                frame_index, current_frame_id, "insufficient_tracks", 
+                len(prev_kps_list), rectified_frame, track_observations
+            )
+
+        # Convert to numpy arrays
+        prev_kps = np.array(prev_kps_list, dtype=np.float32)
+        prev_depths = np.array(prev_depths_list, dtype=np.float32)
+        curr_kps = np.array(curr_kps_list, dtype=np.float32)
+        valid_track_ids = np.array(valid_track_ids_list, dtype=int)
+
+        # Unproject previous points to 3D using previous frame intrinsics (Rectified)
+        K = prev_rectified.calibration.K_left_rect
+        fx = K[0, 0]
+        fy = K[1, 1]
+        cx = K[0, 2]
+        cy = K[1, 2]
+        
+        z = prev_depths
+        x = (prev_kps[:, 0] - cx) * z / fx
+        y = (prev_kps[:, 1] - cy) * z / fy
+        prev_points_3d = np.stack([x, y, z], axis=1).astype(np.float32)
+
+        # Create dummy colors (required by MatchedFramePair property accessors usually)
+        # Sampling from the image is safer than creating zeros
+        h, w = prev_rectified.left_rect.shape[:2]
+        u_clip = np.clip(np.round(prev_kps[:, 0]), 0, w - 1).astype(int)
+        v_clip = np.clip(np.round(prev_kps[:, 1]), 0, h - 1).astype(int)
+        prev_colors = prev_rectified.left_rect[v_clip, u_clip]
+
+        # Construct FeatureFrames
+        features1 = {
+            "keypoints": prev_kps,
+            "keypoints_depth": prev_depths,
+            "keypoints_3d": prev_points_3d,
+            "keypoints_color": prev_colors,
+            "image_size": (h, w)
+        }
+        
+        first_frame = FeatureFrame(
+            left=None, right=None,
+            left_rect=None, right_rect=None,
+            left_depth=None, left_depth_xyz=None,
+            calibration=prev_rectified.calibration,
+            features=features1
         )
-        curr_points = np.asarray(
-            [curr_obs[track_id].keypoint for track_id in common_track_ids],
-            dtype=np.float32,
+
+        features2 = {
+            "keypoints": curr_kps,
+            "image_size": rectified_frame.left_rect.shape[:2]
+        }
+        
+        second_frame = FeatureFrame(
+            left=None, right=None,
+            left_rect=None, right_rect=None,
+            left_depth=None, left_depth_xyz=None,
+            calibration=rectified_frame.calibration,
+            features=features2
         )
 
-        attributes = extract_keypoint_attributes(
-            prev_depth,
-            prev_points,
-            max_depth=cfg.max_depth,
-        )
-        valid_mask = attributes["valid_mask"]
-        if not np.any(valid_mask):
-            result = {
-                "frame_index": frame_index,
-                "frame_id": current_frame_id,
-                "status": "no_valid_depth",
-                "active_track_count": len(common_track_ids),
-            }
-            if self.store_results:
-                self.results.append(result)
-            self._update_previous_frame(rectified_frame, depth_frame, track_observations, frame_index)
-            return result
-
-        prev_valid = attributes["keypoints"]
-        curr_valid = curr_points[valid_mask]
-        valid_track_ids = np.asarray(common_track_ids, dtype=int)[valid_mask]
-        if prev_valid.shape[0] < cfg.min_matches_for_pnp:
-            result = {
-                "frame_index": frame_index,
-                "frame_id": current_frame_id,
-                "status": "insufficient_tracks",
-                "active_track_count": prev_valid.shape[0],
-            }
-            if self.store_results:
-                self.results.append(result)
-            self._update_previous_frame(rectified_frame, depth_frame, track_observations, frame_index)
-            return result
-
-        first_frame = build_feature_frame(prev_depth, attributes)
-        second_frame = make_feature_frame_for_view(rectified_frame, curr_valid)
-        match_indices = np.arange(prev_valid.shape[0], dtype=int)
+        match_indices = np.arange(len(prev_kps), dtype=int)
         matches = np.stack([match_indices, match_indices], axis=1)
         matched_pair = MatchedFramePair(
             first=first_frame,
@@ -189,21 +216,26 @@ class RelativePnPInitializer:
         )
 
         try:
+            # solve_pnp typically expects 3D points in 'first' and 2D in 'second'
             relative_pose_s0, inlier_pair = solve_pnp(matched_pair)
-            imu_from_left = prev_rectified.calibration.imu_from_left
-            relative_pose = imu_from_left * relative_pose_s0 * imu_from_left.inverse()
+            
+            # The result of solve_pnp is usually Frame2 w.r.t Frame1 (or Camera w.r.t World).
+            # We need to account for IMU-Camera extrinsics if provided.
+            # Assuming `imu_from_left` exists on calibration (common in VIO/SLAM setups)
+            # If not present in the dataclass provided, this line might need adjustment,
+            # but based on the previous context it seems expected.
+            if hasattr(prev_rectified.calibration, 'imu_from_left'):
+                imu_from_left = prev_rectified.calibration.imu_from_left
+                relative_pose = imu_from_left * relative_pose_s0 * imu_from_left.inverse()
+            else:
+                # Fallback if extrinsics are not available
+                relative_pose = relative_pose_s0
+
         except Exception as exc:  # noqa: BLE001
-            result = {
-                "frame_index": frame_index,
-                "frame_id": current_frame_id,
-                "status": "pnp_failed",
-                "active_track_count": prev_valid.shape[0],
-                "error": str(exc),
-            }
-            if self.store_results:
-                self.results.append(result)
-            self._update_previous_frame(rectified_frame, depth_frame, track_observations, frame_index)
-            return result
+            return self._record_failure(
+                frame_index, current_frame_id, "pnp_failed", 
+                len(prev_kps), rectified_frame, track_observations, str(exc)
+            )
 
         estimated_pose = prev_world_pose.compose(relative_pose)
         self._world_pose = estimated_pose
@@ -211,14 +243,17 @@ class RelativePnPInitializer:
         ground_truth_pose = None
         pose_error = None
         if sequence_sample is not None and self._first_gt_pose is not None:
-            ground_truth_pose = (self._first_gt_pose.inverse() * sequence_sample.world_poses[frame_index])
+            # Assuming world_poses is a list of gtsam.Pose3
+            gt_pose_now = sequence_sample.world_poses[frame_index]
+            # Adjust GT to be relative to the first frame (start at 0,0,0)
+            ground_truth_pose = (self._first_gt_pose.inverse() * gt_pose_now)
             pose_error = ground_truth_pose.between(estimated_pose)
 
         result = {
             "frame_index": frame_index,
             "frame_id": current_frame_id,
             "status": "success",
-            "active_track_count": prev_valid.shape[0],
+            "active_track_count": len(prev_kps),
             "matches_before_filter": len(common_track_ids),
             "matches_after_filter": inlier_pair.matches.shape[0],
             "estimated_pose": estimated_pose,
@@ -231,18 +266,41 @@ class RelativePnPInitializer:
         }
         if self.store_results:
             self.results.append(result)
-        self._update_previous_frame(rectified_frame, depth_frame, track_observations, frame_index)
+        self._update_previous_frame(rectified_frame, track_observations, frame_index)
+        return result
+
+    def _record_failure(
+        self, 
+        frame_index: int, 
+        frame_id: str, 
+        status: str, 
+        count: int,
+        rectified_frame: RectifiedStereoFrame,
+        track_observations: dict[int, TrackObservation],
+        error_msg: str | None = None
+    ) -> dict[str, Any]:
+        result = {
+            "frame_index": frame_index,
+            "frame_id": frame_id,
+            "status": status,
+            "active_track_count": count,
+        }
+        if error_msg:
+            result["error"] = error_msg
+        
+        if self.store_results:
+            self.results.append(result)
+        
+        self._update_previous_frame(rectified_frame, track_observations, frame_index)
         return result
 
     def _update_previous_frame(
         self,
         rectified_frame: RectifiedStereoFrame,
-        depth_frame: StereoDepthFrame,
         track_observations: dict[int, TrackObservation],
         frame_index: int,
     ) -> None:
         self._prev_rectified_frame = rectified_frame
-        self._prev_depth_frame = depth_frame
         self._prev_track_observations = track_observations
         self._prev_frame_index = frame_index
 

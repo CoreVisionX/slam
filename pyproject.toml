@@ -7,13 +7,13 @@ name = "slam"
 version = "0.1.0"
 description = "Lightweight visual-inertial odometry stack."
 authors = [{ name = "Jacob Van Meter", email = "jacobvm04@gmail.com" }]
-requires-python = ">=3.10,<3.11"
+requires-python = ">=3.10,<3.12"
 dependencies = [
   "hydra-core>=1.3.2,<2",
   "gtsam-develop>=4.3a0.dev202510200041,<5",
-  "opencv-python-headless>=4.12.0.88,<5",
-  "rerun-sdk>=0.27.2,<0.28",
-  "tqdm>=4.66.0,<5",
+  "opencv-python-headless>=4,<5",
+  "rerun-sdk>=0.27,<0.28",
+  "line-profiler>=5.0.0, <6",
 ]
 
 [tool.hatch.build]
@@ -24,3 +24,6 @@ exclude = ["tests/**"]
 
 [tool.hatch.build.targets.sdist]
 exclude = ["tests/**"]
+
+[tool.hatch.build.hooks.custom]
+

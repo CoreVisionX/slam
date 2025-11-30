@@ -9,6 +9,7 @@ class VIOEstimate:
     t: np.ndarray
     R: np.ndarray
     v: np.ndarray
+    keyframe: bool
 
 @dataclass
 class VIOCalibration(StereoCalibration):

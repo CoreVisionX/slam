@@ -51,6 +51,9 @@ def run_vio(vio_config_path: Path, data_config_path: Path, output_path: Path) ->
             imu_gyro=batch.angular_velocities, # (b, n), rad/s
             imu_ts=batch.timestamps, # (b,) s
     )
+
+    # log the distance traveled
+    print(f"Estimated Distance traveled: {vio.get_distance_traveled():.2f} m")
     
     # Save TUM trajectory
     save_tum_sequence(vio.get_estimated_trajectory(), str(output_path))
@@ -68,7 +71,7 @@ def main() -> None:
 
     config_dir = Path(__file__).parent / "config"
     run_vio(
-        vio_config_path=config_dir / "vio.yaml",
+        vio_config_path=config_dir / "vio_euroc.yaml",
         data_config_path=config_dir / "euroc_pipeline.yaml",
         output_path=args.output,
     )

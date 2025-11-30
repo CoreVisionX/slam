@@ -3,6 +3,9 @@ import rerun as rr
 from slam.registration.registration import RectifiedStereoFrame, StereoDepthFrame
 
 
+def log_scalar(path: str, value: float) -> None:
+    rr.log(path, rr.Scalars(value))
+
 def rr_log_pose(
     path: str,
     pose: gtsam.Pose3,
@@ -21,7 +24,7 @@ def rr_log_pose(
             image_plane_distance=image_plane_dist,
         ),
     )
-
+    
     rr_log_pose_arrows(path + "/pose", pose, arrow_length=image_plane_dist / 2)
     rr.log(path + "/position", rr.Points3D([[0, 0, 0]], colors=[[0, 0, 255]], radii=image_plane_dist * 0.1))
 

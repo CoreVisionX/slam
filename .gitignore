@@ -12,3 +12,10 @@ __pycache__/
 tests/results/*
 outputs/*
 *.png
+*.txt
+*.lprof
+
+# build
+build
+*.so
+*.conda

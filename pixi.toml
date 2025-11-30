@@ -1,31 +1,53 @@
 [workspace]
 authors = ["Jacob Van Meter <jacobvm04@gmail.com>"]
-channels = ["conda-forge"]
+channels = ["robostack-humble", "conda-forge"]
 name = "slam"
-platforms = ["linux-aarch64", "osx-arm64"]
+platforms = ["osx-arm64", "linux-aarch64"]
 version = "0.1.0"
 preview = ["pixi-build"]
 
 [tasks]
 
 [dependencies]
-python = ">=3.10,<3.11"
+python = ">=3.10,<3.12"
 pip = ">=25.2,<26"
 hydra-core = ">=1.3.2,<2"
+rerun-sdk = ">=0.27, <0.28"
+opencv = ">=4.11.0,<5"
+cmake = ">=4.2.0,<5"
+ninja = ">=1.13.2,<2"
+compilers = ">=1.11.0,<2"
+pybind11 = ">=3.0.1,<4"
+
+[feature.ros2.dependencies]
+ros-humble-desktop = ">=0.10.0,<0.11"
 
 [pypi-dependencies]
 gtsam-develop = ">=4.3a0.dev202510200041, <5"
-opencv-python-headless = ">=4.12.0.88, <5"
-rerun-sdk = ">=0.27.2, <0.28"
+opencv-python-headless = ">=4, <5"
 tqdm = ">=4.66.0, <5"
-slam = { path = "." }
+line-profiler = ">=5.0.0, <6"
+slam = { path = ".", editable = true }
 
 [feature.dev.pypi-dependencies]
 ipykernel = ">=7.1.0, <8"
 matplotlib = ">=3.10.7, <4"
 
+[feature.ros2.pypi-dependencies]
+rosbags = ">=0.11.0, <0.12"
+rosbags-image = ">=0.10.3, <0.11"
+
 [environments.dev]
 features = ["dev"]
+
+[environments.ros2]
+features = ["ros2"]
+
+[environments.ros2-dev]
+features = ["ros2", "dev"]
+
+[environments]
+default = []
 
 [package]
 name = "slam"
@@ -38,9 +60,16 @@ backend = { name = "pixi-build-python", version = "==0.4.0" }
 hatchling = "==1.26.3"
 
 [package.run-dependencies]
-python = ">=3.10,<3.11"
+python = ">=3.10,<3.12"
 hydra-core = ">=1.3.2,<2"
 gtsam-develop = ">=4.3a0.dev202510200041, <5"
-opencv-python-headless = ">=4.12.0.88, <5"
-rerun-sdk = ">=0.27.2, <0.28"
+opencv-python-headless = ">=4, <5"
+rerun-sdk = ">=0.27, <0.28"
 tqdm = ">=4.66.0, <5"
+
+[tasks.build]
+cmd = "pixi build"
+
+[tasks.euroc]
+cmd = "cd tests && python vio_example_euroc.py"
+depends-on = ["build"]

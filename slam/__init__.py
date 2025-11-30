@@ -3,7 +3,7 @@
 from .vio.core import VIO
 from .vio.config import VIOConfig, compute_vio_calibration
 from .vio.types import VIOEstimate, VIOCalibration
-from .vio.bundle_adjustment import BundleAdjustmentConfig, FixedLagBundleAdjuster, IncrementalBundleAdjuster, finite_difference_velocity
+from .vio.bundle_adjustment import BundleAdjustmentConfig, FixedLagBundleAdjuster, finite_difference_velocity
 from .vio.klt_tracker import KLTFeatureTracker, KLTTrackerConfig, FeatureTrack, TrackObservation
 from .vio.relative_pose import RelativePnPInitializer, RelativePnPInitializerConfig
 

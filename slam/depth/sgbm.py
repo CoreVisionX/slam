@@ -14,11 +14,11 @@ class SGBM:
 
     def __init__(
         self,
-        min_disparity: int = 0,
-        num_disparities: int = 16 * 6,
+        min_disparity: int = 2,
+        num_disparities: int = 16 * 8,
         block_size: int = 5,
         pre_filter_cap: int = 63,
-        uniqueness_ratio: int = 10,
+        uniqueness_ratio: int = 20,
         speckle_window_size: int = 100,
         speckle_range: int = 32,
         disp12_max_diff: int = 1,
@@ -43,17 +43,17 @@ class SGBM:
             p2 = 32 * channels * block_size * block_size
 
         self._matcher = cv2.StereoSGBM_create(
-            minDisparity=min_disparity,
+            minDisparity=0,
             numDisparities=num_disparities,
             blockSize=block_size,
-            P1=p1,
-            P2=p2,
-            preFilterCap=pre_filter_cap,
-            uniquenessRatio=uniqueness_ratio,
-            speckleWindowSize=speckle_window_size,
-            speckleRange=speckle_range,
-            disp12MaxDiff=disp12_max_diff,
-            mode=mode,
+            P1=8 * 1 * block_size * block_size,   # 1 = grayscale channels
+            P2=32 * 1 * block_size * block_size,
+            preFilterCap=31,
+            uniquenessRatio=10,                   # 5–15; lower keeps more matches
+            speckleWindowSize=50,                 # 0 to disable, 50 is a good start
+            speckleRange=2,
+            disp12MaxDiff=1,
+            mode=cv2.STEREO_SGBM_MODE_SGBM_3WAY,
         )
         self._color_conversion = cv2.COLOR_BGR2GRAY if image_color == "BGR" else cv2.COLOR_RGB2GRAY
         self._min_disparity = min_disparity

@@ -3,7 +3,6 @@
 from .bundle_adjustment import (
     BundleAdjustmentConfig,
     FixedLagBundleAdjuster,
-    IncrementalBundleAdjuster,
     finite_difference_velocity,
 )
 from .config import VIOConfig, compute_vio_calibration

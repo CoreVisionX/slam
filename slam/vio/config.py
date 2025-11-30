@@ -48,8 +48,12 @@ class VIOConfig:
     width: int
     height: int
 
+    # feature selection
+    ransac_inliers_only: bool
+
     # bundle adjustment
     optimize_every: int
+    keyframe_interval: int
 
     # logging
     log_every: int
