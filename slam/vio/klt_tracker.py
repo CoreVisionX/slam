@@ -44,10 +44,7 @@ class KLTTrackerConfig:
     refill_feature_ratio: float = 0.8
     feature_suppression_radius: float = 8.0
     
-    # FAST Detector settings
-    fast_threshold: int = 25
-    fast_nonmax: bool = True
-    fast_border: int = 12
+
     
     # Optical Flow settings
     lk_win_size: tuple[int, int] = (15, 15)
@@ -61,6 +58,14 @@ class KLTTrackerConfig:
     stereo_max_y_diff: float = 2.0
     min_disparity: float = 0.1
     max_depth: float = 40.0
+
+
+    # Good Features To Track (GFTT) settings
+    gftt_quality_level: float = 0.001
+    gftt_min_distance: float = 20.0
+    gftt_block_size: int = 3
+    gftt_use_harris_detector: bool = False
+    gftt_k: float = 0.04
 
     # --- sparse stereo params ---
     templ_rows: int = 11              # template height in pixels
@@ -87,44 +92,54 @@ class KLTFeatureTracker:
         max_feature_count: int = 1024,
         refill_feature_ratio: float = 0.8,
         feature_suppression_radius: float = 8.0,
-        fast_threshold: int = 25,
-        fast_nonmax: bool = True,
-        fast_border: int = 12,
         lk_win_size: tuple[int, int] = (15, 15),
         lk_max_level: int = 5,
         lk_max_iterations: int = 40,
         lk_epsilon: float = 0.01,
         lk_min_eig_threshold: float = 1e-3,
         max_depth: float = 40.0,
-        stereo_ransac_threshold: float = 2.0,
-        # TODO: add to config!!
+
+        gftt_quality_level: float = 0.001,
+        gftt_min_distance: float = 20.0,
+        gftt_block_size: int = 3,
+        gftt_use_harris_detector: bool = False,
+        gftt_k: float = 0.04,
+
         templ_rows: int = 11,
         templ_cols: int = 101,
         stripe_extra_rows: int = 0,
         template_matching_tolerance: float = 0.15,
         subpixel_refinement: bool = False,
         stereo_min_depth: float = 0.15,
+        stereo_ransac_threshold: float = 2.0,
+        stereo_max_y_diff: float = 2.0,
+        min_disparity: float = 0.1,
     ) -> None:
         self.config = KLTTrackerConfig(
             max_feature_count=max_feature_count,
             refill_feature_ratio=refill_feature_ratio,
             feature_suppression_radius=feature_suppression_radius,
-            fast_threshold=fast_threshold,
-            fast_nonmax=fast_nonmax,
-            fast_border=fast_border,
             lk_win_size=tuple(lk_win_size),
             lk_max_level=lk_max_level,
             lk_max_iterations=lk_max_iterations,
             lk_epsilon=lk_epsilon,
             lk_min_eig_threshold=lk_min_eig_threshold,
             max_depth=max_depth,
-            stereo_ransac_threshold=stereo_ransac_threshold,
+
+            gftt_quality_level=gftt_quality_level,
+            gftt_min_distance=gftt_min_distance,
+            gftt_block_size=gftt_block_size,
+            gftt_use_harris_detector=gftt_use_harris_detector,
+            gftt_k=gftt_k,
             templ_rows=templ_rows,
             templ_cols=templ_cols,
             stripe_extra_rows=stripe_extra_rows,
             template_matching_tolerance=template_matching_tolerance,
             subpixel_refinement=subpixel_refinement,
             stereo_min_depth=stereo_min_depth,
+            stereo_ransac_threshold=stereo_ransac_threshold,
+            stereo_max_y_diff=stereo_max_y_diff,
+            min_disparity=min_disparity,
         )
         self._lk_params = dict(
             winSize=tuple(int(v) for v in self.config.lk_win_size),
@@ -178,56 +193,23 @@ class KLTFeatureTracker:
             return np.empty((0, 2), dtype=np.float32)
         return np.asarray(kept, dtype=np.float32)
 
-    def _detect_fast_keypoints(
+    def _detect_keypoints(
         self,
         gray_image: np.ndarray,
         max_features: int,
     ) -> np.ndarray:
-        # TODO: add configurable parameters
+        """Detect keypoints using GFTT (Good Features To Track)."""
         keypoints = cv2.goodFeaturesToTrack(
             gray_image,
             maxCorners=max_features,
-            qualityLevel=0.001,
-            minDistance=20,
-            blockSize=3,
-            useHarrisDetector=False,
-            k=0.04,
+            qualityLevel=self.config.gftt_quality_level,
+            minDistance=self.config.gftt_min_distance,
+            blockSize=self.config.gftt_block_size,
+            useHarrisDetector=self.config.gftt_use_harris_detector,
+            k=self.config.gftt_k,
         )
 
         return keypoints.reshape(-1, 2)
-
-        # detector = cv2.FastFeatureDetector_create(
-        #     threshold=self.config.fast_threshold, 
-        #     nonmaxSuppression=self.config.fast_nonmax
-        # )
-        # keypoints = detector.detect(gray_image)
-
-        # if not keypoints:
-        #     return np.empty((0, 2), dtype=np.float32)
-
-        # points = cv2.KeyPoint_convert(keypoints)
-        # responses = np.array([kp.response for kp in keypoints], dtype=np.float32)
-        # border = self.config.fast_border
-
-        # if border > 0:
-        #     h, w = gray_image.shape
-        #     inside = (
-        #         (points[:, 0] >= border)
-        #         & (points[:, 0] < w - border)
-        #         & (points[:, 1] >= border)
-        #         & (points[:, 1] < h - border)
-        #     )
-        #     points = points[inside]
-        #     responses = responses[inside]
-
-        # if points.size == 0:
-        #     return np.empty((0, 2), dtype=np.float32)
-
-        # if points.shape[0] > max_features:
-        #     order = np.argsort(responses)[::-1][:max_features]
-        #     points = points[order]
-
-        # return points.astype(np.float32)
 
     def _reproject_sparse(
         self, 
@@ -556,7 +538,7 @@ class KLTFeatureTracker:
                 return [], np.empty((0, 2), dtype=np.float32)
 
             detection_quota = max(cfg.max_feature_count, budget * 2)
-            candidate_points = self._detect_fast_keypoints(gray_left, detection_quota)
+            candidate_points = self._detect_keypoints(gray_left, detection_quota)
             
             filtered_candidates = self._filter_keypoints_by_distance(
                 candidate_points,

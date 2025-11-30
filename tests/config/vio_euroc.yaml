@@ -35,15 +35,26 @@ feature_tracker:
   max_feature_count: 300
   refill_feature_ratio: 0.8
   feature_suppression_radius: 8.0
-  fast_threshold: 25
-  fast_nonmax: true
-  fast_border: 12
   lk_win_size: [24, 24]
   lk_max_level: 4
   lk_max_iterations: 30
   lk_epsilon: 0.1
   lk_min_eig_threshold: 0.001
   max_depth: 40.0
+  gftt_quality_level: 0.001
+  gftt_min_distance: 20.0
+  gftt_block_size: 3
+  gftt_use_harris_detector: false
+  gftt_k: 0.04
+  stereo_ransac_threshold: 2.0
+  stereo_max_y_diff: 2.0
+  min_disparity: 0.1
+  templ_rows: 11
+  templ_cols: 101
+  stripe_extra_rows: 0
+  template_matching_tolerance: 0.15
+  subpixel_refinement: false
+  stereo_min_depth: 0.15
 
 relative_pose_initializer:
   _target_: slam.vio.relative_pose.RelativePnPInitializer
