@@ -16,7 +16,8 @@ class VIORerunLogger:
         *,
         app_id: str = "vio_example",
         base_path: str = "vio",
-        spawn: bool = True,
+        spawn: bool | None = True,
+        url: str | None = None,
         # TODO: support more view coordinate conventions
         cam_view_coordinates: Literal["RDF", "RIGHT_HAND_X_UP", "RIGHT_HAND_Z_UP"] = "RDF",
         world_view_coordinates: Literal["RDF", "RIGHT_HAND_X_UP", "RIGHT_HAND_Z_UP"] = "RDF",
@@ -26,6 +27,9 @@ class VIORerunLogger:
         image_plane_dist: float = 2.0,
     ) -> None:
         rr.init(app_id, spawn=spawn)
+
+        if url:
+            rr.connect_grpc(url)
 
         self._base_path = base_path.rstrip("/")
         if not self._base_path:
