@@ -25,7 +25,8 @@ config:
   width: 752
   height: 480
   optimize_every: 1
-  log_every: 1
+  log_every: 2
+  log_landmarks_every: 16
   keyframe_interval: 4
   ransac_inliers_only: true
 

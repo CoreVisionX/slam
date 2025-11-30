@@ -57,6 +57,7 @@ class VIOConfig:
 
     # logging
     log_every: int
+    log_landmarks_every: int # must be a multiple of keyframe_interval and log_every
 
     def __post_init__(self):
         if not isinstance(self.gravity, np.ndarray):

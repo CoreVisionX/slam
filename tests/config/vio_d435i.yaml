@@ -49,7 +49,8 @@ config:
 
   optimize_every: 1
   keyframe_interval: 8
-  log_every: 1
+  log_every: 4
+  log_landmarks_every: 16
 
   ransac_inliers_only: true
 

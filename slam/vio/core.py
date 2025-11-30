@@ -53,6 +53,9 @@ class VIO:
         self.frame_idx = 0
         self.T_current_from_latest_keyframe = gtsam.Pose3.Identity() # relative pose from the latest keyframe to the current frame
 
+        self.latest_keyframe_landmarks = []
+        self.latest_all_landmarks = []
+
     @profile
     def process(
         self,
@@ -126,8 +129,6 @@ class VIO:
         if not is_keyframe:
             pose = self.ba.get_latest_pose() * self.T_current_from_latest_keyframe
             trajectory = self.ba.get_trajectory() + [pose] # add the latest pose to the keyframed trajectory
-            landmarks = self.ba.get_active_landmarks()
-            all_landmarks = self.ba.get_all_landmarks()
 
             if self.logger is not None and self.frame_idx % self.config.log_every == 0:
                 self.logger.log_step(
@@ -137,8 +138,8 @@ class VIO:
                     frame=rect_frame,
                     trajectory=trajectory,
                     observations=observations,
-                    landmarks=landmarks,
-                    all_landmarks=all_landmarks,
+                    landmarks=self.latest_keyframe_landmarks,
+                    all_landmarks=self.latest_all_landmarks,
                     ba_stats=None,
                 )
 
@@ -190,6 +191,10 @@ class VIO:
         latest_velocity = self.ba.get_latest_velocity()
         trajectory = self.ba.get_trajectory()
 
+        if self.logger is not None and self.frame_idx % self.config.log_landmarks_every == 0:
+            self.latest_keyframe_landmarks = self.ba.get_active_landmarks()
+            self.latest_all_landmarks = self.ba.get_all_landmarks()
+
         if self.logger is not None and self.frame_idx % self.config.log_every == 0:
             self.logger.log_step(
                 frame_idx=self.frame_idx,
@@ -198,8 +203,8 @@ class VIO:
                 frame=rect_frame,
                 trajectory=trajectory,
                 observations=observations,
-                landmarks=self.ba.get_active_landmarks(),
-                all_landmarks=self.ba.get_all_landmarks(),
+                landmarks=self.latest_keyframe_landmarks,
+                all_landmarks=self.latest_all_landmarks,
                 ba_stats=ba_stats,
                 bias=self.ba.get_bias(),
             )
