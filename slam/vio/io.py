@@ -7,7 +7,7 @@ from typing import Sequence, Mapping
 
 from slam.registration.registration import RectifiedStereoFrame, StereoDepthFrame
 from slam.viz import rr_log_pose, rr_log_trajectory
-from .klt_tracker import TrackObservation
+from .klt_tracker import TrackObservation, TrackObservationsBatch
 from .types import VIOEstimate
 
 class VIORerunLogger:
@@ -87,21 +87,20 @@ class VIORerunLogger:
             
         rr_log_trajectory(f"{self._base_path}/trajectory", list(trajectory), radii=self.trajectory_thickness, color=self.trajectory_color)
 
-    def _log_klt_features(self, observations: Mapping[int, TrackObservation] | None) -> None:
+    def _log_klt_features(self, observations: Mapping[int, TrackObservation] | TrackObservationsBatch | None) -> None:
         if not observations:
             return
 
         image_path = f"{self._base_path}/pose/rgb"
-        observation_count = len(observations)
+        if isinstance(observations, TrackObservationsBatch):
+            points = observations.keypoints
+            class_ids = observations.ids.tolist()
+        else:
+            obs_items = list(observations.items())
+            points = np.array([obs.keypoint for _, obs in obs_items], dtype=np.float32)
+            class_ids = [track_id for track_id, _ in obs_items]
+        observation_count = len(class_ids)
 
-        if observation_count == 0:
-            rr.log(image_path, rr.Points2D(np.empty((0, 2), dtype=np.float32)))
-            rr.log(f"{self._base_path}/klt/observations", rr.Scalars(0))
-            return
-
-        obs_items = list(observations.items())
-        points = np.array([obs.keypoint for _, obs in obs_items], dtype=np.float32)
-        class_ids = [track_id for track_id, _ in obs_items]
         rr.log(
             image_path,
             rr.Points2D(points, radii=self.feature_radii, class_ids=class_ids),

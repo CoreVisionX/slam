@@ -4,7 +4,7 @@ stages:
     loader:
       _target_: tests.datasets.loaders.EurocSequenceLoader
       data_root: tests/data/euroc
-      seq_name: VI_02_medium
+      seq_name: VI_01_easy
       sequence_length: 500
       base_seed: 15
       sampling_mode: contiguous

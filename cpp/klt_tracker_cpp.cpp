@@ -1,4 +1,5 @@
 #include <array>
+#include <cstdint>
 #include <cmath>
 #include <unordered_map>
 #include <unordered_set>
@@ -12,6 +13,7 @@
 #include <pybind11/numpy.h>
 #include <pybind11/pybind11.h>
 #include <pybind11/stl.h>
+#include <iostream>
 #include <stdexcept>
 
 namespace py = pybind11;
@@ -37,11 +39,16 @@ struct FeatureTrack {
     obs.keypoint = {pt.x, pt.y};
     obs.depth = depth;
     observations[frame_idx] = obs;
-    if (observation_frames.empty() ||
-        observation_frames.back() != frame_idx) {
+    if (observation_frames.empty() || observation_frames.back() != frame_idx) {
       observation_frames.push_back(frame_idx);
     }
   }
+};
+
+struct FrameBatch {
+  std::vector<int> ids;
+  std::vector<cv::Point2f> keypoints;
+  std::vector<float> depths;
 };
 
 struct KLTTrackerConfigCpp {
@@ -417,9 +424,9 @@ public:
       int stripe_extra_rows = 0, double template_matching_tolerance = 0.15,
       bool subpixel_refinement = false, double stereo_min_depth = 0.15,
       double stereo_ransac_threshold = 2.0, double stereo_max_y_diff = 2.0,
-      double min_disparity = 0.1,
-      int stereo_ransac_min_inliers = 8,
-      double stereo_ransac_confidence = 0.999)
+      double min_disparity = 0.1, int stereo_ransac_min_inliers = 8,
+      double stereo_ransac_confidence = 0.999,
+      bool profile_timing = false)
       : config_{}, lk_criteria_(cv::TermCriteria::EPS | cv::TermCriteria::COUNT,
                                 lk_max_iterations, lk_epsilon) {
     config_.max_feature_count = max_feature_count;
@@ -447,6 +454,7 @@ public:
     config_.min_disparity = min_disparity;
     config_.stereo_ransac_min_inliers = stereo_ransac_min_inliers;
     config_.stereo_ransac_confidence = stereo_ransac_confidence;
+    profile_timing_ = profile_timing;
 
     refill_threshold_ =
         static_cast<int>(std::floor(config_.refill_feature_ratio *
@@ -463,7 +471,7 @@ public:
     prev_ids_.clear();
   }
 
-  py::dict track_frame(const py::object &rectified_frame) {
+  py::tuple track_frame(const py::object &rectified_frame) {
     const py::array_t<uint8_t, py::array::c_style | py::array::forcecast>
         left_arr = rectified_frame.attr("left_rect").cast<py::array>();
     const py::array_t<uint8_t, py::array::c_style | py::array::forcecast>
@@ -480,20 +488,26 @@ public:
     if (left_mat.channels() == 3) {
       cv::cvtColor(left_mat, gray_left, cv::COLOR_RGB2GRAY);
     } else {
-      gray_left = left_mat.clone();
+      gray_left = left_mat;
     }
     if (right_mat.channels() == 3) {
       cv::cvtColor(right_mat, gray_right, cv::COLOR_RGB2GRAY);
     } else {
-      gray_right = right_mat.clone();
+      gray_right = right_mat;
     }
 
     const int frame_idx = static_cast<int>(track_history_.size());
-    std::unordered_map<int, TrackObservation> frame_obs;
     std::vector<cv::Point2f> tracked_points;
     std::vector<int> tracked_ids;
+    std::vector<float> tracked_depths;
+
+    cv::TickMeter tm_total, tm_lk, tm_stereo, tm_detect, tm_pack;
+    if (profile_timing_) {
+      tm_total.start();
+    }
 
     if (!prev_gray_.empty() && !prev_points_.empty() && !prev_ids_.empty()) {
+      if (profile_timing_) tm_lk.start();
       std::vector<cv::Point2f> next_points;
       std::vector<uchar> status;
       std::vector<float> err;
@@ -501,6 +515,7 @@ public:
           prev_gray_, gray_left, prev_points_, next_points, status, err,
           config_.lk_win_size, config_.lk_max_level, lk_criteria_,
           0, config_.lk_min_eig_threshold);
+      if (profile_timing_) tm_lk.stop();
 
       std::vector<int> candidate_ids;
       std::vector<cv::Point2f> candidate_points;
@@ -514,8 +529,10 @@ public:
         }
       }
 
+      if (profile_timing_) tm_stereo.start();
       const auto stereo = compute_stereo_matches(
           gray_left, gray_right, candidate_points, Q, config_);
+      if (profile_timing_) tm_stereo.stop();
 
       for (size_t i = 0; i < candidate_ids.size(); ++i) {
         if (!stereo.valid_mask[i]) {
@@ -529,9 +546,9 @@ public:
         track.add_observation(frame_idx, pt, depth);
         track.active = true;
 
-        frame_obs[track_id] = track.observations[frame_idx];
         tracked_points.push_back(pt);
         tracked_ids.push_back(track_id);
+        tracked_depths.push_back(depth);
       }
 
       std::unordered_set<int> active_set(tracked_ids.begin(), tracked_ids.end());
@@ -551,8 +568,10 @@ public:
 
       const int detection_quota =
           std::max(config_.max_feature_count, budget * 2);
+      if (profile_timing_) tm_detect.start();
       const auto detected =
           detect_keypoints(gray_left, detection_quota, config_);
+      if (profile_timing_) tm_detect.stop();
 
       const auto filtered = filter_keypoints(
           detected, existing_points, config_.feature_suppression_radius);
@@ -560,8 +579,10 @@ public:
         return;
       }
 
+      if (profile_timing_) tm_stereo.start();
       const auto stereo = compute_stereo_matches(
           gray_left, gray_right, filtered, Q, config_);
+      if (profile_timing_) tm_stereo.stop();
 
       std::vector<int> valid_indices;
       valid_indices.reserve(filtered.size());
@@ -600,9 +621,9 @@ public:
         track.add_observation(frame_idx, kp, depth);
 
         tracks_[next_track_id_] = track;
-        frame_obs[next_track_id_] = track.observations[frame_idx];
         tracked_points.push_back(kp);
         tracked_ids.push_back(next_track_id_);
+        tracked_depths.push_back(depth);
         existing_points.push_back(kp);
         ++next_track_id_;
       }
@@ -624,27 +645,121 @@ public:
     prev_points_ = tracked_points;
     prev_ids_ = tracked_ids;
 
-    track_history_.push_back(frame_obs);
-    return obs_map_to_dict(frame_obs);
+    if (profile_timing_) tm_pack.start();
+    FrameBatch batch;
+    batch.ids = tracked_ids;
+    batch.keypoints = tracked_points;
+    batch.depths = tracked_depths;
+    track_history_.push_back(std::move(batch));
+
+    py::array_t<int64_t> ids_array(
+        {static_cast<py::ssize_t>(tracked_ids.size())});
+    auto ids_buf = ids_array.mutable_unchecked<1>();
+    for (py::ssize_t i = 0; i < ids_buf.shape(0); ++i) {
+      ids_buf(i) = static_cast<int64_t>(tracked_ids[i]);
+    }
+
+    py::array_t<float> kps_array(
+        {static_cast<py::ssize_t>(tracked_points.size()),
+         static_cast<py::ssize_t>(2)});
+    auto kps_buf = kps_array.mutable_unchecked<2>();
+    for (py::ssize_t i = 0; i < kps_buf.shape(0); ++i) {
+      kps_buf(i, 0) = tracked_points[i].x;
+      kps_buf(i, 1) = tracked_points[i].y;
+    }
+
+    py::array_t<float> depths_array(
+        {static_cast<py::ssize_t>(tracked_depths.size())});
+    auto depths_buf = depths_array.mutable_unchecked<1>();
+    for (py::ssize_t i = 0; i < depths_buf.shape(0); ++i) {
+      depths_buf(i) = tracked_depths[i];
+    }
+
+    py::tuple result = py::make_tuple(ids_array, kps_array, depths_array);
+    if (profile_timing_) {
+      tm_pack.stop();
+      tm_total.stop();
+      accum_total_ms_ += tm_total.getTimeMilli();
+      accum_lk_ms_ += tm_lk.getTimeMilli();
+      accum_stereo_ms_ += tm_stereo.getTimeMilli();
+      accum_detect_ms_ += tm_detect.getTimeMilli();
+      accum_pack_ms_ += tm_pack.getTimeMilli();
+      profile_frames_ += 1;
+      if (profile_frames_ % 50 == 0) {
+        const double denom = static_cast<double>(profile_frames_);
+        std::cerr << "[klt_tracker_cpp] avg_ms total=" << accum_total_ms_ / denom
+                  << " lk=" << accum_lk_ms_ / denom
+                  << " stereo=" << accum_stereo_ms_ / denom
+                  << " detect=" << accum_detect_ms_ / denom
+                  << " pack=" << accum_pack_ms_ / denom << std::endl;
+      }
+    }
+    return result;
   }
 
-  std::pair<py::list, py::dict> track(const py::list &rectified_frames) {
+  py::tuple track(const py::list &rectified_frames) {
     reset();
     for (const auto &item : rectified_frames) {
       track_frame(py::reinterpret_borrow<py::object>(item));
     }
     py::list history;
-    for (const auto &frame_obs : track_history_) {
-      history.append(obs_map_to_dict(frame_obs));
+    for (const auto &frame_batch : track_history_) {
+      py::array_t<int64_t> ids_array(
+          {static_cast<py::ssize_t>(frame_batch.ids.size())});
+      auto ids_buf = ids_array.mutable_unchecked<1>();
+      for (py::ssize_t i = 0; i < ids_buf.shape(0); ++i) {
+        ids_buf(i) = static_cast<int64_t>(frame_batch.ids[i]);
+      }
+
+      py::array_t<float> kps_array(
+          {static_cast<py::ssize_t>(frame_batch.keypoints.size()),
+           static_cast<py::ssize_t>(2)});
+      auto kps_buf = kps_array.mutable_unchecked<2>();
+      for (py::ssize_t i = 0; i < kps_buf.shape(0); ++i) {
+        kps_buf(i, 0) = frame_batch.keypoints[i].x;
+        kps_buf(i, 1) = frame_batch.keypoints[i].y;
+      }
+
+      py::array_t<float> depths_array(
+          {static_cast<py::ssize_t>(frame_batch.depths.size())});
+      auto depths_buf = depths_array.mutable_unchecked<1>();
+      for (py::ssize_t i = 0; i < depths_buf.shape(0); ++i) {
+        depths_buf(i) = frame_batch.depths[i];
+      }
+
+      history.append(py::make_tuple(ids_array, kps_array, depths_array));
     }
-    return {history, track_map_to_dict(tracks_)};
+    return py::make_tuple(history, track_map_to_dict(tracks_));
   }
 
   py::dict get_tracks() const { return track_map_to_dict(tracks_); }
   py::list get_track_history() const {
     py::list history;
-    for (const auto &frame_obs : track_history_) {
-      history.append(obs_map_to_dict(frame_obs));
+    for (const auto &frame_batch : track_history_) {
+      py::array_t<int64_t> ids_array(
+          {static_cast<py::ssize_t>(frame_batch.ids.size())});
+      auto ids_buf = ids_array.mutable_unchecked<1>();
+      for (py::ssize_t i = 0; i < ids_buf.shape(0); ++i) {
+        ids_buf(i) = static_cast<int64_t>(frame_batch.ids[i]);
+      }
+
+      py::array_t<float> kps_array(
+          {static_cast<py::ssize_t>(frame_batch.keypoints.size()),
+           static_cast<py::ssize_t>(2)});
+      auto kps_buf = kps_array.mutable_unchecked<2>();
+      for (py::ssize_t i = 0; i < kps_buf.shape(0); ++i) {
+        kps_buf(i, 0) = frame_batch.keypoints[i].x;
+        kps_buf(i, 1) = frame_batch.keypoints[i].y;
+      }
+
+      py::array_t<float> depths_array(
+          {static_cast<py::ssize_t>(frame_batch.depths.size())});
+      auto depths_buf = depths_array.mutable_unchecked<1>();
+      for (py::ssize_t i = 0; i < depths_buf.shape(0); ++i) {
+        depths_buf(i) = frame_batch.depths[i];
+      }
+
+      history.append(py::make_tuple(ids_array, kps_array, depths_array));
     }
     return history;
   }
@@ -685,8 +800,16 @@ private:
   cv::TermCriteria lk_criteria_;
   int refill_threshold_ = 0;
 
+  bool profile_timing_ = false;
+  double accum_total_ms_ = 0.0;
+  double accum_lk_ms_ = 0.0;
+  double accum_stereo_ms_ = 0.0;
+  double accum_detect_ms_ = 0.0;
+  double accum_pack_ms_ = 0.0;
+  int profile_frames_ = 0;
+
   std::unordered_map<int, FeatureTrack> tracks_;
-  std::vector<std::unordered_map<int, TrackObservation>> track_history_;
+  std::vector<FrameBatch> track_history_;
 
   cv::Mat prev_gray_;
   std::vector<cv::Point2f> prev_points_;
@@ -718,7 +841,7 @@ PYBIND11_MODULE(klt_tracker_cpp, m) {
       .def(py::init<int, double, double, std::pair<int, int>, int, int, double,
                     double, double, double, double, int, bool, double, int, int,
                     int, double, bool, double, double, double, double, int,
-                    double>(),
+                    double, bool>(),
            py::arg("max_feature_count") = 1024,
            py::arg("refill_feature_ratio") = 0.8,
            py::arg("feature_suppression_radius") = 8.0,
@@ -740,7 +863,8 @@ PYBIND11_MODULE(klt_tracker_cpp, m) {
            py::arg("stereo_max_y_diff") = 2.0,
            py::arg("min_disparity") = 0.1,
            py::arg("stereo_ransac_min_inliers") = 8,
-           py::arg("stereo_ransac_confidence") = 0.999)
+           py::arg("stereo_ransac_confidence") = 0.999,
+           py::arg("profile_timing") = false)
       .def("reset", &KLTFeatureTrackerCpp::reset)
       .def("track_frame", &KLTFeatureTrackerCpp::track_frame)
       .def("track", &KLTFeatureTrackerCpp::track)

@@ -13,7 +13,7 @@ from gtsam.symbol_shorthand import B, L, V, X
 
 from slam.registration.registration import RectifiedStereoFrame
 
-from .klt_tracker import TrackObservation
+from .klt_tracker import TrackObservation, TrackObservationsBatch
 
 
 @dataclass
@@ -125,7 +125,7 @@ class FixedLagBundleAdjuster:
 
         self._add_prior_factors(ts, pose, velocity)
 
-    def process(self, frame: RectifiedStereoFrame, ts: float, relative_pose: gtsam.Pose3, estimated_velocity: np.ndarray, landmark_observations: Mapping[int, TrackObservation], pim: gtsam.PreintegratedCombinedMeasurements, optimize: bool = True, profile: bool = False) -> dict[str, int]:
+    def process(self, frame: RectifiedStereoFrame, ts: float, relative_pose: gtsam.Pose3, estimated_velocity: np.ndarray, landmark_observations: Mapping[int, TrackObservation] | TrackObservationsBatch, pim: gtsam.PreintegratedCombinedMeasurements, optimize: bool = True, profile: bool = False) -> dict[str, int]:
         profiler = _SectionProfiler(log_prefix="fixed_lag_bundle_adjustment.process")
 
         stats: dict[str, int] = {
@@ -137,6 +137,9 @@ class FixedLagBundleAdjuster:
             "rejected_not_selected": 0,
             "active_landmarks": 0,
         }
+
+        if not isinstance(landmark_observations, TrackObservationsBatch):
+            landmark_observations = TrackObservationsBatch.from_any(landmark_observations)
 
         # Extract Extrinsics (Body -> Sensor)
         body_P_sensor = frame.calibration.imu_from_left
@@ -347,25 +350,33 @@ class FixedLagBundleAdjuster:
         pose_cam = pose_body.compose(body_P_sensor)
         camera = gtsam.PinholeCameraCal3_S2(pose_cam, calib)
 
-        for original_track_id, obs in observations.items():
-            # Filter Invalid Depth
-            if obs.depth is None or not np.isfinite(obs.depth) or obs.depth <= 0.0 or obs.depth > 40.0:
+        if isinstance(observations, TrackObservationsBatch):
+            ids_arr = observations.ids.astype(int)
+            kps_arr = observations.keypoints
+            depths_arr = observations.depths
+            obs_iter = zip(ids_arr.tolist(), kps_arr, depths_arr)
+        else:
+            obs_iter = (
+                (tid, obs.keypoint, obs.depth) for tid, obs in observations.items()
+            )
+
+        for original_track_id, keypoint, depth_val in obs_iter:
+            if depth_val is None or not np.isfinite(depth_val) or depth_val <= 0.0 or depth_val > 40.0:
                 if stats is not None:
                     stats["rejected_depth"] += 1
                 continue
 
-            # ID Management
             if original_track_id not in self.landmark_key_map:
                 self.landmark_key_map[original_track_id] = original_track_id
             track_id = self.landmark_key_map[original_track_id]
             key_L = L(track_id)
 
             # Create Factor
-            disparity = (stereo_calib.fx() * stereo_calib.baseline()) / obs.depth
+            disparity = (stereo_calib.fx() * stereo_calib.baseline()) / depth_val
             stereo_meas = gtsam.StereoPoint2(
-                float(obs.keypoint[0]),
-                float(obs.keypoint[0] - disparity),
-                float(obs.keypoint[1])
+                float(keypoint[0]),
+                float(keypoint[0] - disparity),
+                float(keypoint[1])
             )
 
             # FIX 2: Use GenericStereoFactor3D with BODY POSE + EXTRINSICS
@@ -383,7 +394,7 @@ class FixedLagBundleAdjuster:
                 existing_point = self.full_values.atPoint3(key_L)
                 try:
                     projected_pt2 = camera.project(existing_point)
-                    residual = projected_pt2 - gtsam.Point2(float(obs.keypoint[0]), float(obs.keypoint[1]))
+                    residual = projected_pt2 - gtsam.Point2(float(keypoint[0]), float(keypoint[1]))
                     if np.linalg.norm(residual) ** 2 > self.config.reprojection_gating_threshold_px ** 2:
                         if stats is not None:
                             stats["rejected_reprojection"] += 1
@@ -411,7 +422,7 @@ class FixedLagBundleAdjuster:
                     key_L_new = L(new_track_id)
                     
                     # Re-triangulate fresh point
-                    point = camera.backproject(obs.keypoint, obs.depth)
+                    point = camera.backproject(keypoint, depth_val)
                     
                     self.new_values.insert(key_L_new, point)
                     self.full_values.insert(key_L_new, point)
@@ -435,7 +446,7 @@ class FixedLagBundleAdjuster:
 
             else:
                 # New Landmark
-                point = camera.backproject(obs.keypoint, obs.depth)
+                point = camera.backproject(keypoint, depth_val)
                 
                 self.new_values.insert(key_L, point)
                 self.full_values.insert(key_L, point)

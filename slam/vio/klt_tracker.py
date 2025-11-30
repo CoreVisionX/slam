@@ -18,6 +18,41 @@ class TrackObservation:
 
 
 @dataclass
+class TrackObservationsBatch:
+    ids: np.ndarray
+    keypoints: np.ndarray
+    depths: np.ndarray
+
+    def __len__(self) -> int:
+        return int(self.ids.shape[0])
+
+    @classmethod
+    def from_any(cls, observations: Any) -> "TrackObservationsBatch":
+        if isinstance(observations, cls):
+            return observations
+        if isinstance(observations, tuple) and len(observations) == 3:
+            ids, keypoints, depths = observations
+            return cls(
+                ids=np.asarray(ids, dtype=np.int64),
+                keypoints=np.asarray(keypoints, dtype=np.float32),
+                depths=np.asarray(depths, dtype=np.float32),
+            )
+        if isinstance(observations, dict):
+            if not observations:
+                return cls(
+                    ids=np.empty(0, dtype=np.int64),
+                    keypoints=np.empty((0, 2), dtype=np.float32),
+                    depths=np.empty(0, dtype=np.float32),
+                )
+            items = list(observations.items())
+            return cls(
+                ids=np.fromiter((tid for tid, _ in items), dtype=np.int64, count=len(items)),
+                keypoints=np.asarray([v.keypoint for _, v in items], dtype=np.float32),
+                depths=np.asarray([v.depth for _, v in items], dtype=np.float32),
+            )
+        raise TypeError(f"Cannot convert observations of type {type(observations)}")
+
+@dataclass
 class FeatureTrack:
     track_id: int
     anchor_frame: int
@@ -636,3 +671,45 @@ class KLTFeatureTracker:
         for rectified_frame in rectified_frames:
             self.track_frame(rectified_frame)
         return list(self.track_history), dict(self.tracks)
+
+
+try:
+    from . import klt_tracker_cpp as _klt_tracker_cpp
+except Exception:
+    _klt_tracker_cpp = None
+
+
+if _klt_tracker_cpp is not None:
+    class KLTFeatureTrackerCpp(_klt_tracker_cpp.KLTFeatureTrackerCpp):
+        def track_frame(self, rectified_frame: RectifiedStereoFrame) -> TrackObservationsBatch:
+            ids, keypoints, depths = super().track_frame(rectified_frame)
+            return TrackObservationsBatch(
+                ids=np.asarray(ids, dtype=np.int64),
+                keypoints=np.asarray(keypoints, dtype=np.float32),
+                depths=np.asarray(depths, dtype=np.float32),
+            )
+
+        def track(self, rectified_frames: list[RectifiedStereoFrame]):
+            history, tracks = super().track(rectified_frames)
+            history_batches = [
+                TrackObservationsBatch(
+                    ids=np.asarray(batch[0], dtype=np.int64),
+                    keypoints=np.asarray(batch[1], dtype=np.float32),
+                    depths=np.asarray(batch[2], dtype=np.float32),
+                )
+                for batch in history
+            ]
+            return history_batches, tracks
+
+    FeatureTrackCpp = _klt_tracker_cpp.FeatureTrack
+    TrackObservationCpp = _klt_tracker_cpp.TrackObservation
+else:
+    class KLTFeatureTrackerCpp:
+        def __init__(self, *_, **__) -> None:
+            raise ImportError(
+                "klt_tracker_cpp extension is not built. "
+                "Run the C++ build to enable the fast tracker."
+            )
+
+    FeatureTrackCpp = None
+    TrackObservationCpp = None

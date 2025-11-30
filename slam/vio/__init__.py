@@ -8,12 +8,26 @@ from .bundle_adjustment import (
 from .config import VIOConfig, compute_vio_calibration
 from .core import VIO
 from .io import VIORerunLogger, save_tum_sequence
+from .klt_tracker import (
+    FeatureTrack,
+    KLTFeatureTracker,
+    KLTFeatureTrackerCpp,
+    KLTTrackerConfig,
+    TrackObservation,
+    TrackObservationsBatch,
+)
 from .relative_pose import RelativePnPInitializer, RelativePnPInitializerConfig
 from .types import VIOCalibration, VIOEstimate
 
 __all__ = [
     "BundleAdjustmentConfig",
     "FixedLagBundleAdjuster",
+    "FeatureTrack",
+    "KLTFeatureTracker",
+    "KLTFeatureTrackerCpp",
+    "KLTTrackerConfig",
+    "TrackObservation",
+    "TrackObservationsBatch",
     "RelativePnPInitializer",
     "RelativePnPInitializerConfig",
     "finite_difference_velocity",

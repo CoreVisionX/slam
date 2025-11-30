@@ -10,8 +10,7 @@ from slam.depth.sgbm import SGBM
 from slam.hydra_utils import compose_config, extract_target_config
 from slam.registration.registration import RectifiedStereoFrame, StereoDepthFrame
 from slam.vio.bundle_adjustment import FixedLagBundleAdjuster, finite_difference_velocity
-from slam.vio.klt_tracker import KLTFeatureTracker
-from slam.vio.klt_tracker_cpp import KLTFeatureTrackerCpp
+from slam.vio.klt_tracker import KLTFeatureTracker, KLTFeatureTrackerCpp, TrackObservationsBatch
 from slam.vio.relative_pose import RelativePnPInitializer
 from .config import VIOConfig, compute_vio_calibration
 from .io import VIORerunLogger
@@ -105,7 +104,9 @@ class VIO:
         
         rect_frame = self.preprocess_frame(left_rect, right_rect)
 
-        observations = self.feature_tracker.track_frame(rect_frame)        
+        observations = self.feature_tracker.track_frame(rect_frame)
+        if isinstance(observations, tuple):
+            observations = TrackObservationsBatch.from_any(observations)
         pnp_result = self.T_current_from_latest_keyframe_initializer.process_frame(
             frame_index=self.frame_idx,
             rectified_frame=rect_frame,
@@ -159,7 +160,15 @@ class VIO:
         # only use pnp inliers
         if self.config.ransac_inliers_only and pnp_result["status"] == "success":
             valid_track_ids = pnp_result["track_ids"]
-            observations = { k: v for k, v in observations.items() if k in valid_track_ids }
+            if isinstance(observations, TrackObservationsBatch):
+                mask = np.isin(observations.ids, valid_track_ids)
+                observations = TrackObservationsBatch(
+                    ids=observations.ids[mask],
+                    keypoints=observations.keypoints[mask],
+                    depths=observations.depths[mask],
+                )
+            else:
+                observations = { k: v for k, v in observations.items() if k in valid_track_ids }
 
         dt = timestamp - self.ba.prev_ts
         assert dt > 0, f"dt must be positive, got {dt}"
@@ -224,6 +233,8 @@ class VIO:
 
         rect_frame = self.preprocess_frame(left_rect, right_rect)
         observations = self.feature_tracker.track_frame(rect_frame)
+        if isinstance(observations, tuple):
+            observations = TrackObservationsBatch.from_any(observations)
         pnp_result = self.T_current_from_latest_keyframe_initializer.process_frame(
             frame_index=0,
             rectified_frame=rect_frame,

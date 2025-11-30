@@ -13,7 +13,7 @@ from slam.registration.registration import (
 )
 from slam.registration.utils import solve_pnp
 
-from .klt_tracker import TrackObservation
+from .klt_tracker import TrackObservation, TrackObservationsBatch
 
 
 @dataclass
@@ -40,7 +40,7 @@ class RelativePnPInitializer:
         self._first_gt_pose: gtsam.Pose3 | None = None
         self._world_pose: gtsam.Pose3 | None = None
         self._prev_rectified_frame: RectifiedStereoFrame | None = None
-        self._prev_track_observations: dict[int, TrackObservation] | None = None
+        self._prev_track_observations: dict[int, TrackObservation] | TrackObservationsBatch | tuple | None = None
         self._prev_frame_index: int | None = None
         self.results: list[dict[str, Any]] = []
         self.store_results = store_results
@@ -68,7 +68,7 @@ class RelativePnPInitializer:
     def estimate_sequence_poses(
         self,
         rectified_frames: list[RectifiedStereoFrame],
-        track_history: list[dict[int, TrackObservation]],
+        track_history: list[dict[int, TrackObservation] | TrackObservationsBatch | tuple],
         sequence_sample: Any,
     ) -> list[dict[str, Any]]:
         self.reset_with_gt(sequence_sample)
@@ -86,7 +86,7 @@ class RelativePnPInitializer:
         *,
         frame_index: int,
         rectified_frame: RectifiedStereoFrame,
-        track_observations: dict[int, TrackObservation],
+        track_observations: dict[int, TrackObservation] | TrackObservationsBatch | tuple,
         frame_id: str | None = None,
     ) -> dict[str, Any] | None:
         """Incrementally process a frame and return the PnP result when available."""
@@ -110,10 +110,18 @@ class RelativePnPInitializer:
         sequence_sample = self._sequence_sample
         prev_world_pose = self._world_pose
         curr_obs = track_observations
-        
+
+        def _to_batch(obs: dict[int, TrackObservation] | TrackObservationsBatch | tuple) -> TrackObservationsBatch:
+            return TrackObservationsBatch.from_any(obs)
+
+        prev_batch = _to_batch(prev_obs)
+        curr_batch = _to_batch(curr_obs)
+
         # Identify common tracks
-        common_track_ids = sorted(set(prev_obs.keys()) & set(curr_obs.keys()))
-        
+        common_ids, prev_idx, curr_idx = np.intersect1d(
+            prev_batch.ids, curr_batch.ids, assume_unique=False, return_indices=True
+        )
+
         current_frame_id = frame_id
         if current_frame_id is None:
             if sequence_sample is not None:
@@ -121,42 +129,36 @@ class RelativePnPInitializer:
             else:
                 current_frame_id = str(frame_index)
 
-        if not common_track_ids:
+        if common_ids.size == 0:
             return self._record_failure(
                 frame_index, current_frame_id, "no_tracks", 0,
                 rectified_frame, track_observations
             )
 
-        # Gather points and verify depth from previous observations
-        prev_kps_list = []
-        prev_depths_list = []
-        curr_kps_list = []
-        valid_track_ids_list = []
+        matches_before_filter = int(common_ids.size)
 
-        for tid in common_track_ids:
-            obs = prev_obs[tid]
-            depth_val = obs.depth
-            
-            # Filter invalid depths
-            if depth_val <= 0.0 or depth_val > cfg.max_depth or not np.isfinite(depth_val):
-                continue
-                
-            prev_kps_list.append(obs.keypoint)
-            prev_depths_list.append(depth_val)
-            curr_kps_list.append(curr_obs[tid].keypoint)
-            valid_track_ids_list.append(tid)
+        prev_kps = prev_batch.keypoints[prev_idx]
+        prev_depths = prev_batch.depths[prev_idx]
+        curr_kps = curr_batch.keypoints[curr_idx]
+        valid_track_ids = common_ids.astype(int)
 
-        if len(prev_kps_list) < cfg.min_matches_for_pnp:
+        # Filter invalid depths
+        depth_mask = (
+            (prev_depths > 0.0)
+            & (prev_depths <= cfg.max_depth)
+            & np.isfinite(prev_depths)
+        )
+
+        prev_kps = prev_kps[depth_mask]
+        prev_depths = prev_depths[depth_mask]
+        curr_kps = curr_kps[depth_mask]
+        valid_track_ids = valid_track_ids[depth_mask]
+
+        if prev_kps.shape[0] < cfg.min_matches_for_pnp:
             return self._record_failure(
                 frame_index, current_frame_id, "insufficient_tracks", 
-                len(prev_kps_list), rectified_frame, track_observations
+                prev_kps.shape[0], rectified_frame, track_observations
             )
-
-        # Convert to numpy arrays
-        prev_kps = np.array(prev_kps_list, dtype=np.float32)
-        prev_depths = np.array(prev_depths_list, dtype=np.float32)
-        curr_kps = np.array(curr_kps_list, dtype=np.float32)
-        valid_track_ids = np.array(valid_track_ids_list, dtype=int)
 
         # Unproject previous points to 3D using previous frame intrinsics (Rectified)
         K = prev_rectified.calibration.K_left_rect
@@ -254,7 +256,7 @@ class RelativePnPInitializer:
             "frame_id": current_frame_id,
             "status": "success",
             "active_track_count": len(prev_kps),
-            "matches_before_filter": len(common_track_ids),
+            "matches_before_filter": matches_before_filter,
             "matches_after_filter": inlier_pair.matches.shape[0],
             "estimated_pose": estimated_pose,
             "ground_truth_pose": ground_truth_pose,
@@ -276,7 +278,7 @@ class RelativePnPInitializer:
         status: str, 
         count: int,
         rectified_frame: RectifiedStereoFrame,
-        track_observations: dict[int, TrackObservation],
+        track_observations: dict[int, TrackObservation] | TrackObservationsBatch | tuple,
         error_msg: str | None = None
     ) -> dict[str, Any]:
         result = {
@@ -297,7 +299,7 @@ class RelativePnPInitializer:
     def _update_previous_frame(
         self,
         rectified_frame: RectifiedStereoFrame,
-        track_observations: dict[int, TrackObservation],
+        track_observations: dict[int, TrackObservation] | TrackObservationsBatch | tuple,
         frame_index: int,
     ) -> None:
         self._prev_rectified_frame = rectified_frame
