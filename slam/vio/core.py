@@ -41,7 +41,7 @@ class VIO:
     ):
         self.config = config
         self.feature_tracker = feature_tracker
-        self.relative_pose_initializer = relative_pose_initializer
+        self.T_current_from_latest_keyframe_initializer = relative_pose_initializer
         self.ba = ba
         self.imu_preintegrator = imu_preintegrator
         self.logger = logger
@@ -51,7 +51,7 @@ class VIO:
         self.sgbm = SGBM() # TODO: configure sgbm via hydra too. definitely need to support max depth at least
 
         self.frame_idx = 0
-        self.relative_pose = gtsam.Pose3.Identity() # relative pose from the latest keyframe to the current frame
+        self.T_current_from_latest_keyframe = gtsam.Pose3.Identity() # relative pose from the latest keyframe to the current frame
 
     @profile
     def process(
@@ -102,7 +102,7 @@ class VIO:
         rect_frame = self.preprocess_frame(left_rect, right_rect)
 
         observations = self.feature_tracker.track_frame(rect_frame)        
-        pnp_result = self.relative_pose_initializer.process_frame(
+        pnp_result = self.T_current_from_latest_keyframe_initializer.process_frame(
             frame_index=self.frame_idx,
             rectified_frame=rect_frame,
             track_observations=observations
@@ -115,16 +115,16 @@ class VIO:
             dt = timestamp - self.ba.prev_ts
             assert dt > 0, f"dt must be positive, got {dt}"
             
-            relative_pose = gtsam.Pose3(gtsam.Rot3.Identity(), last_velocity * dt)
+            T_current_from_previous_current = gtsam.Pose3(gtsam.Rot3.Identity(), last_velocity * dt)
         else:
-            relative_pose = pnp_result["relative_pose"]
+            T_current_from_previous_current = pnp_result["relative_pose"]
 
         # compose the relative pose with the current keyframe relative pose
-        self.relative_pose = relative_pose * self.relative_pose
+        self.T_current_from_latest_keyframe = self.T_current_from_latest_keyframe * T_current_from_previous_current
 
         # only process keyframes
         if not is_keyframe:
-            pose = self.relative_pose * self.ba.get_latest_pose()
+            pose = self.ba.get_latest_pose() * self.T_current_from_latest_keyframe
             trajectory = self.ba.get_trajectory() + [pose] # add the latest pose to the keyframed trajectory
             landmarks = self.ba.get_active_landmarks()
             all_landmarks = self.ba.get_all_landmarks()
@@ -164,14 +164,14 @@ class VIO:
 
         estimated_velocity = finite_difference_velocity(
             prev_pose=gtsam.Pose3.Identity(),
-            next_pose=relative_pose,
+            next_pose=T_current_from_previous_current,
             dt=dt
         )
 
         ba_stats = self.ba.process(
             frame=rect_frame,
             ts=timestamp,
-            relative_pose=self.relative_pose,
+            relative_pose=self.T_current_from_latest_keyframe,
             estimated_velocity=estimated_velocity,
             landmark_observations=observations,
             pim=self.imu_preintegrator.pim,
@@ -181,7 +181,7 @@ class VIO:
 
         # reset relative pose since this is a new keyframe
         assert is_keyframe
-        self.relative_pose = gtsam.Pose3.Identity()
+        self.T_current_from_latest_keyframe = gtsam.Pose3.Identity()
         
         # Update IMU preintegrator with latest bias estimate
         self.imu_preintegrator.reset(self.ba.get_bias())
@@ -214,11 +214,11 @@ class VIO:
     def reset(self, timestamp: float, left_rect: np.ndarray, right_rect: np.ndarray, t: np.ndarray, R: np.ndarray, v: np.ndarray = None):
         self.feature_tracker.reset()
         initial_pose = gtsam.Pose3(gtsam.Rot3(R), t)
-        self.relative_pose_initializer.reset(initial_pose)
+        self.T_current_from_latest_keyframe_initializer.reset(initial_pose)
 
         rect_frame = self.preprocess_frame(left_rect, right_rect)
         observations = self.feature_tracker.track_frame(rect_frame)
-        pnp_result = self.relative_pose_initializer.process_frame(
+        pnp_result = self.T_current_from_latest_keyframe_initializer.process_frame(
             frame_index=0,
             rectified_frame=rect_frame,
             track_observations=observations
