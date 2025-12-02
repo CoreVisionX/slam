@@ -10,6 +10,7 @@ from slam.vio.core import VIO
 
 
 # TODO: fix the shared memory leaks
+# TODO: a proper initialization sequence/routine for a second of the robot sitting still could help a lot, esp. with imu frames and gravity initialization
 
 
 def _extract_imu_window(
