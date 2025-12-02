@@ -17,15 +17,17 @@ from .io import VIORerunLogger
 from .imu_preintegration import ImuPreintegrator
 from .types import VIOEstimate
 
-# TODO: see if switching to CombinedImuFactors helps on longer sequences by accounting for IMU bias drift
+
+# TODO: add an explicit initialization period to estimate gravity and initial bias
+# TODO: try using cad extrinsics for the IMU
+# TODO: output at the IMU update rate instead of frame rate
+# TODO: run the frontend at a higher rate in a separate thread from the backend
+# TODO: proper d435i calibration (imu mainly)?
+
 # TODO: see if relative pose initialization via Imu Preintegration is better than PnP
 
 # support for absolute orientation with magnometers (or even GPS) would be super useful and not that hard to add
 
-# TODO: see if adding keyframing helps accuracy and performance at all. definitely could by making longer lag windows much more feasible
-# TODO: see if adding a minimum number of observations per landmark before it's added to the graph helps accuracy
-
-# TODO: offer a way to get poses at the IMU update rate
 # maybe that should come with multithreading support?
 # TODO: timing/profiling capabilities. should be well integrated with VIORerunLogger for easy debugging
 # TODO: num landmark / landmark rejection count stats for debugging, should also be well integrated with VIORerunLogger for easy debugging

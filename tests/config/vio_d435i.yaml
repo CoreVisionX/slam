@@ -124,8 +124,6 @@ ba:
     light_relative_pose_sigmas: [0.2, 0.2, 0.2, 0.1, 0.1, 0.1]
     min_depth: 0.0
     lag: 3.0
-    # make sure visual only works first
-    # imu_bias_prior_for_factors: [1000.0, 1000.0, 1000.0, 1000.0, 1000.0, 1000.0]
     imu_bias_prior_for_factors: [0.5, 0.5, 0.5, 0.01, 0.01, 0.01]
 
 imu_preintegrator:
@@ -146,7 +144,8 @@ imu_preintegrator:
 
 logger:
   _target_: slam.vio.io.VIORerunLogger
-  spawn: true
+  spawn: false
+  url: ${oc.env:RERUN_URL}
   feature_radii: 4.0
   image_plane_dist: 0.2
   cam_view_coordinates: RDF

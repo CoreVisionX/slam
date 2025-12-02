@@ -10,6 +10,9 @@ find_package(OpenCV REQUIRED)
 # pybind11 from your pixi env
 find_package(pybind11 CONFIG REQUIRED)
 
+# System librealsense (librealsense2-dev)
+find_package(realsense2 REQUIRED)
+
 # We want the Python extension to land inside slam/vio so that
 # `import slam.vio.stereo_matching` works without extra sys.path hacks.
 # Remember: source_dir here is `cpp/`, Python package is ../slam/vio
@@ -28,5 +31,13 @@ pybind11_add_module(klt_tracker_cpp klt_tracker_cpp.cpp)
 target_link_libraries(klt_tracker_cpp PRIVATE ${OpenCV_LIBS})
 
 set_target_properties(klt_tracker_cpp PROPERTIES
+    LIBRARY_OUTPUT_DIRECTORY "${PY_PKG_DIR}"
+)
+
+# ---- pybind11 module: rs_sdk ----
+pybind11_add_module(rs_sdk rs_sdk.cpp)
+target_link_libraries(rs_sdk PRIVATE realsense2::realsense2 ${OpenCV_LIBS})
+
+set_target_properties(rs_sdk PROPERTIES
     LIBRARY_OUTPUT_DIRECTORY "${PY_PKG_DIR}"
 )

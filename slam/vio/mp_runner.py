@@ -5,6 +5,7 @@ from pathlib import Path
 import time
 
 import numpy as np
+import rerun as rr
 
 from slam.vio.core import VIO
 
@@ -187,7 +188,8 @@ def async_vio_worker(
             )
 
             if imu_ts_arr.size == 0:
-                print(f"[AsyncVIO] Low IMU sample count: {imu_ts_arr.size}")
+                if rr.get_global_data_recording() is not None:
+                    rr.log("async_vio/logs", rr.TextLog(f"Low IMU sample count: {imu_ts_arr.size}"))
                 continue
 
             vio.process(
@@ -204,10 +206,12 @@ def async_vio_worker(
                 elapsed = time.perf_counter() - start_time
                 if elapsed > 0:
                     fps = frame_count / elapsed
-                    print(f"[AsyncVIO] Total processed frames: {frame_count}, FPS: {fps:.2f}")
+                    if rr.get_global_data_recording() is not None:
+                        rr.log("async_vio/logs", rr.TextLog(f"Total processed frames: {frame_count}, FPS: {fps:.2f}"))
 
             if frame_count % 100 == 0:
-                print(f"[AsyncVIO] Total distance traveled: {vio.get_distance_traveled():.2f}m")
+                if rr.get_global_data_recording() is not None:
+                    rr.log("async_vio/logs", rr.TextLog(f"Total distance traveled: {vio.get_distance_traveled():.2f}m"))
 
 
 class AsyncVIO:
@@ -320,6 +324,33 @@ class AsyncVIO:
     def stop(self):
         self.worker.terminate()
         self.worker.join()
+
+        # delete shared memory
+        self.timestamp_shm.close()
+        self.left_rect_shm.close()
+        self.right_rect_shm.close()
+        self.imu_ts_buffer_shm.close()
+        self.imu_acc_buffer_shm.close()
+        self.imu_gyro_buffer_shm.close()
+        self.reset_timestamp_shm.close()
+        self.reset_left_rect_shm.close()
+        self.reset_right_rect_shm.close()
+        self.reset_t_shm.close()
+        self.reset_R_shm.close()
+        self.reset_v_shm.close()
+
+        self.timestamp_shm.unlink()
+        self.left_rect_shm.unlink()
+        self.right_rect_shm.unlink()
+        self.imu_ts_buffer_shm.unlink()
+        self.imu_acc_buffer_shm.unlink()
+        self.imu_gyro_buffer_shm.unlink()
+        self.reset_timestamp_shm.unlink()
+        self.reset_left_rect_shm.unlink()
+        self.reset_right_rect_shm.unlink()
+        self.reset_t_shm.unlink()
+        self.reset_R_shm.unlink()
+        self.reset_v_shm.unlink()
 
     def __enter__(self):
         return self
