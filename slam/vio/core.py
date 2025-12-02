@@ -24,6 +24,8 @@ from .types import VIOEstimate
 # TODO: run the frontend at a higher rate in a separate thread from the backend
 # TODO: proper d435i calibration (imu mainly)?
 
+# TODO: comprehensive test suite for euroc (and kitti) to ensure accuracy and prevent regressions
+
 # TODO: see if relative pose initialization via Imu Preintegration is better than PnP
 
 # support for absolute orientation with magnometers (or even GPS) would be super useful and not that hard to add
