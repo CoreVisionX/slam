@@ -9,6 +9,9 @@ import numpy as np
 from slam.vio.core import VIO
 
 
+# TODO: fix the shared memory leaks
+
+
 def _extract_imu_window(
     imu_ts_buf: np.ndarray,
     imu_acc_buf: np.ndarray,
