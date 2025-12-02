@@ -9,10 +9,14 @@ class CustomBuildHook(BuildHookInterface):
         
         # Define the build command
         # We use the same command as defined in pixi.toml for the build-cpp task
+        clean_cmd = ["rm", "-rf", "build"]
         configure_cmd = ["cmake", "-S", "cpp", "-B", "build", "-G", "Ninja", "-DCMAKE_BUILD_TYPE=Release"]
         build_cmd = ["cmake", "--build", "build"]
 
         try:
+            print(f"Executing: {' '.join(clean_cmd)}")
+            subprocess.check_call(clean_cmd)
+            
             print(f"Executing: {' '.join(configure_cmd)}")
             subprocess.check_call(configure_cmd)
             

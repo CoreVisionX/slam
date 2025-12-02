@@ -68,7 +68,7 @@ rerun-sdk = ">=0.27, <0.28"
 tqdm = ">=4.66.0, <5"
 
 [tasks.build]
-cmd = "pixi build"
+cmd = "rm -rf build && pixi build"
 
 [tasks.euroc]
 cmd = "cd tests && python vio_example_euroc.py"
