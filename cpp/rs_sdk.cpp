@@ -111,11 +111,15 @@ public:
             for (auto& s : sensors) {
                 // Disable motion correction to get raw data
                 if (s.supports(RS2_OPTION_ENABLE_MOTION_CORRECTION))
-                    s.set_option(RS2_OPTION_ENABLE_MOTION_CORRECTION, 1);
+                    s.set_option(RS2_OPTION_ENABLE_MOTION_CORRECTION, 0);
                 
                 // Disable Global Time to ensure we get Hardware timestamps
                 if (s.supports(RS2_OPTION_GLOBAL_TIME_ENABLED))
                     s.set_option(RS2_OPTION_GLOBAL_TIME_ENABLED, 0);
+
+                // Disable IR emitter
+                if (s.supports(RS2_OPTION_EMITTER_ENABLED))
+                    s.set_option(RS2_OPTION_EMITTER_ENABLED, 0);
             }
         }
 

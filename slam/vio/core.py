@@ -21,7 +21,7 @@ from .types import VIOEstimate
 # TODO: add an explicit initialization period to estimate gravity and initial bias
 # TODO: try using cad extrinsics for the IMU
 # TODO: output at the IMU update rate instead of frame rate
-# TODO: run the frontend at a higher rate in a separate thread from the backend
+# TODO: run the frontend at a higher rate in a separate thread from the backend (same with logging)
 # TODO: proper d435i calibration (imu mainly)?
 
 # TODO: comprehensive test suite for euroc (and kitti) to ensure accuracy and prevent regressions
