@@ -9,7 +9,7 @@ preview = ["pixi-build"]
 [tasks]
 
 [dependencies]
-python = ">=3.10,<3.12"
+python = ">=3.11,<3.12"
 pip = ">=25.2,<26"
 hydra-core = ">=1.3.2,<2"
 rerun-sdk = ">=0.27, <0.28"
@@ -60,7 +60,7 @@ backend = { name = "pixi-build-python", version = "==0.4.0" }
 hatchling = "==1.26.3"
 
 [package.run-dependencies]
-python = ">=3.10,<3.12"
+python = ">=3.11,<3.12"
 hydra-core = ">=1.3.2,<2"
 gtsam-develop = ">=4.3a0.dev202510200041, <5"
 opencv-python-headless = ">=4, <5"

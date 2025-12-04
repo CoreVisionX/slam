@@ -1,5 +1,7 @@
 """Public interface for the lightweight VIO stack."""
 
+__version__ = "0.1.0"
+
 from .vio.core import VIO
 from .vio.config import VIOConfig, compute_vio_calibration
 from .vio.types import VIOEstimate, VIOCalibration

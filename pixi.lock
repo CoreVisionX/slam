@@ -25445,13 +25445,13 @@ packages:
 - pypi: ./
   name: slam
   version: 0.1.0
-  sha256: 3fdf50ea99b86918d2d163e540a5865503b6211953340be7a73319b09a6c81d5
+  sha256: 3c77e8a3636ea3b4c60bef20f22f2beff465551526658ba11d8d6d96d3695960
   requires_dist:
-  - hydra-core>=1.3.2,<2
   - gtsam-develop>=4.3a0.dev202510200041,<5
+  - hydra-core>=1.3.2,<2
+  - line-profiler>=5.0.0,<6
   - opencv-python-headless>=4,<5
   - rerun-sdk>=0.27,<0.28
-  - line-profiler>=5.0.0,<6
   requires_python: '>=3.10,<3.12'
   editable: true
 - conda: https://conda.anaconda.org/conda-forge/linux-aarch64/snappy-1.2.2-he774c54_1.conda
