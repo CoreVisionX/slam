@@ -38,7 +38,6 @@ class CustomBuildHook(BuildHookInterface):
         build_data['infer_tag'] = True
         
         # Define the build command
-        # We use the same command as defined in pixi.toml for the build-cpp task
         clean_cmd = ["rm", "-rf", "build"]
         configure_cmd = ["cmake", "-S", "cpp", "-B", "build", "-G", "Ninja", "-DCMAKE_BUILD_TYPE=Release"]
         build_cmd = ["cmake", "--build", "build"]

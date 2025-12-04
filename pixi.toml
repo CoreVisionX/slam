@@ -13,7 +13,6 @@ python = ">=3.11,<3.12"
 pip = ">=25.2,<26"
 hydra-core = ">=1.3.2,<2"
 rerun-sdk = ">=0.27, <0.28"
-opencv = ">=4.11.0,<5"
 cmake = ">=4.2.0,<5"
 ninja = ">=1.13.2,<2"
 compilers = ">=1.11.0,<2"
@@ -27,6 +26,9 @@ gtsam-develop = ">=4.3a0.dev202510200041, <5"
 opencv-python-headless = ">=4, <5"
 tqdm = ">=4.66.0, <5"
 line-profiler = ">=5.0.0, <6"
+auditwheel = ">=6.0.0, <7"
+patchelf = ">=0.17.0, <1"
+delocate = ">=0.12.0, <1"
 slam = { path = ".", editable = true }
 
 [feature.dev.pypi-dependencies]
@@ -73,3 +75,22 @@ cmd = "rm -rf build && pixi build"
 [tasks.euroc]
 cmd = "cd tests && python vio_example_euroc.py"
 depends-on = ["build"]
+
+[tasks.wheel-jetson]
+cmd = """
+rm -rf dist build && \
+CC=/usr/bin/gcc CXX=/usr/bin/g++ SLAM_BUILD_VARIANT=jetson uv build --wheel && \
+auditwheel repair dist/*.whl --plat manylinux_2_35_aarch64 -w dist/ && \
+rm -f dist/*-linux_aarch64.whl && \
+echo 'Built:' && ls dist/*.whl
+"""
+description = "Build portable Jetson wheel with bundled dependencies"
+
+[tasks.wheel-macos]
+cmd = """
+rm -rf dist build && \
+SLAM_BUILD_VARIANT=macos uv build --wheel && \
+delocate-wheel -v dist/*.whl && \
+echo 'Built:' && ls dist/*.whl
+"""
+description = "Build portable macOS wheel with bundled dependencies"

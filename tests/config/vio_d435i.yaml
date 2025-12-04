@@ -2,7 +2,7 @@ _target_: slam.vio.core.VIO
 
 config:
   _target_: slam.vio.config.VIOConfig
-  gravity: [0, 9.80655, 0]
+  gravity: [0, 9.80655, 0] # TODO: remove redundant gravity field
 
   # T_ic (cam -> imu) from Kalibr
   # imu_from_left:
@@ -62,7 +62,7 @@ config:
   height: 480
 
   optimize_every: 1
-  keyframe_interval: 12
+  keyframe_interval: 15
   log_every: 15
   log_landmarks_every: 128
 
@@ -112,7 +112,7 @@ ba:
     projection_noise_px: 0.5
     disparity_noise_px: 0.5
     use_huber_loss: true
-    reprojection_gating_threshold_px: 4.0
+    reprojection_gating_threshold_px: 32.0
     use_inlier_observations_only: false
     pose_prior_sigmas:
       [
@@ -144,14 +144,14 @@ imu_preintegrator:
   _target_: slam.vio.imu_preintegration.ImuPreintegrator
   config:
     _target_: slam.vio.imu_preintegration.ImuPreintegrationConfig
-    gravity: [0, 9.80655, 0]
+    gravity: [0, 9.80655, 0] # TODO: proper gravity initialization
     gravity_magnitude: 9.80655
 
     # From Kalibr IMU configuration (continuous noise densities)
-    # accel_noise: 0.008183027       # m/s^2 / sqrt(Hz)
-    # gyro_noise: 0.00109979       # rad/s  / sqrt(Hz)
-    accel_noise: 0.001177
-    gyro_noise: 0.000244
+    accel_noise: 0.008183027       # m/s^2 / sqrt(Hz)
+    gyro_noise: 0.00109979       # rad/s  / sqrt(Hz)
+    # accel_noise: 0.001177
+    # gyro_noise: 0.000244
 
     accel_random_walk: 7.976531501174554e-04
     gyro_random_walk: 2.882662305656072e-05

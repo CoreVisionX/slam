@@ -18,6 +18,7 @@ def main(argv=None) -> None:
     parser.add_argument("--fps", type=int, default=60)
     parser.add_argument("--warmup", type=float, default=1.0, help="Seconds to wait after spinning up the worker")
     parser.add_argument("--max-frames", type=int, default=0, help="Stop after this many processed frames (0 = infinite)")
+    parser.add_argument("--log-every", type=int, default=5, help="Log position estimate every N frames")
     args = parser.parse_args(argv)
 
     async_vio = AsyncVIO(vio_config_path=args.vio_config)
@@ -79,9 +80,10 @@ def main(argv=None) -> None:
                     rr.log("async_vio/logs", rr.TextLog(f"Reached max_frames={args.max_frames}, stopping stream."))
                 break
 
-        estimate = async_vio.get_current_estimate()
-        if estimate is not None:
-            print(f"Estimated Position: {estimate.t}")
+            if frame_idx % args.log_every == 0:
+                estimate = async_vio.get_current_estimate()
+                if estimate is not None:
+                    print(f"Estimated Position: {estimate.t}")
 
     except KeyboardInterrupt:
         print("Keyboard interrupt received, stopping...")

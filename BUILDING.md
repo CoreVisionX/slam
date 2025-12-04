@@ -7,27 +7,27 @@ Ensure the pixi environment is set up:
 pixi install
 ```
 
+Make sure OpenCV is installed on your system.
+
 ## Build Commands
 
 ```bash
-# Standard build
-PATH=".pixi/envs/default/bin:$PATH" uv build --wheel
-
-# Platform variant builds (Jetson, RPi, etc.)
-SLAM_BUILD_VARIANT=jetson PATH=".pixi/envs/default/bin:$PATH" uv build --wheel
-SLAM_BUILD_VARIANT=rpi PATH=".pixi/envs/default/bin:$PATH" uv build --wheel
+# Jetson build
+pixi run wheel-jetson
 ```
 
+See build commands for additional platforms in `pixi.toml`.
+
 Output wheels land in `dist/`:
-- `slam-0.1.0-cp311-cp311-linux_aarch64.whl`
-- `slam-0.1.0+jetson-cp311-cp311-linux_aarch64.whl`
-- `slam-0.1.0+rpi-cp311-cp311-linux_aarch64.whl`
+- `slam-0.1.0-cp311-cp311-manylinux_2_35_aarch64.whl`
+- `slam-0.1.0+jetson-cp311-cp311-manylinux_2_35_aarch64.whl`
+- `slam-0.1.0+rpi-cp311-cp311-manylinux_2_35_aarch64.whl`
 
 ## Install
 
 ```bash
-pip install dist/slam-0.1.0+jetson-cp311-cp311-linux_aarch64.whl
+pip install slam-0.1.0+jetson-cp311-cp311-manylinux_2_35_aarch64.whl
 # or
-uv pip install dist/slam-0.1.0+jetson-cp311-cp311-linux_aarch64.whl
+uv add slam-0.1.0+jetson-cp311-cp311-manylinux_2_35_aarch64.whl
 ```
 

@@ -4,18 +4,15 @@ project(slam_cpp LANGUAGES CXX)
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
-# OpenCV from your pixi env
 find_package(OpenCV REQUIRED)
-
-# pybind11 from your pixi env
 find_package(pybind11 CONFIG REQUIRED)
 
 # System librealsense (librealsense2-dev) - optional
 find_package(realsense2 QUIET)
 
 # We want the Python extension to land inside slam/vio so that
-# `import slam.vio.stereo_matching` works without extra sys.path hacks.
-# Remember: source_dir here is `cpp/`, Python package is ../slam/vio
+# `import slam.vio.stereo_matching` works
+# source_dir here is `cpp/`, Python package is ../slam/vio
 set(PY_PKG_DIR "${CMAKE_SOURCE_DIR}/../slam/vio")
 
 # ---- pybind11 module: stereo_matching ----
