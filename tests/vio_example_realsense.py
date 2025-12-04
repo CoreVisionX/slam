@@ -79,6 +79,10 @@ def main(argv=None) -> None:
                     rr.log("async_vio/logs", rr.TextLog(f"Reached max_frames={args.max_frames}, stopping stream."))
                 break
 
+        estimate = async_vio.get_current_estimate()
+        if estimate is not None:
+            print(f"Estimated Position: {estimate.t}")
+
     except KeyboardInterrupt:
         print("Keyboard interrupt received, stopping...")
     finally:

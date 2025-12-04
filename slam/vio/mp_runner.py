@@ -8,6 +8,7 @@ import numpy as np
 import rerun as rr
 
 from slam.vio.core import VIO
+from slam.vio.types import VIOEstimate
 
 
 # TODO: a proper initialization sequence/routine for a second of the robot sitting still could help a lot, esp. with imu frames and gravity initialization
@@ -79,6 +80,11 @@ def async_vio_worker(
     reset_t_shm: SharedMemory,
     reset_R_shm: SharedMemory,
     reset_v_shm: SharedMemory,
+    pose_timestamp_shm: SharedMemory,
+    pose_t_shm: SharedMemory,
+    pose_R_shm: SharedMemory,
+    pose_v_shm: SharedMemory,
+    pose_keyframe_shm: SharedMemory,
     lock: Lock,
     ready: Event,
     reset_ready: Event,
@@ -89,6 +95,13 @@ def async_vio_worker(
     imu_ts_buffer = np.ndarray(shape=(max_imu_samples,), dtype=np.float64, buffer=imu_ts_buffer_shm.buf)
     imu_acc_buffer = np.ndarray(shape=(max_imu_samples, 3), dtype=np.float64, buffer=imu_acc_buffer_shm.buf)
     imu_gyro_buffer = np.ndarray(shape=(max_imu_samples, 3), dtype=np.float64, buffer=imu_gyro_buffer_shm.buf)
+
+    # Create numpy views for pose output shared memory
+    pose_timestamp_arr = np.ndarray(shape=1, dtype=np.float64, buffer=pose_timestamp_shm.buf)
+    pose_t_arr = np.ndarray(shape=(3,), dtype=np.float64, buffer=pose_t_shm.buf)
+    pose_R_arr = np.ndarray(shape=(3, 3), dtype=np.float64, buffer=pose_R_shm.buf)
+    pose_v_arr = np.ndarray(shape=(3,), dtype=np.float64, buffer=pose_v_shm.buf)
+    pose_keyframe_arr = np.ndarray(shape=1, dtype=np.int32, buffer=pose_keyframe_shm.buf)
 
     last_frame_timestamp: float | None = None
     frame_count = 0
@@ -121,7 +134,7 @@ def async_vio_worker(
             ready.clear()
 
         # Copy reset data outside the lock
-        vio.reset(
+        estimate = vio.reset(
             timestamp=reset_timestamp,
             left_rect=np.array(reset_left_arr, copy=True),
             right_rect=np.array(reset_right_arr, copy=True),
@@ -129,6 +142,15 @@ def async_vio_worker(
             R=reset_R_arr.copy(),
             v=reset_v_arr.copy(),
         )
+        
+        # Write initial pose estimate to shared memory
+        with lock:
+            pose_timestamp_arr[0] = estimate.timestamp
+            pose_t_arr[:] = estimate.t
+            pose_R_arr[:] = estimate.R
+            pose_v_arr[:] = estimate.v
+            pose_keyframe_arr[0] = 1 if estimate.keyframe else 0
+        
         last_frame_timestamp = reset_timestamp
         frame_count = 0
         start_time = time.perf_counter()
@@ -191,7 +213,7 @@ def async_vio_worker(
                     rr.log("async_vio/logs", rr.TextLog(f"Low IMU sample count: {imu_ts_arr.size}"))
                 continue
 
-            vio.process(
+            estimate = vio.process(
                 timestamp=timestamp,
                 left_rect=left_rect,
                 right_rect=right_rect,
@@ -199,6 +221,15 @@ def async_vio_worker(
                 imu_gyro=imu_gyro_arr,
                 imu_ts=imu_ts_arr,
             )
+            
+            # Write pose estimate to shared memory
+            with lock:
+                pose_timestamp_arr[0] = estimate.timestamp
+                pose_t_arr[:] = estimate.t
+                pose_R_arr[:] = estimate.R
+                pose_v_arr[:] = estimate.v
+                pose_keyframe_arr[0] = 1 if estimate.keyframe else 0
+            
             last_frame_timestamp = timestamp
             frame_count += 1
             if frame_count % 10 == 0 and start_time is not None:
@@ -243,6 +274,13 @@ class AsyncVIO:
         self.reset_R_shm = SharedMemory(create=True, size=8 * 9)
         self.reset_v_shm = SharedMemory(create=True, size=8 * 3)
 
+        # pose output buffers
+        self.pose_timestamp_shm = SharedMemory(create=True, size=8)
+        self.pose_t_shm = SharedMemory(create=True, size=8 * 3)
+        self.pose_R_shm = SharedMemory(create=True, size=8 * 9)
+        self.pose_v_shm = SharedMemory(create=True, size=8 * 3)
+        self.pose_keyframe_shm = SharedMemory(create=True, size=4)  # int32
+
         # setup synchronization primitives
         self.lock = Lock()
         self.ready = Event()
@@ -269,6 +307,11 @@ class AsyncVIO:
                 self.reset_t_shm,
                 self.reset_R_shm,
                 self.reset_v_shm,
+                self.pose_timestamp_shm,
+                self.pose_t_shm,
+                self.pose_R_shm,
+                self.pose_v_shm,
+                self.pose_keyframe_shm,
                 self.lock,
                 self.ready,
                 self.reset_ready,
@@ -337,6 +380,11 @@ class AsyncVIO:
         self.reset_t_shm.close()
         self.reset_R_shm.close()
         self.reset_v_shm.close()
+        self.pose_timestamp_shm.close()
+        self.pose_t_shm.close()
+        self.pose_R_shm.close()
+        self.pose_v_shm.close()
+        self.pose_keyframe_shm.close()
 
         self.timestamp_shm.unlink()
         self.left_rect_shm.unlink()
@@ -350,6 +398,11 @@ class AsyncVIO:
         self.reset_t_shm.unlink()
         self.reset_R_shm.unlink()
         self.reset_v_shm.unlink()
+        self.pose_timestamp_shm.unlink()
+        self.pose_t_shm.unlink()
+        self.pose_R_shm.unlink()
+        self.pose_v_shm.unlink()
+        self.pose_keyframe_shm.unlink()
 
     def __enter__(self):
         return self
@@ -412,3 +465,31 @@ class AsyncVIO:
 
         self.imu_head.value = head
         self.imu_size.value = size
+
+    def get_current_estimate(self) -> VIOEstimate | None:
+        """
+        Read the current pose estimate from shared memory.
+        
+        Returns:
+            VIOEstimate with the latest pose, velocity, and timestamp, or None if no pose is available yet.
+        """
+        with self.lock:
+            # Create numpy views into shared memory
+            pose_timestamp_arr = np.ndarray(shape=1, dtype=np.float64, buffer=self.pose_timestamp_shm.buf)
+            pose_t_arr = np.ndarray(shape=(3,), dtype=np.float64, buffer=self.pose_t_shm.buf)
+            pose_R_arr = np.ndarray(shape=(3, 3), dtype=np.float64, buffer=self.pose_R_shm.buf)
+            pose_v_arr = np.ndarray(shape=(3,), dtype=np.float64, buffer=self.pose_v_shm.buf)
+            pose_keyframe_arr = np.ndarray(shape=1, dtype=np.int32, buffer=self.pose_keyframe_shm.buf)
+
+            # Check if pose data is valid (timestamp > 0 indicates valid data)
+            if pose_timestamp_arr[0] <= 0:
+                return None
+
+            # Copy data from shared memory
+            return VIOEstimate(
+                timestamp=float(pose_timestamp_arr[0]),
+                t=pose_t_arr.copy(),
+                R=pose_R_arr.copy(),
+                v=pose_v_arr.copy(),
+                keyframe=bool(pose_keyframe_arr[0]),
+            )
