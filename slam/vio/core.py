@@ -4,7 +4,6 @@ from typing import Sequence
 import gtsam
 import numpy as np
 from hydra.utils import instantiate
-from line_profiler import profile
 
 from slam.depth.sgbm import SGBM
 from slam.hydra_utils import compose_config, extract_target_config
@@ -60,7 +59,6 @@ class VIO:
         self.latest_keyframe_landmarks = []
         self.latest_all_landmarks = []
 
-    @profile
     def process(
         self,
         timestamp: float,

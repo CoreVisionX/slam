@@ -6,8 +6,6 @@ from typing import Any
 import cv2
 import numpy as np
 
-from line_profiler import profile
-
 from slam.registration.registration import RectifiedStereoFrame
 from slam.vio import stereo_matching
 
@@ -285,7 +283,6 @@ class KLTFeatureTracker:
         
         return points3d, depths
 
-    @profile
     def _search_right_epipolar(
         self,
         left_img: np.ndarray,
@@ -400,7 +397,6 @@ class KLTFeatureTracker:
 
         return True, match_pt, float(min_val)
 
-    @profile
     def _compute_stereo_matches(
         self,
         left_gray: np.ndarray,
@@ -499,7 +495,6 @@ class KLTFeatureTracker:
 
         return final_mask, right_points, full_depths, full_points3d
 
-    @profile
     def track_frame(
         self,
         rectified_frame: RectifiedStereoFrame,

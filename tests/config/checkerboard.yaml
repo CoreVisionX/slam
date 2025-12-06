@@ -1,0 +1,5 @@
+target_type: 'checkerboard'
+targetCols: 10          # number of inner corners in x (columns)
+targetRows: 7          # number of inner corners in y (rows)
+rowSpacingMeters: 0.025  # distance between corners in y, in meters
+colSpacingMeters: 0.025  # distance between corners in x, in meters

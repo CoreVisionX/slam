@@ -28,7 +28,7 @@ def iter_rosbag_stream(
     max_time_diff: float = 0.01,
     source_fps: int = 20,
     target_fps: int = 20,
-    take_every: int = 3,  # take every i-th frame
+    take_every: int = 1,  # take every i-th frame
 ) -> Iterable[tuple[float, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]]:
     """
     Stream stereo pairs + IMU batches from a ROS1 bag without preloading everything.
@@ -183,6 +183,50 @@ def run_vio_rosbag_kalibr(
     frames_enqueued = 0
     start_time = time.perf_counter()
 
+    # Gyroscope:
+    # M:
+    # [[ 1.99108148 0. 0. ]
+    # [-0.00233388 2.00310951 0. ]
+    # [-0.00313549 -0.00798199 2.00860319]]
+    # A [(rad/s)/(m/s^2)]:
+    # [[ 0.00003872 -0.00054633 0.00009226]
+    # [ 0.00026314 0.00061978 -0.0001102 ]
+    # [ 0.00002499 0.00002004 -0.0000637 ]]
+    # C_gyro_i:
+    # [[ 0.99920186 -0.03743561 0.0139365 ]
+    # [ 0.03777894 0.99896716 -0.02524603]
+    # [-0.012977 0.02575238 0.99958412]]
+    # Accelerometer:
+    # M:
+    # [[ 0.99884124 0. 0. ]
+    # [-0.00879978 0.99821107 0. ]
+    # [-0.00942307 -0.00389955 0.99772294]]
+
+    gyro_M = np.array([
+        [1.99108148, 0.0, 0.0],
+        [-0.00233388, 2.00310951, 0.0],
+        [-0.00313549, -0.00798199, 2.00860319]
+    ])
+    gyro_A = np.array([
+        [0.00003872, -0.00054633, 0.00009226],
+        [0.00026314, 0.00061978, -0.0001102],
+        [0.00002499, 0.00002004, -0.0000637]
+    ])
+    acc_M = np.array([
+        [0.99884124, 0.0, 0.0],
+        [-0.00879978, 0.99821107, 0.0],
+        [-0.00942307, -0.00389955, 0.99772294]
+    ])
+
+    gyro_M_inv = np.linalg.inv(gyro_M)
+    acc_M_inv = np.linalg.inv(acc_M)
+
+    def correct_acc(*, raw_acc: np.ndarray) -> np.ndarray:
+        return acc_M_inv @ raw_acc
+    
+    def correct_gyro(*, raw_gyro: np.ndarray, corrected_acc: np.ndarray) -> np.ndarray:
+        return gyro_M_inv @ (raw_gyro - gyro_A @ corrected_acc)
+
     for i, (t_curr, left_rect, right_rect, imu_ts, imu_acc, imu_gyro) in enumerate(stream):
         if imu_ts.size < 2:
             print("not enough imu samples, skipping frame")
@@ -191,7 +235,12 @@ def run_vio_rosbag_kalibr(
 
         # process imu samples sequentially
         for t_imu, acc, gyro in zip(imu_ts, imu_acc, imu_gyro):
-            async_vio.process_imu(imu_ts=np.array([t_imu]), imu_acc=np.array([acc]), imu_gyro=np.array([gyro]))
+            corrected_acc = correct_acc(raw_acc=acc)
+            corrected_gyro = correct_gyro(raw_gyro=gyro, corrected_acc=corrected_acc)
+            
+            async_vio.process_imu(imu_ts=np.array([t_imu]), imu_acc=np.array([corrected_acc]), imu_gyro=np.array([corrected_gyro]))
+
+        # async_vio.process_imu(imu_ts=imu_ts, imu_acc=imu_acc, imu_gyro=imu_gyro)
 
         async_vio.process(
             timestamp=float(t_curr),
