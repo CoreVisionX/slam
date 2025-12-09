@@ -108,18 +108,27 @@ public:
         if (devices.size() > 0) {
             auto dev = devices[0];
             auto sensors = dev.query_sensors();
-            for (auto& s : sensors) {
-                // Disable motion correction to get raw data
+            for (auto& s : sensors)
+            {
+                // Enable motion correction to corrected IMU data
                 if (s.supports(RS2_OPTION_ENABLE_MOTION_CORRECTION))
-                    s.set_option(RS2_OPTION_ENABLE_MOTION_CORRECTION, 0);
-                
+                    s.set_option(RS2_OPTION_ENABLE_MOTION_CORRECTION, 1.f);
+
                 // Disable Global Time to ensure we get Hardware timestamps
                 if (s.supports(RS2_OPTION_GLOBAL_TIME_ENABLED))
-                    s.set_option(RS2_OPTION_GLOBAL_TIME_ENABLED, 0);
+                    s.set_option(RS2_OPTION_GLOBAL_TIME_ENABLED, 0.f);
 
                 // Disable IR emitter
                 if (s.supports(RS2_OPTION_EMITTER_ENABLED))
-                    s.set_option(RS2_OPTION_EMITTER_ENABLED, 0);
+                    s.set_option(RS2_OPTION_EMITTER_ENABLED, 0.f);
+
+                // Enable auto exposure
+                if (s.supports(RS2_OPTION_ENABLE_AUTO_EXPOSURE))
+                    s.set_option(RS2_OPTION_ENABLE_AUTO_EXPOSURE, 1.f);
+
+                // Enable auto white balance
+                if (s.supports(RS2_OPTION_ENABLE_AUTO_WHITE_BALANCE))
+                    s.set_option(RS2_OPTION_ENABLE_AUTO_WHITE_BALANCE, 1.f);
             }
         }
 

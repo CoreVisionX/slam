@@ -1,3 +1,4 @@
+from collections.abc import Sequence
 import multiprocessing as mp
 from multiprocessing import Event, Lock
 from multiprocessing.shared_memory import SharedMemory  # benchmark shared memory to make sure there's no overhead
@@ -7,6 +8,7 @@ import time
 import numpy as np
 import rerun as rr
 
+from slam.hydra_utils import compose_config
 from slam.vio.core import VIO
 from slam.vio.types import VIOEstimate
 
@@ -65,6 +67,7 @@ def _extract_imu_window(
 
 def async_vio_worker(
     vio_config_path: str | Path,
+    vio_overrides: Sequence[str] | None,
     timestamp_shm: SharedMemory,
     left_rect_shm: SharedMemory,
     right_rect_shm: SharedMemory,
@@ -90,7 +93,7 @@ def async_vio_worker(
     reset_ready: Event,
     reset_done: Event,
 ):
-    vio = VIO.from_config(vio_config_path)
+    vio = VIO.from_config(vio_config_path, overrides=vio_overrides)
 
     imu_ts_buffer = np.ndarray(shape=(max_imu_samples,), dtype=np.float64, buffer=imu_ts_buffer_shm.buf)
     imu_acc_buffer = np.ndarray(shape=(max_imu_samples, 3), dtype=np.float64, buffer=imu_acc_buffer_shm.buf)
@@ -248,15 +251,19 @@ class AsyncVIO:
     def __init__(
         self,
         vio_config_path: str | Path,
+        vio_overrides: Sequence[str] | None = None,
         max_imu_samples: int = 640,
-        height: int = 480,
-        width: int = 848,
-    ):  # TODO: remove height and width and load config instead
+    ):
         self.vio_config_path = vio_config_path
+        self.vio_overrides = vio_overrides
         self.max_imu_samples = max_imu_samples
 
+        self.config = compose_config(vio_config_path, overrides=vio_overrides)
+        self.height = self.config.config.height
+        self.width = self.config.config.width
+
         # allocate shared memory for frame and imu data
-        frame_size = width * height * 3
+        frame_size = self.width * self.height * 3
         self.timestamp_shm = SharedMemory(create=True, size=8)
         self.left_rect_shm = SharedMemory(create=True, size=frame_size)
         self.right_rect_shm = SharedMemory(create=True, size=frame_size)
@@ -292,6 +299,7 @@ class AsyncVIO:
             target=async_vio_worker,
             args=(
                 self.vio_config_path,
+                self.vio_overrides,
                 self.timestamp_shm,
                 self.left_rect_shm,
                 self.right_rect_shm,

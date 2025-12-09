@@ -32,8 +32,7 @@ from .types import VIOCalibration
 
 @dataclass
 class VIOConfig:
-    # imu
-    gravity: np.ndarray
+    # imu extrinsics
     imu_from_left: np.ndarray
     imu_from_right: np.ndarray
 
@@ -60,8 +59,6 @@ class VIOConfig:
     log_landmarks_every: int # must be a multiple of keyframe_interval and log_every
 
     def __post_init__(self):
-        if not isinstance(self.gravity, np.ndarray):
-            self.gravity = np.array(self.gravity)
         if not isinstance(self.imu_from_left, np.ndarray):
             self.imu_from_left = np.array(self.imu_from_left)
         if not isinstance(self.imu_from_right, np.ndarray):

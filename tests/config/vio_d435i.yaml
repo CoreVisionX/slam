@@ -2,70 +2,31 @@ _target_: slam.vio.core.VIO
 
 config:
   _target_: slam.vio.config.VIOConfig
-  gravity: [0, 9.80655, 0] # TODO: remove redundant gravity field
-
-  # T_ic (cam -> imu) from Kalibr
-  # imu_from_left:
-  #   - [0.99995845,  0.00382811, -0.00827314, -0.0055536]
-  #   - [-0.00380265,  0.99998799, 0.00309183,  0.00516152]
-  #   - [0.00828487,  -0.00306025,  0.999961,  0.01517235]
-  #   - [0.0,         0.0,         0.0,         1.0]
-  # imu_from_right:
-  #   - [0.99995845,  0.00382811, -0.00827314,  0.04397001]
-  #   - [-0.00380265,  0.99998799, 0.00309183,  0.00497319]
-  #   - [0.00828487,  -0.00306025,  0.999961,  0.01558266]
-  #   - [0.0,         0.0,         0.0,         1.0]
-
-  # cad extrinsics
   imu_from_left:
     - [1.0, 0.0, 0.0, -0.00552000012248755]
     - [0.0, 1.0, 0.0, 0.00510000018402934]
     - [0.0, 0.0, 1.0, 0.011739999987185]
     - [0.0, 0.0, 0.0, 1.0]
-
   imu_from_right:
     - [1.0, 0.0, 0.0, 0.0443238727748394]
     - [0.0, 1.0, 0.0, 0.00510000018402934]
     - [0.0, 0.0, 1.0, 0.011739999987185]
     - [0.0, 0.0, 0.0, 1.0]
-
-  # Baseline norm from Kalibr (cam0 -> cam1)
   baseline: 0.0498438738286495
-
-  # Intrinsics from Kalibr (these are for the distorted images;
-  # you can override with rectified K at runtime as we discussed).
-  # TODO: make sure they get overriden
-
-  # Camera model: pinhole
-  # Focal length: [427.6597900390625, 427.6597900390625]
-  # Principal point: [426.3415222167969, 236.13694763183594]
-  # Distortion model: radtan
-  # Distortion coefficients: [0.0, 0.0, 0.0, 0.0]
   K_left_rect:
     - [427.6597900390625, 0.0,                  426.3415222167969]
     - [0.0,                427.6597900390625,   236.13694763183594]
     - [0.0,                0.0,                  1.0]
-
-  # Camera model: pinhole
-  # Focal length: [427.6597900390625, 427.6597900390625]
-  # Principal point: [426.3415222167969, 236.13694763183594]
-  # Distortion model: radtan
-  # Distortion coefficients: [0.0, 0.0, 0.0, 0.0]
-  # TODO: load d435i calib from realsense sdk
   K_right_rect:
     - [427.6597900390625, 0.0,                  426.3415222167969]
     - [0.0,                427.6597900390625,   236.13694763183594]
     - [0.0,                0.0,                  1.0]
-
-  # Resolution used in Kalibr
   width: 848
   height: 480
-
   optimize_every: 1
-  keyframe_interval: 15
-  log_every: 15
-  log_landmarks_every: 128
-
+  keyframe_interval: 3
+  log_every: 3
+  log_landmarks_every: 24
   ransac_inliers_only: true
 
 feature_tracker:
@@ -91,7 +52,7 @@ feature_tracker:
   templ_cols: 31
   stripe_extra_rows: 0
   template_matching_tolerance: 0.15
-  subpixel_refinement: true
+  subpixel_refinement: false
   stereo_min_depth: 0.15
   profile_timing: false
 
@@ -100,9 +61,6 @@ relative_pose_initializer:
   min_matches_for_pnp: 6
   max_depth: 40.0
 
-# TODO: remove unused params
-# TODO: add params for configuring the LM/iSAM2 optimizer (and choosing between them!) and see if tweaking them can yield any performance improvements
-# TODO: huber/cauchy k parameters (good candidates for leveraging _target_ to directly instansiate the gtsam nosie models)
 ba:
   _target_: slam.vio.bundle_adjustment.FixedLagBundleAdjuster
   config:
@@ -112,22 +70,13 @@ ba:
     projection_noise_px: 0.5
     disparity_noise_px: 0.5
     use_huber_loss: true
-    reprojection_gating_threshold_px: 32.0
+    reprojection_gating_threshold_px: 16.0
     use_inlier_observations_only: false
     pose_prior_sigmas:
-      [
-        # 1.7453292519943296e-05,
-        # 1.7453292519943296e-05,
-        # 1.7453292519943296e-05,
-        
+      [        
         0.3,
         0.00001,
         0.3,
-
-        # 0.001,
-        # 0.001,
-        # 0.001,
-
         0.0001,
         0.0001,
         0.0001,
@@ -138,24 +87,18 @@ ba:
     light_relative_pose_sigmas: [0.2, 0.2, 0.2, 0.1, 0.1, 0.1]
     min_depth: 0.0
     lag: 4.0
-    imu_bias_prior_for_factors: [0.3, 0.3, 0.3, 0.01, 0.01, 0.01]
+    imu_bias_prior_for_factors: [0.1, 0.1, 0.1, 0.001, 0.001, 0.001]
 
 imu_preintegrator:
   _target_: slam.vio.imu_preintegration.ImuPreintegrator
   config:
     _target_: slam.vio.imu_preintegration.ImuPreintegrationConfig
-    gravity: [0, 9.80655, 0] # TODO: proper gravity initialization
-    gravity_magnitude: 9.80655
-
-    # From Kalibr IMU configuration (continuous noise densities)
-    accel_noise: 0.008183027       # m/s^2 / sqrt(Hz)
-    gyro_noise: 0.00109979       # rad/s  / sqrt(Hz)
-    # accel_noise: 0.001177
-    # gyro_noise: 0.000244
-
-    accel_random_walk: 7.976531501174554e-04
-    gyro_random_walk: 2.882662305656072e-05
-
+    gravity: [0.0, 9.80655, 0.0]
+    initial_gyro_bias: [0.0, 0.0, 0.0]
+    accel_noise: 0.008183027
+    gyro_noise: 0.00109979
+    accel_random_walk: 6.0000e-3
+    gyro_random_walk: 1.2e-04
     integration_noise: 0.0005
 
 logger:

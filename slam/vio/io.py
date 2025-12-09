@@ -19,8 +19,8 @@ class VIORerunLogger:
         spawn: bool | None = True,
         url: str | None = None,
         # TODO: support more view coordinate conventions
-        cam_view_coordinates: Literal["RDF", "RIGHT_HAND_X_UP", "RIGHT_HAND_Z_UP"] = "RDF",
-        world_view_coordinates: Literal["RDF", "RIGHT_HAND_X_UP", "RIGHT_HAND_Z_UP"] = "RDF",
+        cam_view_coordinates: Literal["RDF", "RIGHT_HAND_X_UP", "RIGHT_HAND_Z_UP", "LUF", "RFU", "RDB"] = "RDF",
+        world_view_coordinates: Literal["RDF", "RIGHT_HAND_X_UP", "RIGHT_HAND_Z_UP", "LUF", "RFU", "RDB"] = "RDF",
         trajectory_thickness: float = 0.008,
         trajectory_color: tuple[int, int, int] = (0, 0, 255),
         feature_radii: float = 3.0,
@@ -45,6 +45,9 @@ class VIORerunLogger:
             "RDF": rr.ViewCoordinates.RDF,
             "RIGHT_HAND_X_UP": rr.ViewCoordinates.RIGHT_HAND_X_UP,
             "RIGHT_HAND_Z_UP": rr.ViewCoordinates.RIGHT_HAND_Z_UP,
+            "LUF": rr.ViewCoordinates.LUF,
+            "RFU": rr.ViewCoordinates.RFU,
+            "RDB": rr.ViewCoordinates.RDB,
         }
 
         self.cam_view_coordinates = view_coordinates[cam_view_coordinates]
@@ -82,8 +85,10 @@ class VIORerunLogger:
         # log right rect
         rr.log("vio/pose/rgb_right", rr.Image(frame.right_rect))
 
-    def _log_pose(self, pose: gtsam.Pose3, frame: RectifiedStereoFrame | StereoDepthFrame) -> None:
-        rr_log_pose(f"{self._base_path}/pose", pose, frame, camera_xyz=self.cam_view_coordinates, image_plane_dist=self.image_plane_dist)
+    def _log_pose(self, pose: gtsam.Pose3, frame: RectifiedStereoFrame | StereoDepthFrame) -> None:        
+        camera_pose = pose.compose(frame.calibration.imu_from_left)
+        
+        rr_log_pose(f"{self._base_path}/pose", camera_pose, frame, camera_xyz=self.cam_view_coordinates, image_plane_dist=self.image_plane_dist)
 
     def _log_trajectory(self, trajectory: Sequence[gtsam.Pose3] | None) -> None:
         if not trajectory:

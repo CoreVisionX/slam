@@ -7,7 +7,6 @@ import gtsam
 @dataclass
 class ImuPreintegrationConfig:
     gravity: tuple[float, float, float]
-    gravity_magnitude: float
     
     # Noise parameters
     accel_noise: float
@@ -15,6 +14,10 @@ class ImuPreintegrationConfig:
     accel_random_walk: float
     gyro_random_walk: float
     integration_noise: float
+
+    # Bias
+    initial_acc_bias: tuple[float, float, float] = (0.0, 0.0, 0.0)
+    initial_gyro_bias: tuple[float, float, float] = (0.0, 0.0, 0.0)
     
 class ImuPreintegrator:
     """
@@ -46,8 +49,11 @@ class ImuPreintegrator:
         self.params.setIntegrationCovariance(integration_cov)
         
         # Initialize bias
-        # TODO: Allow initializing with specific bias values if needed
-        self.current_bias = gtsam.imuBias.ConstantBias()
+        self.initial_bias = gtsam.imuBias.ConstantBias(
+            biasAcc=np.array(self.config.initial_gyro_bias).reshape(3, 1),
+            biasGyro=np.array(self.config.initial_acc_bias).reshape(3, 1),
+        )
+        self.current_bias = self.initial_bias
         
         # Initialize PIM
         self.pim = gtsam.PreintegratedCombinedMeasurements(self.params, self.current_bias)

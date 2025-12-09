@@ -246,7 +246,8 @@ class VIO:
 
         if v is None:
             v = np.zeros(3)
-        self.ba.reset(ts=timestamp, pose=gtsam.Pose3(gtsam.Rot3(R), t), velocity=v)
+        bias = self.imu_preintegrator.initial_bias
+        self.ba.reset(ts=timestamp, pose=gtsam.Pose3(gtsam.Rot3(R), t), velocity=v, bias=bias)
         
         # Initialize IMU timestamp tracking
         self.prev_imu_ts = timestamp

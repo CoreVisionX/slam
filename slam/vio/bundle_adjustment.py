@@ -102,7 +102,7 @@ class FixedLagBundleAdjuster:
         self.new_values = None
         self.new_timestamps = None
 
-    def reset(self, ts: float, pose: gtsam.Pose3, velocity: np.ndarray) -> None:
+    def reset(self, ts: float, pose: gtsam.Pose3, velocity: np.ndarray, bias: gtsam.imuBias.ConstantBias) -> None:
         self.new_factors = gtsam.NonlinearFactorGraph()
         self.new_values = gtsam.Values()
         self.new_timestamps = {}
@@ -123,7 +123,7 @@ class FixedLagBundleAdjuster:
 
         self.ts.append(ts)
 
-        self._add_prior_factors(ts, pose, velocity)
+        self._add_prior_factors(ts, pose, velocity, bias)
 
     def process(self, frame: RectifiedStereoFrame, ts: float, relative_pose: gtsam.Pose3, estimated_velocity: np.ndarray, landmark_observations: Mapping[int, TrackObservation] | TrackObservationsBatch, pim: gtsam.PreintegratedCombinedMeasurements, optimize: bool = True, profile: bool = False) -> dict[str, int]:
         profiler = _SectionProfiler(log_prefix="fixed_lag_bundle_adjustment.process")
@@ -482,7 +482,7 @@ class FixedLagBundleAdjuster:
 
 
 
-    def _add_prior_factors(self, ts, pose, velocity):
+    def _add_prior_factors(self, ts, pose, velocity, bias):
         key_pose = X(0)
         self.new_values.insert(key_pose, pose)
         self.full_values.insert(key_pose, pose)
@@ -496,7 +496,6 @@ class FixedLagBundleAdjuster:
         self.new_timestamps[key_vel] = ts
         
         key_bias = B(0)
-        bias = gtsam.imuBias.ConstantBias()
         self.new_values.insert(key_bias, bias)
         self.full_values.insert(key_bias, bias)
         self.new_timestamps[key_bias] = ts
