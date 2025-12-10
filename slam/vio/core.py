@@ -151,12 +151,11 @@ class VIO:
             R = pose.rotation().matrix()
             v = self.ba.get_latest_velocity()
 
-            return VIOEstimate(
+            return VIOEstimate.from_numpy(
                 timestamp=timestamp,
                 t=T,
                 R=R,
                 v=v,
-                keyframe=False,
             )
 
         # only use pnp inliers
@@ -252,7 +251,7 @@ class VIO:
         # Initialize IMU timestamp tracking
         self.prev_imu_ts = timestamp
 
-        estimate = VIOEstimate(timestamp=timestamp, t=t, R=R, v=v, keyframe=True)
+        estimate = VIOEstimate.from_numpy(timestamp=timestamp, t=t, R=R, v=v)
         return estimate
 
 
@@ -266,7 +265,7 @@ class VIO:
             t = poses[i].translation()
             R = poses[i].rotation().matrix()
             v = velocities[i]
-            estimates.append(VIOEstimate(timestamp=self.ba.ts[i], t=t, R=R, v=v, keyframe=True))
+            estimates.append(VIOEstimate.from_numpy(timestamp=self.ba.ts[i], t=t, R=R, v=v))
         
         return estimates
 

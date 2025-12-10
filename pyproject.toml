@@ -5,7 +5,7 @@ build-backend = "hatchling.build"
 [project]
 name = "slam"
 dynamic = ["version"]
-description = "Lightweight visual-inertial odometry stack."
+description = "Lightweight visual-inertial odometry stack for CoreVisionX."
 authors = [{ name = "Jacob Van Meter", email = "jacobvm04@gmail.com" }]
 requires-python = ">=3.11,<3.12"
 dependencies = [
@@ -14,10 +14,12 @@ dependencies = [
   "opencv-python-headless>=4,<5",
   "rerun-sdk>=0.27,<0.28",
   "line-profiler>=5.0.0, <6",
+  "pydantic>=2.12.5,<3",
+  "eclipse-zenoh>=1.7.0,<2",
 ]
 
 [tool.hatch.build]
-packages = ["slam"]
+packages = ["slam", "vio"]
 exclude = ["tests/**"]
 
 [tool.hatch.build.targets.wheel]
@@ -32,4 +34,3 @@ path = "slam/__init__.py"
 [tool.hatch.metadata.hooks.custom]
 
 [tool.hatch.build.hooks.custom]
-

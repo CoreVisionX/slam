@@ -17,9 +17,6 @@ cmake = ">=4.2.0,<5"
 ninja = ">=1.13.2,<2"
 pybind11 = ">=3.0.1,<4"
 pillow = ">=9.1, <11"
-
-# macOS gets conda opencv + compilers (no system equivalents)
-[target.osx-arm64.dependencies]
 opencv = ">=4.11.0,<5"
 compilers = ">=1.11.0,<2"
 
@@ -37,6 +34,8 @@ line_profiler = ">=5.0.0, <6"
 pillow = ">=9.1, <11"
 term-image = ">=0.7.0, <0.8"
 slam = { path = ".", editable = true }
+eclipse-zenoh = ">=1.7.0, <2"
+pydantic = ">=2.12.5, <3"
 
 [feature.dev.pypi-dependencies]
 ipykernel = ">=7.1.0, <8"

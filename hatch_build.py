@@ -42,10 +42,6 @@ class CustomBuildHook(BuildHookInterface):
         configure_cmd = ["cmake", "-S", "cpp", "-B", "build", "-G", "Ninja", "-DCMAKE_BUILD_TYPE=Release"]
         build_cmd = ["cmake", "--build", "build"]
 
-        # Pass through OpenCV path from environment (for wheel builds using system OpenCV)
-        if os.environ.get("OpenCV_DIR"):
-            configure_cmd.append(f"-DOpenCV_DIR={os.environ['OpenCV_DIR']}")
-
         try:
             print(f"Executing: {' '.join(clean_cmd)}")
             subprocess.check_call(clean_cmd)

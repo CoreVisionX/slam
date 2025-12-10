@@ -5,6 +5,18 @@ from multiprocessing.shared_memory import SharedMemory  # benchmark shared memor
 from pathlib import Path
 import time
 
+# TODO: proper logging instead of print statements
+
+# OpenMP (libgomp) used by OpenCV can deadlock if we fork after it is loaded.
+# Use the spawn start method so the worker has a clean interpreter and its own
+# OpenMP runtime instead of inheriting the parent's state.
+try:
+    if mp.get_start_method(allow_none=True) != "spawn":
+        mp.set_start_method("spawn")
+except RuntimeError:
+    # start method already set elsewhere; leave it as-is
+    print("OpenMP start method already set; leaving it as-is")
+
 import numpy as np
 import rerun as rr
 
@@ -13,7 +25,7 @@ from slam.vio.core import VIO
 from slam.vio.types import VIOEstimate
 
 
-# TODO: a proper initialization sequence/routine for a second of the robot sitting still could help a lot, esp. with imu frames and gravity initialization
+# TODO: make sure the main process shutdowns if the worker program errors. maybe provide a healthy param in the vio estimate class too?
 
 
 def _extract_imu_window(
@@ -104,7 +116,6 @@ def async_vio_worker(
     pose_t_arr = np.ndarray(shape=(3,), dtype=np.float64, buffer=pose_t_shm.buf)
     pose_R_arr = np.ndarray(shape=(3, 3), dtype=np.float64, buffer=pose_R_shm.buf)
     pose_v_arr = np.ndarray(shape=(3,), dtype=np.float64, buffer=pose_v_shm.buf)
-    pose_keyframe_arr = np.ndarray(shape=1, dtype=np.int32, buffer=pose_keyframe_shm.buf)
 
     last_frame_timestamp: float | None = None
     frame_count = 0
@@ -149,10 +160,9 @@ def async_vio_worker(
         # Write initial pose estimate to shared memory
         with lock:
             pose_timestamp_arr[0] = estimate.timestamp
-            pose_t_arr[:] = estimate.t
-            pose_R_arr[:] = estimate.R
-            pose_v_arr[:] = estimate.v
-            pose_keyframe_arr[0] = 1 if estimate.keyframe else 0
+            pose_t_arr[:] = estimate.t_np()
+            pose_R_arr[:] = estimate.R_np()
+            pose_v_arr[:] = estimate.v_np()
         
         last_frame_timestamp = reset_timestamp
         frame_count = 0
@@ -228,10 +238,9 @@ def async_vio_worker(
             # Write pose estimate to shared memory
             with lock:
                 pose_timestamp_arr[0] = estimate.timestamp
-                pose_t_arr[:] = estimate.t
-                pose_R_arr[:] = estimate.R
-                pose_v_arr[:] = estimate.v
-                pose_keyframe_arr[0] = 1 if estimate.keyframe else 0
+                pose_t_arr[:] = estimate.t_np()
+                pose_R_arr[:] = estimate.R_np()
+                pose_v_arr[:] = estimate.v_np()
             
             last_frame_timestamp = timestamp
             frame_count += 1
@@ -487,17 +496,15 @@ class AsyncVIO:
             pose_t_arr = np.ndarray(shape=(3,), dtype=np.float64, buffer=self.pose_t_shm.buf)
             pose_R_arr = np.ndarray(shape=(3, 3), dtype=np.float64, buffer=self.pose_R_shm.buf)
             pose_v_arr = np.ndarray(shape=(3,), dtype=np.float64, buffer=self.pose_v_shm.buf)
-            pose_keyframe_arr = np.ndarray(shape=1, dtype=np.int32, buffer=self.pose_keyframe_shm.buf)
 
             # Check if pose data is valid (timestamp > 0 indicates valid data)
             if pose_timestamp_arr[0] <= 0:
                 return None
 
             # Copy data from shared memory
-            return VIOEstimate(
+            return VIOEstimate.from_numpy(
                 timestamp=float(pose_timestamp_arr[0]),
                 t=pose_t_arr.copy(),
                 R=pose_R_arr.copy(),
                 v=pose_v_arr.copy(),
-                keyframe=bool(pose_keyframe_arr[0]),
             )

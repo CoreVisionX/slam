@@ -1,0 +1,21 @@
+# pixi environments
+.pixi/*
+!.pixi/config.toml
+
+# test data
+tests/data/*
+
+# python
+__pycache__/
+
+# results
+tests/results/*
+outputs/*
+*.png
+*.lprof
+tests/*.txt
+
+# build
+build
+*.so
+*.conda
