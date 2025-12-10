@@ -83,24 +83,3 @@ cmd = "rm -rf build && pixi build"
 [tasks.euroc]
 cmd = "cd tests && python vio_example_euroc.py"
 depends-on = ["build"]
-
-# TODO: add a test script that creates a virtual environment and installs the wheel and runs the tests/examples to verify the wheel works.
-# also support using conda packages
-[tasks.wheel-jetson]
-cmd = """
-rm -rf dist build && \
-OpenCV_DIR=/usr/lib/cmake/opencv4 SLAM_BUILD_VARIANT=jetson uv build --wheel && \
-auditwheel repair dist/*.whl --plat manylinux_2_35_aarch64 -w dist/ && \
-rm -f dist/*-linux_aarch64.whl && \
-echo 'Built:' && ls dist/*.whl
-"""
-description = "Build Jetson wheel using system compiler + system OpenCV"
-
-[tasks.wheel-macos]
-cmd = """
-rm -rf dist build && \
-SLAM_BUILD_VARIANT=macos uv build --wheel && \
-delocate-wheel -v --exclude /opt/homebrew dist/*.whl && \
-echo 'Built:' && ls dist/*.whl
-"""
-description = "Build portable macOS wheel with bundled dependencies"
