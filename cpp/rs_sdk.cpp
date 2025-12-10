@@ -110,7 +110,7 @@ public:
             auto sensors = dev.query_sensors();
             for (auto& s : sensors)
             {
-                // Enable motion correction to corrected IMU data
+                // Enable motion correction to get corrected IMU data
                 if (s.supports(RS2_OPTION_ENABLE_MOTION_CORRECTION))
                     s.set_option(RS2_OPTION_ENABLE_MOTION_CORRECTION, 1.f);
 
