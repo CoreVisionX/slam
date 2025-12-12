@@ -2,7 +2,6 @@ _target_: slam.vio.core.VIO
 
 config:
   _target_: slam.vio.config.VIOConfig
-  gravity: [0.0, 0.0, -9.80665]
   imu_from_left:
     - [0.0148655429818, -0.999880929698, 0.00414029679422, -0.0216401454975]
     - [0.999557249008, 0.0149672133247, 0.025715529948, -0.064676986768]
@@ -101,7 +100,6 @@ imu_preintegrator:
   config:
     _target_: slam.vio.imu_preintegration.ImuPreintegrationConfig
     gravity: [0.0, 0.0, -9.80665]
-    gravity_magnitude: 9.80665
     accel_noise: 0.002
     gyro_noise: 0.00017
     accel_random_walk: 3.0000e-3
@@ -114,5 +112,5 @@ logger:
   spawn: true
   feature_radii: 4.0
   image_plane_dist: 0.6
-  cam_view_coordinates: RIGHT_HAND_X_UP
+  cam_view_coordinates: RDF
   world_view_coordinates: RIGHT_HAND_Z_UP
