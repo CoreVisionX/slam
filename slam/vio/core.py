@@ -1,3 +1,4 @@
+from gtsam.gtsam.symbol_shorthand import X
 from pathlib import Path
 from typing import Sequence
 
@@ -207,11 +208,16 @@ class VIO:
             self.latest_all_landmarks = self.ba.get_all_landmarks()
 
         if self.logger is not None and self.frame_idx % self.config.log_every == 0:
+            # compute pose covariance
+            key = X(self.ba.frame_idx)
+            pose_covariance = self.ba.smoother.marginalCovariance(key)
+
             self.logger.log_step(
                 frame_idx=self.frame_idx,
                 timestamp=timestamp,
                 pose=latest_pose,
                 frame=rect_frame,
+                pose_covariance=pose_covariance,
                 trajectory=trajectory,
                 observations=observations,
                 landmarks=self.latest_keyframe_landmarks,

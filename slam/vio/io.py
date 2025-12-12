@@ -65,6 +65,7 @@ class VIORerunLogger:
         trajectory: Sequence[gtsam.Pose3] | None,
         observations: Mapping[int, TrackObservation] | None,
         landmarks: Sequence[Mapping[str, object]] | None,
+        pose_covariance: np.ndarray | None = None,
         all_landmarks: Sequence[Mapping[str, object]] | None = None,
         ba_stats: Mapping[str, int] | None = None,
         bias: gtsam.imuBias.ConstantBias | None = None,
@@ -73,7 +74,7 @@ class VIORerunLogger:
         """Log the current VIO step to rerun."""
         rr.set_time("frame", sequence=frame_idx)
         rr.set_time("timestamp", timestamp=timestamp)
-        self._log_pose(pose, frame)
+        self._log_pose(pose, frame, pose_covariance=pose_covariance)
         self._log_trajectory(trajectory)
         self._log_klt_features(observations)
         self._log_landmarks(landmarks, f"{self._base_path}/landmarks/active")
@@ -85,10 +86,10 @@ class VIORerunLogger:
         # log right rect
         rr.log("vio/pose/rgb_right", rr.Image(frame.right_rect))
 
-    def _log_pose(self, pose: gtsam.Pose3, frame: RectifiedStereoFrame | StereoDepthFrame) -> None:        
+    def _log_pose(self, pose: gtsam.Pose3, frame: RectifiedStereoFrame | StereoDepthFrame, pose_covariance: np.ndarray | None) -> None:        
         camera_pose = pose.compose(frame.calibration.imu_from_left)
         
-        rr_log_pose(f"{self._base_path}/pose", camera_pose, frame, camera_xyz=self.cam_view_coordinates, image_plane_dist=self.image_plane_dist)
+        rr_log_pose(f"{self._base_path}/pose", camera_pose, frame, camera_xyz=self.cam_view_coordinates, image_plane_dist=self.image_plane_dist, pose_covariance=pose_covariance)
 
     def _log_trajectory(self, trajectory: Sequence[gtsam.Pose3] | None) -> None:
         if not trajectory:
