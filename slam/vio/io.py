@@ -70,6 +70,7 @@ class VIORerunLogger:
         ba_stats: Mapping[str, int] | None = None,
         bias: gtsam.imuBias.ConstantBias | None = None,
         bias_trajectory: np.ndarray | None = None,
+        warnings: list[str] | None = None,
     ) -> None:
         """Log the current VIO step to rerun."""
         rr.set_time("frame", sequence=frame_idx)
@@ -82,6 +83,7 @@ class VIORerunLogger:
         self._log_bundle_stats(ba_stats)
         self._log_bias(bias)
         self._log_bias_trajectory(bias_trajectory)
+        self._log_warnings(warnings)
 
         # log right rect
         rr.log("vio/pose/rgb_right", rr.Image(frame.right_rect))
@@ -183,6 +185,13 @@ class VIORerunLogger:
         rr.log(f"{gyro_base_path}/x", rr.LineStrips2D([np.stack([ts, gyro_x], axis=1)]))
         rr.log(f"{gyro_base_path}/y", rr.LineStrips2D([np.stack([ts, gyro_y], axis=1)]))
         rr.log(f"{gyro_base_path}/z", rr.LineStrips2D([np.stack([ts, gyro_z], axis=1)]))
+
+    def _log_warnings(self, warnings: list[str] | None) -> None:
+        if not warnings:
+            return
+
+        for warning in warnings:
+            rr.log("warnings", rr.TextLog(f"warning: {warning}"))
 
 
 def save_tum_sequence(vio_outputs: list[VIOEstimate], output_path: str):

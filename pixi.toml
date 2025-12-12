@@ -36,6 +36,8 @@ term-image = ">=0.7.0, <0.8"
 slam = { path = ".", editable = true }
 eclipse-zenoh = ">=1.7.0, <2"
 pydantic = ">=2.12.5, <3"
+rich = ">=14.2.0, <15"
+sh = ">=2.2.2, <3"
 
 [feature.dev.pypi-dependencies]
 ipykernel = ">=7.1.0, <8"

@@ -71,6 +71,7 @@ ba:
     disparity_noise_px: 0.5
     use_huber_loss: true
     reprojection_gating_threshold_px: 16.0
+    reprojection_gating_min_obs: 12
     use_inlier_observations_only: false
     pose_prior_sigmas:
       [        

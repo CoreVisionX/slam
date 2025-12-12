@@ -1,0 +1,16 @@
+# @package _global_
+
+defaults:
+  - /euroc/vio
+  - _self_
+
+ba:
+  config:
+    reprojection_gating: true
+    
+feature_tracker:
+  gftt_quality_level: 0.01
+  gftt_min_distance: 1.0
+  gftt_block_size: 3
+  gftt_use_harris_detector: false
+  gftt_k: 0.04

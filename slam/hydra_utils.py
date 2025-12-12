@@ -12,16 +12,25 @@ def compose_config(
 ) -> DictConfig:
     """Load a Hydra config from a file path with optional override kwargs."""
     path = Path(config_path).resolve()
+    config_dir = path.parent
+    config_name = path.stem
+    for parent in path.parents:
+        if parent.name == "config":
+            config_dir = parent
+            relative_path = path.relative_to(config_dir)
+            config_name = relative_path.with_suffix("").as_posix()
+            break
+
     override_args = list(overrides) if overrides else []
     for key, value in override_kwargs.items():
         override_args.append(f"{key}={value}")
 
     with initialize_config_dir(
-        config_dir=str(path.parent),
+        config_dir=str(config_dir),
         job_name="compose_config",
         version_base=None,
     ):
-        return compose(config_name=path.stem, overrides=override_args)
+        return compose(config_name=config_name, overrides=override_args)
 
 
 def extract_target_config(cfg: DictConfig, *, context: str) -> Any:

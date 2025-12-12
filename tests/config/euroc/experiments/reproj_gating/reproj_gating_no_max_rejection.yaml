@@ -1,0 +1,11 @@
+# @package _global_
+
+defaults:
+  - /euroc/vio
+  - _self_
+
+ba:
+  config:
+    reprojection_gating: true
+    max_rejection_rate: 1.01
+    use_light_relative_pose_factor: false

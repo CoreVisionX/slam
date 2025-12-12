@@ -181,7 +181,7 @@ class VIO:
             dt=dt
         )
 
-        ba_stats = self.ba.process(
+        ba_stats, ba_warnings = self.ba.process(
             frame=rect_frame,
             ts=timestamp,
             relative_pose=self.T_current_from_latest_keyframe,
@@ -224,6 +224,7 @@ class VIO:
                 all_landmarks=self.latest_all_landmarks,
                 ba_stats=ba_stats,
                 bias=self.ba.get_bias(),
+                warnings=ba_warnings,
             )
 
         t = latest_pose.translation()

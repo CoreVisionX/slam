@@ -1,0 +1,12 @@
+# @package _global_
+
+defaults:
+  - /euroc/vio
+  - _self_
+
+ba:
+  config:
+    reprojection_gating: true
+    use_median_filtering: true
+    reprojection_gating_min_obs: 10
+    use_light_relative_pose_factor: false

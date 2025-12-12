@@ -14,8 +14,8 @@ from slam.vio.core import VIO
 from tests.datasets.pipeline import SequencePreprocessor, load_euroc_pipeline
 
 
-def run_vio(vio_config_path: Path, data_config_path: Path, output_path: Path) -> None:
-    vio: VIO = VIO.from_config(vio_config_path)
+def run_vio(vio_config_path: Path, data_config_path: Path, output_path: Path, overrides: list[str] | None = None) -> None:
+    vio: VIO = VIO.from_config(vio_config_path, overrides=overrides)
 
     pipeline: SequencePreprocessor = load_euroc_pipeline(data_config_path)
     preprocessed = pipeline.prepare(seed=13, max_depth=40.0)
@@ -62,17 +62,29 @@ def run_vio(vio_config_path: Path, data_config_path: Path, output_path: Path) ->
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument(
+        "--config",
+        type=str,
+        default="vio_euroc.yaml",
+        help="Path to the VIO config file.",
+    )
+    parser.add_argument(
         "--output",
         type=Path,
         default=Path(__file__).parent / "results" / "vio_estimated.txt",
         help="Path to write the estimated TUM trajectory.",
     )
+    parser.add_argument(
+        "--sequence",
+        type=str,
+        default="euroc/VI_01_easy.yaml",
+        help="Sequence to process.",
+    )
     args = parser.parse_args()
 
     config_dir = Path(__file__).parent / "config"
     run_vio(
-        vio_config_path=config_dir / "vio_euroc.yaml",
-        data_config_path=config_dir / "euroc_pipeline.yaml",
+        vio_config_path=config_dir / args.config,
+        data_config_path=config_dir / args.sequence,
         output_path=args.output,
     )
 

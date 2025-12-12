@@ -28,7 +28,11 @@ class BundleAdjustmentConfig:
     projection_noise_px: float = 1.0
     disparity_noise_px: float = 1.0
     use_huber_loss: bool = True
+    reprojection_gating: bool = True
     reprojection_gating_threshold_px: float = 2.0
+    max_rejection_rate: float = 1.01
+    use_median_filtering: bool = False
+    reprojection_gating_min_obs: int = 12
     use_inlier_observations_only: bool = False
     pose_prior_sigmas: Sequence[float] = field(
         default_factory=lambda: np.array(
@@ -45,6 +49,7 @@ class BundleAdjustmentConfig:
         * 0.001,
     )
     use_motion_only_smart_factors: bool = False
+    use_light_relative_pose_factor: bool = False
     light_relative_pose_sigmas: Sequence[float] = field(
         default_factory=lambda: [0.3, 0.3, 0.3, 0.3, 0.3, 0.3]
     )
@@ -125,7 +130,7 @@ class FixedLagBundleAdjuster:
 
         self._add_prior_factors(ts, pose, velocity, bias)
 
-    def process(self, frame: RectifiedStereoFrame, ts: float, relative_pose: gtsam.Pose3, estimated_velocity: np.ndarray, landmark_observations: Mapping[int, TrackObservation] | TrackObservationsBatch, pim: gtsam.PreintegratedCombinedMeasurements, optimize: bool = True, profile: bool = False) -> dict[str, int]:
+    def process(self, frame: RectifiedStereoFrame, ts: float, relative_pose: gtsam.Pose3, estimated_velocity: np.ndarray, landmark_observations: Mapping[int, TrackObservation] | TrackObservationsBatch, pim: gtsam.PreintegratedCombinedMeasurements, optimize: bool = True, profile: bool = False) -> tuple[dict[str, int], list[str]]:
         profiler = _SectionProfiler(log_prefix="fixed_lag_bundle_adjustment.process")
 
         stats: dict[str, int] = {
@@ -137,6 +142,7 @@ class FixedLagBundleAdjuster:
             "rejected_not_selected": 0,
             "active_landmarks": 0,
         }
+        warnings = []
 
         if not isinstance(landmark_observations, TrackObservationsBatch):
             landmark_observations = TrackObservationsBatch.from_any(landmark_observations)
@@ -158,9 +164,14 @@ class FixedLagBundleAdjuster:
             # You must update your main loop to pass raw IMU data or generate PIM with the same strict params!
             self._add_imu_factor(prev_idx, self.frame_idx, pim, ts)
 
+        # add light relative pose factor to keep the drift from being way too large
+        # use a L2WithDeadZone loss to so that it doesn't have much of an effect unless the pose is way off
+        if self.config.use_light_relative_pose_factor:
+            self._add_light_relative_pose_factor(prev_idx, self.frame_idx, ts)
+
         # 2. Process Landmarks
         with profiler.section("process_landmarks"):
-            self._process_explicit_landmarks(frame, landmark_observations, body_P_sensor, ts, stats=stats)
+            self._process_explicit_landmarks(frame, landmark_observations, body_P_sensor, ts, stats=stats, warnings=warnings)
 
         # 3. Optimize
         if optimize:
@@ -173,7 +184,7 @@ class FixedLagBundleAdjuster:
 
         stats["active_landmarks"] = self._count_active_landmarks()
 
-        return stats
+        return stats, warnings
 
     def optimize(self) -> None:
         self._prune_unconstrained_values()
@@ -306,6 +317,23 @@ class FixedLagBundleAdjuster:
     # Helpers
     # =========================================================================
 
+    def _add_light_relative_pose_factor(self, prev_idx: int, idx: int, ts: float) -> None:
+        """
+        Add a light relative pose factor to keep the drift from being way too large.
+        
+        Uses a L2WithDeadZone loss function to so that it doesn't have much of an effect unless the pose is way off.
+        """
+        prev_pose = self.full_values.atPose3(X(prev_idx))
+        current_pose = self.full_values.atPose3(X(idx))
+        light_relative_pose = prev_pose.inverse().compose(current_pose)
+
+        noise = gtsam.noiseModel.Robust(
+            gtsam.noiseModel.mEstimator.L2WithDeadZone.Create(1.0),
+            gtsam.noiseModel.Diagonal.Sigmas(self.config.light_relative_pose_sigmas)
+        )
+
+        self.new_factors.add(gtsam.PriorFactorPose3(X(idx), light_relative_pose, noise))
+
     def _count_active_landmarks(self) -> int:
         """Count landmarks that are still inside the fixed-lag smoother window."""
         active_keys: set[int] = set()
@@ -319,7 +347,7 @@ class FixedLagBundleAdjuster:
                     active_keys.add(key)
         return len(active_keys)
 
-    def _process_explicit_landmarks(self, frame: RectifiedStereoFrame, observations, body_P_sensor, ts, stats: dict[str, int] | None = None):
+    def _process_explicit_landmarks(self, frame: RectifiedStereoFrame, observations, body_P_sensor, ts, stats: dict[str, int] | None = None, warnings: list[str] | None = None):
         # Prepare Calibration / Noise
         K = frame.calibration.K_left_rect
         calib = gtsam.Cal3_S2(float(K[0,0]), float(K[1,1]), float(K[0,1]), float(K[0,2]), float(K[1,2]))
@@ -354,11 +382,15 @@ class FixedLagBundleAdjuster:
             ids_arr = observations.ids.astype(int)
             kps_arr = observations.keypoints
             depths_arr = observations.depths
-            obs_iter = zip(ids_arr.tolist(), kps_arr, depths_arr)
+            obs_iter = list(zip(ids_arr.tolist(), kps_arr, depths_arr))
         else:
-            obs_iter = (
+            obs_iter = [
                 (tid, obs.keypoint, obs.depth) for tid, obs in observations.items()
-            )
+            ]
+
+        # Collection for existing landmark factors to potentially filter
+        # List of dicts: {factor, error, passed_threshold, is_new=False}
+        candidate_factors = []
 
         for original_track_id, keypoint, depth_val in obs_iter:
             if depth_val is None or not np.isfinite(depth_val) or depth_val <= 0.0 or depth_val > 40.0:
@@ -389,32 +421,35 @@ class FixedLagBundleAdjuster:
 
             # Landmark Logic
             if self.full_values.exists(key_L):
-                # TODO: collect and log (to rerun) stats about landmarks that were added and rejected
-                # Reprojection Gating
+                # Calculate error
+                error = 0.0
+                passed_threshold = True
+                
                 existing_point = self.full_values.atPoint3(key_L)
                 try:
                     projected_pt2 = camera.project(existing_point)
                     residual = projected_pt2 - gtsam.Point2(float(keypoint[0]), float(keypoint[1]))
-                    if np.linalg.norm(residual) ** 2 > self.config.reprojection_gating_threshold_px ** 2:
-                        if stats is not None:
-                            stats["rejected_reprojection"] += 1
-                        continue
+                    error = np.linalg.norm(residual)
                 except RuntimeError:
-                    if stats is not None:
-                        stats["rejected_reprojection"] += 1
-                    continue
+                    # Projection failed (behind camera, etc.)
+                    # We treat this as infinite error / fail
+                    error = float('inf')
+                    passed_threshold = False
+                
+                if self.config.reprojection_gating and error > self.config.reprojection_gating_threshold_px:
+                    passed_threshold = False
 
                 # Landmark exists in history.
                 # Check if it is currently optimized (alive in the smoother window)
                 if self.smoothed_values.exists(key_L) or self.new_values.exists(key_L):
-                    # It's alive. Add factor.
-                    self.new_factors.add(factor)
-                    if stats is not None:
-                        stats["features_added"] += 1
+                    # It's alive. Add to candidates.
+                    candidate_factors.append({
+                        "factor": factor,
+                        "error": error,
+                        "passed_threshold": passed_threshold,
+                    })
                 else:
                     # It was marginalized out (exists in full_values but not smoothed).
-                    # FIX 5: Do NOT bring it back with the same ID.
-                    # This anchors current pose to a marginalized state -> Rubber banding/Drift.
                     # Strategy: Respawn as NEW landmark ID
                     self.next_replacement_id += 1
                     self.landmark_key_map[original_track_id] = self.next_replacement_id
@@ -434,12 +469,11 @@ class FixedLagBundleAdjuster:
                         X(self.frame_idx), key_L_new, 
                         stereo_calib, body_P_sensor
                     )
+                    
                     self.new_factors.add(new_factor)
                     if stats is not None:
                         stats["features_added"] += 1
 
-                    # TODO: factor out the landmark prior construction into a function
-                    # TODO: make sure this doesn't end up effectively overruling outlier rejection of the robust noise models on the projection factors
                     # add a weak prior on the landmark to stop it from drifting too far
                     prior_factor = gtsam.PriorFactorPoint3(key_L_new, point, gtsam.noiseModel.Diagonal.Sigmas(np.array([1e+2]*3)))
                     self.new_factors.add(prior_factor)
@@ -455,11 +489,71 @@ class FixedLagBundleAdjuster:
                 if stats is not None:
                     stats["features_added"] += 1
 
-                # TODO: make sure the 1e+2 still works as well as the 5e-0 on the euroc VI sequences
-                # TODO: add a hydra config option for the landmark prior sigmas, this new BA seems to work fine in the euroc vicon room sequences, but doesn't on the machine hall ones, maybe it has to do with a larger range of depth and this landmark prior noise model could be more tight? either way it needs to be configurable. try a looser configuration and see if that improves performance on the machine hall sequences.
                 # add a weak prior on the landmark to stop it from drifting too far
                 prior_factor = gtsam.PriorFactorPoint3(key_L, point, gtsam.noiseModel.Diagonal.Sigmas(np.array([1e+2]*3)))
                 self.new_factors.add(prior_factor)
+
+        # --- Filtering Logic ---
+        
+        # 1. Determine Gating Policy (Safety Valve)
+        disable_gating = False
+        if self.config.reprojection_gating and candidate_factors:
+            rejected_count = sum(1 for c in candidate_factors if not c["passed_threshold"])
+            rejection_rate = rejected_count / len(candidate_factors)
+            
+            if rejection_rate >= self.config.max_rejection_rate:
+                disable_gating = True
+                # if stats is not None:
+                #     stats["gating_disabled"] = 1
+
+        # 2. Select Survivors
+        survivors = []
+        rejected_by_gating = 0
+        
+        if candidate_factors:
+            for c in candidate_factors:
+                if self.config.reprojection_gating and not disable_gating:
+                    if not c["passed_threshold"]:
+                        rejected_by_gating += 1
+                        continue
+                survivors.append(c)
+
+        # 3. Apply Median Filtering
+        rejected_by_median = 0
+        if self.config.use_median_filtering and survivors:
+            errors = np.array([c["error"] for c in survivors])
+            median_error = np.median(errors)
+            
+            # Filter
+            filtered_survivors = [c for c in survivors if c["error"] <= median_error]
+            rejected_by_median = len(survivors) - len(filtered_survivors)
+            survivors = filtered_survivors
+
+        # 4. Min Obs Rescue
+        factors_to_add = survivors
+        rescued = False
+        
+        if len(survivors) < self.config.reprojection_gating_min_obs:
+             # Sort ALL candidates by error (asc)
+             sorted_candidates = sorted(candidate_factors, key=lambda c: c["error"])
+             # Take best N
+             factors_to_add = sorted_candidates[:self.config.reprojection_gating_min_obs]
+             rescued = True
+             
+             warnings.append(f"Low observation count, try decreasing speed or improve lighting conditions for better tracking")
+        
+        # 5. Add to Graph & Update Stats
+        for item in factors_to_add:
+            self.new_factors.add(item["factor"])
+            if stats is not None:
+                stats["features_added"] += 1
+        
+        if stats is not None:
+            if not rescued:
+                stats["rejected_reprojection"] += rejected_by_gating + rejected_by_median
+            else:
+                 # If rescued, true rejections is just total - added
+                 stats["rejected_reprojection"] += max(0, len(candidate_factors) - len(factors_to_add))
 
 
     def _select_best_tracks(self, observations, limit=1024): # TODO: this limit should be part of the hydra config

@@ -6,4 +6,6 @@ defaults:
 
 ba:
   config:
+    reprojection_gating: false
+    use_light_relative_pose_factor: false
     light_relative_pose_sigmas: [0.2, 0.2, 0.2, 0.5, 0.5, 0.5]

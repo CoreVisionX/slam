@@ -1,0 +1,17 @@
+_target_: tests.datasets.pipeline.SequencePreprocessor
+stages:
+  - _target_: tests.datasets.pipeline.LoadSequenceStage
+    loader:
+      _target_: tests.datasets.loaders.EurocSequenceLoader
+      data_root: tests/data/euroc
+      seq_name: VI_03_difficult
+      sequence_length: 5000
+      base_seed: 15
+      sampling_mode: contiguous
+      min_stride: 1
+      max_stride: 1
+      add_imu_noise: false
+  - _target_: tests.datasets.pipeline.RectifyFramesStage
+    rectifier:
+      _target_: tests.datasets.rectifiers.StereoSequenceRectifier
+      force_rectification: false
