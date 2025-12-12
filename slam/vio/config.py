@@ -58,6 +58,9 @@ class VIOConfig:
     log_every: int
     log_landmarks_every: int # must be a multiple of keyframe_interval and log_every
 
+    # covariance
+    covariance_scale: float = 2.0
+
     def __post_init__(self):
         if not isinstance(self.imu_from_left, np.ndarray):
             self.imu_from_left = np.array(self.imu_from_left)

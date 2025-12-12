@@ -210,7 +210,7 @@ class VIO:
         if self.logger is not None and self.frame_idx % self.config.log_every == 0:
             # compute pose covariance
             key = X(self.ba.frame_idx)
-            pose_covariance = self.ba.smoother.marginalCovariance(key)
+            pose_covariance = self.ba.smoother.marginalCovariance(key) * self.config.covariance_scale
 
             self.logger.log_step(
                 frame_idx=self.frame_idx,
