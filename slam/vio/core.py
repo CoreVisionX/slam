@@ -6,7 +6,8 @@ import gtsam
 import numpy as np
 from hydra.utils import instantiate
 
-from slam.depth.sgbm import SGBM
+import rerun as rr
+
 from slam.hydra_utils import compose_config, extract_target_config
 from slam.registration.registration import RectifiedStereoFrame, StereoDepthFrame
 from slam.vio.bundle_adjustment import FixedLagBundleAdjuster, finite_difference_velocity
@@ -16,6 +17,7 @@ from .config import VIOConfig, compute_vio_calibration
 from .io import VIORerunLogger
 from .imu_preintegration import ImuPreintegrator
 from .types import VIOEstimate
+from .relocalization import OrbRelocalization
 
 
 # TODO: add an explicit initialization period to estimate gravity and initial bias
@@ -42,6 +44,7 @@ class VIO:
         ba: FixedLagBundleAdjuster,
         imu_preintegrator: ImuPreintegrator,
         logger: "VIORerunLogger | None" = None,
+        relocalization: "OrbRelocalization | None" = None,
     ):
         self.config = config
         self.feature_tracker = feature_tracker
@@ -49,10 +52,10 @@ class VIO:
         self.ba = ba
         self.imu_preintegrator = imu_preintegrator
         self.logger = logger
+        self.relocalization = relocalization
         self.keyframe_interval = config.keyframe_interval
 
         self.calibration = compute_vio_calibration(config)
-        self.sgbm = SGBM() # TODO: configure sgbm via hydra too. definitely need to support max depth at least
 
         self.frame_idx = 0
         self.T_current_from_latest_keyframe = gtsam.Pose3.Identity() # relative pose from the latest keyframe to the current frame
@@ -181,6 +184,19 @@ class VIO:
             dt=dt
         )
 
+        # TODO: find a less hacky way to do the indexing add the factor, just compute the pose andpass it as an input to ba.process() or something
+        # probably should factor out the logging into the rerun logger into
+        if self.relocalization is not None:
+            # We are about to process a keyframe, so the BA will increment its index.
+            # The new variable will be X(ba.frame_idx + 1)
+            next_key_index = self.ba.frame_idx + 1
+            reloc_factor = self.relocalization.process(self.frame_idx, next_key_index, rect_frame)
+            if reloc_factor is not None:
+                self.ba.new_factors.add(reloc_factor)
+
+                if self.logger is not None:
+                    rr.log("Relocalization", rr.TextLog(f"Added origin loop closure factor at frame {self.frame_idx} (Key {next_key_index})"))
+
         ba_stats, ba_warnings = self.ba.process(
             frame=rect_frame,
             ts=timestamp,
@@ -240,6 +256,11 @@ class VIO:
         self.T_current_from_latest_keyframe_initializer.reset(initial_pose)
 
         rect_frame = self.preprocess_frame(left_rect, right_rect)
+
+        # Initialize Relocalization
+        if self.relocalization is not None:
+            self.relocalization.reset(rect_frame, initial_pose)
+
         observations = self.feature_tracker.track_frame(rect_frame)
         if isinstance(observations, tuple):
             observations = TrackObservationsBatch.from_any(observations)

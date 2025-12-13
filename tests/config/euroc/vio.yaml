@@ -42,8 +42,8 @@ feature_tracker:
   lk_epsilon: 0.01
   lk_min_eig_threshold: 0.001
   max_depth: 40.0
-  gftt_quality_level: 0.001
-  gftt_min_distance: 20.0
+  gftt_quality_level: 0.01
+  gftt_min_distance: 1.0
   gftt_block_size: 3
   gftt_use_harris_detector: false
   gftt_k: 0.04
@@ -111,6 +111,17 @@ imu_preintegrator:
     accel_random_walk: 3.0000e-3
     gyro_random_walk: 1.9393e-05
     integration_noise: 0.0005
+
+
+relocalization:
+  _target_: slam.vio.relocalization.OrbRelocalization
+  config:
+    _target_: slam.vio.relocalization.OrbRelocalizationConfig
+    enabled: true
+    run_every_frames: 10
+    min_inliers: 100
+    match_ratio_thresh: 0.75
+    pnp_reprojection_error: 2.0
 
 
 logger:
