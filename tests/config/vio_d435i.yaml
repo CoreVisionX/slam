@@ -24,18 +24,20 @@ config:
   width: 848
   height: 480
   optimize_every: 1
-  keyframe_interval: 3
-  log_every: 3
+  keyframe_interval: 4
+  log_every: 4
   log_landmarks_every: 24
   ransac_inliers_only: true
+  covariance_scale: 4.0
+  log_covariance: false
 
 feature_tracker:
   _target_: slam.vio.klt_tracker.KLTFeatureTrackerCpp
-  max_feature_count: 400
+  max_feature_count: 200
   refill_feature_ratio: 0.8
-  feature_suppression_radius: 20.0
+  feature_suppression_radius: 10.0
   lk_win_size: [24, 24]
-  lk_max_level: 4
+  lk_max_level: 5
   lk_max_iterations: 30
   lk_epsilon: 0.1
   lk_min_eig_threshold: 0.001
@@ -45,8 +47,8 @@ feature_tracker:
   gftt_block_size: 3
   gftt_use_harris_detector: false
   gftt_k: 0.04
-  stereo_ransac_threshold: 2.0
-  stereo_max_y_diff: 2.0
+  stereo_ransac_threshold: 1.0
+  stereo_max_y_diff: 1.0
   min_disparity: 0.1
   templ_rows: 6
   templ_cols: 31
@@ -65,6 +67,7 @@ ba:
   _target_: slam.vio.bundle_adjustment.FixedLagBundleAdjuster
   config:
     _target_: slam.vio.bundle_adjustment.BundleAdjustmentConfig
+    optimizer: incremental
     min_observations_per_landmark: 1
     min_observations_per_frame: 5
     projection_noise_px: 0.5
@@ -75,9 +78,9 @@ ba:
     use_inlier_observations_only: false
     pose_prior_sigmas:
       [        
-        0.3,
+        0.1,
         0.00001,
-        0.3,
+        0.1,
         0.0001,
         0.0001,
         0.0001,
@@ -85,10 +88,11 @@ ba:
     max_landmarks: 10000000000
     max_observations_per_landmark: 100000000
     use_motion_only_smart_factors: false
+    use_light_relative_pose_factor: false
     light_relative_pose_sigmas: [0.2, 0.2, 0.2, 0.1, 0.1, 0.1]
     min_depth: 0.0
     lag: 4.0
-    imu_bias_prior_for_factors: [0.1, 0.1, 0.1, 0.001, 0.001, 0.001]
+    imu_bias_prior_for_factors: [0.01, 0.01, 0.01, 0.001, 0.001, 0.001]
 
 imu_preintegrator:
   _target_: slam.vio.imu_preintegration.ImuPreintegrator
@@ -96,11 +100,22 @@ imu_preintegrator:
     _target_: slam.vio.imu_preintegration.ImuPreintegrationConfig
     gravity: [0.0, 9.80655, 0.0]
     initial_gyro_bias: [0.0, 0.0, 0.0]
-    accel_noise: 0.008183027
-    gyro_noise: 0.00109979
-    accel_random_walk: 6.0000e-3
-    gyro_random_walk: 1.2e-04
+    initial_acc_bias: [0.0, 0.0, 0.0]
+    accel_noise: 0.02
+    gyro_noise: 2.44e-2
+    accel_random_walk: 2.9420e-4
+    gyro_random_walk: 9.6963e-6
     integration_noise: 0.0005
+
+relocalization:
+  _target_: slam.vio.relocalization.OrbRelocalization
+  config:
+    _target_: slam.vio.relocalization.OrbRelocalizationConfig
+    enabled: false
+    run_every_frames: 10
+    min_inliers: 100
+    match_ratio_thresh: 0.75
+    pnp_reprojection_error: 2.0
 
 logger:
   _target_: slam.vio.io.VIORerunLogger

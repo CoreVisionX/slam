@@ -50,8 +50,8 @@ class ImuPreintegrator:
         
         # Initialize bias
         self.initial_bias = gtsam.imuBias.ConstantBias(
-            biasAcc=np.array(self.config.initial_gyro_bias).reshape(3, 1),
-            biasGyro=np.array(self.config.initial_acc_bias).reshape(3, 1),
+            biasAcc=np.array(self.config.initial_acc_bias).reshape(3, 1),
+            biasGyro=np.array(self.config.initial_gyro_bias).reshape(3, 1),
         )
         self.current_bias = self.initial_bias
         

@@ -179,8 +179,8 @@ class VIO:
         assert dt > 0, f"dt must be positive, got {dt}"
 
         estimated_velocity = finite_difference_velocity(
-            prev_pose=gtsam.Pose3.Identity(),
-            next_pose=T_current_from_previous_current,
+            prev_pose=self.ba.get_latest_pose(),
+            next_pose=self.ba.get_latest_pose() * self.T_current_from_latest_keyframe,
             dt=dt
         )
 
@@ -225,8 +225,11 @@ class VIO:
 
         if self.logger is not None and self.frame_idx % self.config.log_every == 0:
             # compute pose covariance
-            key = X(self.ba.frame_idx)
-            pose_covariance = self.ba.smoother.marginalCovariance(key) * self.config.covariance_scale
+            if self.config.log_covariance:
+                key = X(self.ba.frame_idx)
+                pose_covariance = self.ba.smoother.marginalCovariance(key) * self.config.covariance_scale
+            else:
+                pose_covariance = None
 
             self.logger.log_step(
                 frame_idx=self.frame_idx,

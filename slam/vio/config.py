@@ -57,6 +57,7 @@ class VIOConfig:
     # logging
     log_every: int
     log_landmarks_every: int # must be a multiple of keyframe_interval and log_every
+    log_covariance: bool = False
 
     # covariance
     covariance_scale: float = 2.0

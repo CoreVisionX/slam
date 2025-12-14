@@ -3,6 +3,7 @@ from pathlib import Path
 import time
 
 import numpy as np
+import gtsam
 
 from slam.hydra_utils import compose_config
 from slam.vio import rs_sdk
@@ -13,21 +14,20 @@ def main(argv=None) -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--vio-config", type=Path, default=Path("config/vio_d435i.yaml"))
     parser.add_argument("--fps", type=int, default=30)
+    parser.add_argument("--width", type=int, default=848)
+    parser.add_argument("--height", type=int, default=480)
     parser.add_argument("--warmup", type=float, default=1.0, help="Seconds to wait after spinning up the worker")
     parser.add_argument("--max-frames", type=int, default=0, help="Stop after this many processed frames (0 = infinite)")
     parser.add_argument("--log-every", type=int, default=60, help="Log position estimate every N frames")
-    parser.add_argument("--init-duration", type=float, default=2.0, help="Duration in seconds to collect IMU data for initial gravity and bias estimation")
+    parser.add_argument("--init-duration", type=float, default=4.0, help="Duration in seconds to collect IMU data for initial gravity and bias estimation")
     parser.add_argument("--skip-frames", type=int, default=100, help="Skip the first N frames")
     args = parser.parse_args(argv)
-
-    config = compose_config(args.vio_config)
-    width = config.config.width
-    height = config.config.height
     
-    stream = rs_sdk.D435iIterator(width=width, height=height, fps=args.fps)
+    stream = rs_sdk.D435iIterator(width=args.width, height=args.height, fps=args.fps)
+    calib = stream.get_calib_params()
 
     # Use the first few frames to estimate gravity and gyro bias
-    init_frames = 60
+    init_frames = int(args.init_duration * args.fps)
     imu_ts_samples = []
     imu_acc_samples = []
     imu_gyro_samples = []
@@ -54,11 +54,23 @@ def main(argv=None) -> None:
     print(f"Gravity norm: {gravity_norm}")
     print(f"Gyro bias: {gyro_bias}")
 
+    # estimate initial accelerometer bias
+    true_gravity = np.array([0.0, 9.80665, 0.0])
+    acc_bias = true_gravity - gravity
+    print(f"Acc bias: {acc_bias}")
+
     # Create AsyncVIO with initial gravity and bias via overrides
     async_vio = AsyncVIO(
         vio_config_path=args.vio_config,
         vio_overrides=[
-            "imu_preintegrator.config.gravity=" + str(gravity.tolist()),
+            "config.width=" + str(args.width),
+            "config.height=" + str(args.height),
+            "config.K_left_rect=" + str(calib["K_left_rect"].tolist()),
+            "config.K_right_rect=" + str(calib["K_right_rect"].tolist()),
+            "config.imu_from_left=" + str(calib["imu_from_left"].tolist()),
+            "config.imu_from_right=" + str(calib["imu_from_right"].tolist()),
+            "config.baseline=" + str(calib["baseline"]),
+            "imu_preintegrator.config.initial_acc_bias=" + str(acc_bias.tolist()),
             "imu_preintegrator.config.initial_gyro_bias=" + str(gyro_bias.tolist())
         ]
     )

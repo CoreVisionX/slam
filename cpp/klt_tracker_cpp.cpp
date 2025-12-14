@@ -114,18 +114,22 @@ cv::Matx44d to_q_matrix(const py::array &q_array) {
   return Q;
 }
 
+// Applies a minimum-distance suppression rule against BOTH:
+//   (1) existing points (already accepted / currently tracked)
+//   (2) previously accepted candidates in this call
 std::vector<cv::Point2f> filter_keypoints(
     const std::vector<cv::Point2f> &candidates,
     const std::vector<cv::Point2f> &existing, double min_radius) {
   if (candidates.empty()) {
     return {};
   }
-  if (existing.empty()) {
-    return candidates;
-  }
 
   std::vector<cv::Point2f> kept;
+  kept.reserve(candidates.size());
+
   std::vector<cv::Point2f> current = existing;
+  current.reserve(existing.size() + candidates.size());
+
   const float min_radius_sq = static_cast<float>(min_radius * min_radius);
 
   for (const auto &pt : candidates) {

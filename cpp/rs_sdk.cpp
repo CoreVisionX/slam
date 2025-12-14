@@ -10,6 +10,7 @@
 #include <algorithm>
 #include <cmath>
 #include <iostream>
+#include <stdexcept>
 
 #include <librealsense2/rs.hpp>
 #include <opencv2/core.hpp>
@@ -29,14 +30,14 @@ struct StereoSample {
     cv::Mat left;
     cv::Mat right;
     StereoSample() : timestamp_s(0.0) {}
-    StereoSample(double ts, cv::Mat l, cv::Mat r) 
+    StereoSample(double ts, cv::Mat l, cv::Mat r)
         : timestamp_s(ts), left(std::move(l)), right(std::move(r)) {}
 };
 
 struct ImuFrame {
-    double timestamp_s;     // Seconds
-    rs2_vector data;   // x, y, z
-    bool is_accel;       // true=accel, false=gyro
+    double timestamp_s; // Seconds
+    rs2_vector data;    // x, y, z
+    bool is_accel;      // true=accel, false=gyro
 };
 
 struct ImuOutput {
@@ -72,7 +73,8 @@ class D435iIterator {
 
     rs2::pipeline pipe_;
     rs2::config cfg_;
-    
+    rs2::pipeline_profile profile_; // active profile after start()
+
     std::mutex mutex_;
     std::condition_variable cv_;
 
@@ -83,13 +85,13 @@ class D435iIterator {
     double ros_time_base_ = 0.0;    // System time at start
     double camera_time_base_ = 0.0; // Hardware time at start
 
-    std::deque<ImuFrame> imu_history_; 
-    
+    std::deque<ImuFrame> imu_history_;
+
     bool accel0_valid_ = false;
     ImuFrame accel0_;
 
 public:
-    D435iIterator(int width = 848, int height = 480, int fps = 30) 
+    D435iIterator(int width = 848, int height = 480, int fps = 30)
         : width_(width), height_(height), fps_(fps) {
         start();
     }
@@ -97,19 +99,23 @@ public:
     ~D435iIterator() { stop(); }
 
     void start() {
-        frames_.clear();
-        imu_ready_queue_.clear();
-        imu_history_.clear();
-        accel0_valid_ = false;
-        is_initialized_time_base_ = false;
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+            frames_.clear();
+            imu_ready_queue_.clear();
+            imu_history_.clear();
+            accel0_valid_ = false;
+            is_initialized_time_base_ = false;
+            running_ = false;
+            profile_ = rs2::pipeline_profile{};
+        }
 
         rs2::context ctx;
         auto devices = ctx.query_devices();
         if (devices.size() > 0) {
             auto dev = devices[0];
             auto sensors = dev.query_sensors();
-            for (auto& s : sensors)
-            {
+            for (auto& s : sensors) {
                 // Enable motion correction to get corrected IMU data
                 if (s.supports(RS2_OPTION_ENABLE_MOTION_CORRECTION))
                     s.set_option(RS2_OPTION_ENABLE_MOTION_CORRECTION, 1.f);
@@ -132,14 +138,19 @@ public:
             }
         }
 
+        cfg_.disable_all_streams();
         cfg_.enable_stream(RS2_STREAM_INFRARED, 1, width_, height_, RS2_FORMAT_Y8, fps_);
         cfg_.enable_stream(RS2_STREAM_INFRARED, 2, width_, height_, RS2_FORMAT_Y8, fps_);
         cfg_.enable_stream(RS2_STREAM_ACCEL, RS2_FORMAT_MOTION_XYZ32F);
         cfg_.enable_stream(RS2_STREAM_GYRO, RS2_FORMAT_MOTION_XYZ32F);
 
-        running_ = true;
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+            running_ = true;
+        }
 
-        pipe_.start(cfg_, [this](const rs2::frame& frame) {
+        // Capture pipeline_profile so we can query calibration for the active profile
+        profile_ = pipe_.start(cfg_, [this](const rs2::frame& frame) {
             double frame_time_ms = frame.get_timestamp();
             double systetimestamp_s = 0.0;
 
@@ -157,7 +168,7 @@ public:
                 systetimestamp_s = ros_time_base_ + (elapsed_camera_ms * 1e-3);
             }
 
-            // 2. Dispatch
+            // Dispatch
             if (auto fs = frame.as<rs2::frameset>()) {
                 handle_frameset(fs, systetimestamp_s);
             } else if (auto mf = frame.as<rs2::motion_frame>()) {
@@ -184,7 +195,7 @@ public:
         {
             py::gil_scoped_release release;
             std::unique_lock<std::mutex> lock(mutex_);
-            
+
             // Wait for frame AND synchronized IMU data covering that frame
             cv_.wait(lock, [this] {
                 if (!running_) return true;
@@ -236,12 +247,106 @@ public:
         return std::make_tuple(frame_out.timestamp_s, left_py, right_py, imu_ts, imu_gyro, imu_acc);
     }
 
+    // -------------------------------------------------------------------------
+    // Calibration getter for the active (width,height,fps) profile
+    //
+    // Returns a dict:
+    //   left_rect      : 3x3 K matrix for left IR intrinsics
+    //   right_rect     : 3x3 K matrix for right IR intrinsics
+    //   imu_from_left  : 4x4 transform (left IR cam -> IMU)
+    //   imu_from_right : 4x4 transform (right IR cam -> IMU)
+    // -------------------------------------------------------------------------
+    py::dict get_calib_params() {
+        rs2::pipeline_profile prof;
+
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+            // prefer stored profile; if absent, try active profile
+            if (profile_) {
+                prof = profile_;
+            }
+        }
+
+        if (!prof) {
+            try {
+                prof = pipe_.get_active_profile();
+            } catch (...) {
+                throw std::runtime_error("Pipeline not started; cannot query calibration.");
+            }
+        }
+
+        auto left_sp  = prof.get_stream(RS2_STREAM_INFRARED, 1).as<rs2::video_stream_profile>();
+        auto right_sp = prof.get_stream(RS2_STREAM_INFRARED, 2).as<rs2::video_stream_profile>();
+
+        // Prefer gyro as IMU frame; fall back to accel if needed.
+        rs2::stream_profile imu_sp;
+        try {
+            imu_sp = prof.get_stream(RS2_STREAM_GYRO);
+        } catch (...) {
+            try {
+                imu_sp = prof.get_stream(RS2_STREAM_ACCEL);
+            } catch (...) {
+                throw std::runtime_error("No IMU stream (gyro/accel) found in active profile.");
+            }
+        }
+
+        auto K_from_intr = [](const rs2_intrinsics& in) {
+            py::array_t<double> K({3, 3});
+            auto k = K.mutable_unchecked<2>();
+            k(0,0) = in.fx;  k(0,1) = 0.0;   k(0,2) = in.ppx;
+            k(1,0) = 0.0;    k(1,1) = in.fy; k(1,2) = in.ppy;
+            k(2,0) = 0.0;    k(2,1) = 0.0;   k(2,2) = 1.0;
+            return K;
+        };
+
+        rs2_intrinsics li = left_sp.get_intrinsics();
+        rs2_intrinsics ri = right_sp.get_intrinsics();
+
+        py::array_t<double> left_rect  = K_from_intr(li);
+        py::array_t<double> right_rect = K_from_intr(ri);
+
+        auto T_from_extr = [](const rs2_extrinsics& ex) {
+            py::array_t<double> T({4, 4});
+            auto t = T.mutable_unchecked<2>();
+
+            // rs2_extrinsics.rotation is column-major 3x3.
+            for (int r = 0; r < 3; ++r) {
+                for (int c = 0; c < 3; ++c) {
+                    t(r, c) = static_cast<double>(ex.rotation[c * 3 + r]);
+                }
+            }
+
+            t(0,3) = static_cast<double>(ex.translation[0]);
+            t(1,3) = static_cast<double>(ex.translation[1]);
+            t(2,3) = static_cast<double>(ex.translation[2]);
+
+            t(3,0) = 0.0; t(3,1) = 0.0; t(3,2) = 0.0; t(3,3) = 1.0;
+            return T;
+        };
+
+        rs2_extrinsics ex_imu_from_left  = left_sp.get_extrinsics_to(imu_sp);
+        rs2_extrinsics ex_imu_from_right = right_sp.get_extrinsics_to(imu_sp);
+
+        py::array_t<double> imu_from_left  = T_from_extr(ex_imu_from_left);
+        py::array_t<double> imu_from_right = T_from_extr(ex_imu_from_right);
+
+        double baseline = std::abs(ex_imu_from_left.translation[0] - ex_imu_from_right.translation[0]);
+
+        py::dict out;
+        out["K_left_rect"] = left_rect;
+        out["K_right_rect"] = right_rect;
+        out["imu_from_left"] = imu_from_left;
+        out["imu_from_right"] = imu_from_right;
+        out["baseline"] = baseline;
+        return out;
+    }
+
 private:
     void handle_frameset(const rs2::frameset& fs, double systetimestamp_s) {
         rs2::video_frame left = fs.get_infrared_frame(1);
         rs2::video_frame right = fs.get_infrared_frame(2);
 
-        // Note: RealSense frameset parts share the same timestamp
+        // RealSense frameset parts share the same timestamp
         cv::Mat l(left.get_height(), left.get_width(), CV_8UC1, (void*)left.get_data());
         cv::Mat r(right.get_height(), right.get_width(), CV_8UC1, (void*)right.get_data());
 
@@ -255,12 +360,12 @@ private:
         rs2_vector data = f.get_motion_data();
 
         std::lock_guard<std::mutex> lock(mutex_);
-        
+
         // Push raw data to history
         imu_history_.push_back({systetimestamp_s, data, is_accel});
-        
+
         if (imu_history_.size() < 3) return;
-        
+
         while (imu_history_.size() >= 2) { // Need at least potential accel0 and accel1 or gyro
             ImuFrame& front = imu_history_.front();
 
@@ -274,53 +379,49 @@ private:
             }
 
             int next_accel_idx = -1;
-            for(size_t i = 0; i < imu_history_.size(); ++i) {
+            for (size_t i = 0; i < imu_history_.size(); ++i) {
                 if (imu_history_[i].is_accel) {
-                    next_accel_idx = i;
+                    next_accel_idx = (int)i;
                     break;
                 }
             }
 
             if (next_accel_idx == -1) {
-                break; 
+                break;
             }
 
-            ImuFrame accel1 = imu_history_[next_accel_idx];
-            
+            ImuFrame accel1 = imu_history_[(size_t)next_accel_idx];
+
             double dt = accel1.timestamp_s - accel0_.timestamp_s;
             if (dt <= 0) {
-                // Should not happen with monotonic clocks, but safe guard
                 accel0_ = accel1;
-                // Remove everything up to and including this bad packet
-                for(int k=0; k<=next_accel_idx; k++) imu_history_.pop_front();
+                for (int k = 0; k <= next_accel_idx; k++) imu_history_.pop_front();
                 continue;
             }
 
-            for(int i = 0; i < next_accel_idx; ++i) {
-                ImuFrame& g = imu_history_[i];
+            for (int i = 0; i < next_accel_idx; ++i) {
+                ImuFrame& g = imu_history_[(size_t)i];
                 if (!g.is_accel) {
-                    // Linear Interpolation
+                    // Linear interpolation
                     double alpha = (g.timestamp_s - accel0_.timestamp_s) / dt;
-                    
+
                     rs2_vector interp_acc;
                     interp_acc.x = accel0_.data.x * (1.0 - alpha) + accel1.data.x * alpha;
                     interp_acc.y = accel0_.data.y * (1.0 - alpha) + accel1.data.y * alpha;
                     interp_acc.z = accel0_.data.z * (1.0 - alpha) + accel1.data.z * alpha;
 
-                    // Publish
                     imu_ready_queue_.push_back({
                         g.timestamp_s,
-                        g.data.x, g.data.y, g.data.z, // Gyro
+                        g.data.x, g.data.y, g.data.z,          // Gyro
                         interp_acc.x, interp_acc.y, interp_acc.z // Interpolated Accel
                     });
                 }
             }
 
             accel0_ = accel1;
-
-            for(int k=0; k<=next_accel_idx; k++) imu_history_.pop_front();
+            for (int k = 0; k <= next_accel_idx; k++) imu_history_.pop_front();
         }
-        
+
         cv_.notify_one();
     }
 };
@@ -330,5 +431,6 @@ PYBIND11_MODULE(rs_sdk, m) {
         .def(py::init<int, int, int>(), py::arg("width")=848, py::arg("height")=480, py::arg("fps")=30)
         .def("__iter__", &D435iIterator::iter)
         .def("__next__", &D435iIterator::next)
+        .def("get_calib_params", &D435iIterator::get_calib_params)
         .def("close", &D435iIterator::stop);
 }
