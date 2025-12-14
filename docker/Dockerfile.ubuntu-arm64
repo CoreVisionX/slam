@@ -65,8 +65,5 @@ COPY . .
 # Install project dependencies
 RUN pixi install
 
-# Build the project wheel using the defined task
-RUN pixi run wheel-jetson
-
 # By default, start a bash shell with the pixi environment activated
 CMD ["pixi", "shell"]
