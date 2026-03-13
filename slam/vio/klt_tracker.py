@@ -292,7 +292,7 @@ class KLTFeatureTracker:
         stripe_rows: int,
     ) -> tuple[bool, np.ndarray, float]:
         """
-        Kimera-style stereo search:
+       template-based stereo search:
         - place a template around left_pt in the left image
         - search along a horizontal stripe in the right image using SSD template matching
         Returns (ok, match_pt, score), where score is the normalized SSD (lower is better).
@@ -405,7 +405,7 @@ class KLTFeatureTracker:
         Q: np.ndarray,
     ) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
         """
-        Use fast C++ Kimera-style sparse stereo to get right keypoints,
+        Use fast C++ sparse stereo to get right keypoints,
         then do Q-based reprojection and depth filtering in Python.
         """
         cfg = self.config
