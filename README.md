@@ -10,21 +10,21 @@ The front end tracks sparse features across stereo frames using KLT optical flow
 
 ## EuRoC Results
 
-ATE RMSE (meters) on the [EuRoC MAV dataset](https://projects.asl.ethz.ch/datasets/doku.php?id=kmavvisualinertialdatasets), SE(3) Umeyama alignment:
+ATE RMSE (meters) on the [EuRoC MAV dataset](https://projects.asl.ethz.ch/datasets/doku.php?id=kmavvisualinertialdatasets), SE(3) Umeyama alignment. Comparison against published stereo results from [Basalt](https://arxiv.org/abs/1904.06504), [OpenVINS](https://arxiv.org/abs/1910.01122), and [Kimera](https://arxiv.org/abs/1910.02490):
 
-| Sequence        | Distance (m) | ATE RMSE (m) | % of distance |
-| --------------- | ------------ | ------------ | ------------- |
-| V1_01_easy      | 57.8         | 0.05         | 0.09%         |
-| V2_01_easy      | 35.8         | 0.05         | 0.15%         |
-| MH_02_easy      | 73.2         | 0.06         | 0.08%         |
-| V1_02_medium    | 75.1         | 0.07         | 0.09%         |
-| V2_02_medium    | 82.4         | 0.08         | 0.10%         |
-| MH_04_difficult | 91.3         | 0.09         | 0.10%         |
-| MH_03_medium    | 130.9        | 0.11         | 0.09%         |
-| MH_01_easy      | 80.4         | 0.11         | 0.14%         |
-| V1_03_difficult | 77.8         | 0.12         | 0.15%         |
-| MH_05_difficult | 97.6         | 0.14         | 0.15%         |
-| **Average**     | **80.2**     | **0.09**     | **0.11%**     |
+| Sequence | Ours | Basalt | OpenVINS | Kimera |
+|---|---|---|---|---|
+| MH_01_easy | 0.11 | 0.07 | 0.07 | 0.11 |
+| MH_02_easy | 0.06 | 0.06 | 0.14 | 0.10 |
+| MH_03_medium | 0.11 | 0.07 | 0.09 | 0.16 |
+| MH_04_difficult | 0.09 | 0.13 | 0.17 | 0.24 |
+| MH_05_difficult | 0.14 | 0.11 | 0.25 | 0.35 |
+| V1_01_easy | 0.05 | 0.04 | 0.06 | 0.05 |
+| V1_02_medium | 0.07 | 0.05 | 0.06 | 0.08 |
+| V1_03_difficult | 0.12 | 0.10 | 0.06 | 0.07 |
+| V2_01_easy | 0.05 | 0.04 | 0.05 | 0.08 |
+| V2_02_medium | 0.08 | 0.05 | 0.05 | 0.10 |
+| **Average** | **0.09** | **0.07** | **0.10** | **0.13** |
 
 ## Usage
 
