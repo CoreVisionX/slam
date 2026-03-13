@@ -2,7 +2,7 @@
 
 Stereo VIO based on sparse feature tracking and incremental fixed-lag nonlinear optimization. Targets embedded platforms (Jetson Nano, Raspberry Pi).
 
-https://github.com/user-attachments/assets/02f5a774-cdd6-4d27-bb30-3372ba7a7746
+https://github.com/user-attachments/assets/d95d8f68-6288-4fc3-b487-ca9f02ecad13
 
 ## Overview
 
