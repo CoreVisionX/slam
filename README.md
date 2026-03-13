@@ -42,7 +42,18 @@ estimate = vio.process(
 
 ## Building
 
-See [BUILDING.md](BUILDING.md) and [INSTALL.md](INSTALL.md). Alternatively, Docker images provided for Jetson and Ubuntu ARM64.
+Docker images are provided for Jetson (JetPack 6) and Ubuntu ARM64. Both include librealsense, GTSAM, OpenCV, and all Python dependencies.
+
+```bash
+# Jetson (aarch64, JetPack 6)
+docker build -f docker/Dockerfile.jetson -t slam .
+
+# Ubuntu ARM64
+docker build -f docker/Dockerfile.ubuntu-arm64 -t slam .
+
+# Run with RealSense USB access
+docker run -it --privileged -v /dev/bus/usb:/dev/bus/usb slam pixi shell
+```
 
 ## Dependencies
 
